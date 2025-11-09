@@ -36,24 +36,31 @@ class DerivativeFactory:
         
         if deriv_type == 'vanilla':
             # Use VanillaOption with precomputed data
-            maturity_days = config['simulation']['N']  # Should be 252 for 1-year
+            # Convert hedged option maturity from years to days
+            maturity_days = int(hedged_cfg['T'] * 252)
             
             if maturity_days not in precomputed_data:
-                raise ValueError(f"No precomputed data for maturity {maturity_days}")
+                raise ValueError(
+                    f"No precomputed data for hedged vanilla option maturity {maturity_days} days. "
+                    f"Available maturities: {list(precomputed_data.keys())}"
+                )
             
             # Create a minimal PrecomputationManager wrapper
             class PrecompManagerWrapper:
-                def __init__(self, precomp_dict, r_daily):
+                def __init__(self, precomp_dict, r_daily, mat_days):
                     self.r_daily = r_daily
-                    self._data = {maturity_days: precomp_dict}
+                    self._data = {mat_days: precomp_dict}
                 
                 def get_precomputed_data(self, N):
                     return self._data.get(N)
             
             precomp_manager = PrecompManagerWrapper(
                 precomputed_data[maturity_days],
-                config['simulation']['r'] / 252.0
+                config['simulation']['r'] / 252.0,
+                maturity_days
             )
+            
+            logger.info(f"Created vanilla hedged option with maturity {maturity_days} days")
             
             return VanillaOption(
                 precomputation_manager=precomp_manager,
@@ -62,7 +69,12 @@ class DerivativeFactory:
             )
         
         elif deriv_type == 'barrier':
-            # Use BarrierOption with neural network
+            # Use BarrierOption with neural network (no precomputation needed)
+            logger.info(
+                f"Created barrier hedged option: {hedged_cfg['barrier_type']} "
+                f"{hedged_cfg['option_type']} with barrier={hedged_cfg['barrier_level']}"
+            )
+            
             return BarrierOption(
                 model_path=hedged_cfg['model_path'],
                 barrier_level=hedged_cfg['barrier_level'],
@@ -81,14 +93,18 @@ class DerivativeFactory:
         precomputed_data: Dict[int, Dict[str, Any]]
     ) -> List:
         """
-        Create hedging instruments.
+        Create hedging instruments (always vanilla).
+        
+        Hedging instruments structure:
+        - Instrument 0: Stock (represented as None)
+        - Instruments 1+: Vanilla options with strikes/maturities from config
         
         Args:
             config: Full config dict
             precomputed_data: Dict mapping maturity to precomputed coefficients
         
         Returns:
-            List of derivative objects [None (stock), Option1, Option2, ...]
+            List of derivative objects [None (stock), VanillaOption1, VanillaOption2, ...]
         """
         instruments_cfg = config['instruments']
         n_instruments = instruments_cfg['n_hedging_instruments']
@@ -96,24 +112,36 @@ class DerivativeFactory:
         # First instrument is always stock (None)
         hedging_derivs = [None]
         
+        # If only hedging with stock, return early
         if n_instruments == 1:
+            logger.info("Hedging with stock only (no vanilla options)")
             return hedging_derivs
         
-        # Get strikes and types
-        strikes = instruments_cfg.get('strikes', [])
-        option_types = instruments_cfg.get('types', [])
-        maturities = instruments_cfg.get('maturities', [252, 504])
+        # Get hedging option parameters
+        strikes = instruments_cfg['strikes']  # Length: n_instruments - 1
+        option_types = instruments_cfg['types']  # Length: n_instruments - 1
+        maturities = instruments_cfg['maturities']  # Length: n_instruments - 1
         
-        # Skip first maturity (252) as it's for the hedged option
-        hedge_maturities = maturities[1:]
+        # Validate lengths
+        n_options = n_instruments - 1
+        if len(strikes) != n_options:
+            raise ValueError(f"Expected {n_options} strikes, got {len(strikes)}")
+        if len(option_types) != n_options:
+            raise ValueError(f"Expected {n_options} option types, got {len(option_types)}")
+        if len(maturities) != n_options:
+            raise ValueError(f"Expected {n_options} maturities, got {len(maturities)}")
         
-        # Create hedging options
-        for i, maturity_days in enumerate(hedge_maturities):
-            strike = strikes[i] if i < len(strikes) else config['simulation']['S0']
-            opt_type = option_types[i] if i < len(option_types) else 'call'
+        # Create vanilla hedging options
+        for i in range(n_options):
+            maturity_days = maturities[i]
+            strike = strikes[i]
+            opt_type = option_types[i]
             
             if maturity_days not in precomputed_data:
-                raise ValueError(f"No precomputed data for hedging maturity {maturity_days}")
+                raise ValueError(
+                    f"No precomputed data for hedging maturity {maturity_days} days. "
+                    f"Available maturities: {list(precomputed_data.keys())}"
+                )
             
             # Create PrecomputationManager wrapper for this maturity
             class PrecompManagerWrapper:
@@ -138,6 +166,11 @@ class DerivativeFactory:
                     option_type=opt_type
                 )
             )
+            
+            logger.info(
+                f"Created hedging option {i+1}: {opt_type} with K={strike}, "
+                f"T={maturity_days} days"
+            )
         
         return hedging_derivs
 
@@ -159,6 +192,7 @@ def setup_derivatives_from_precomputed(
         (hedged_derivative, hedging_derivatives_list)
     """
     logger.info("Setting up derivatives from config...")
+    logger.info(f"Available precomputed maturities: {list(precomputed_data.keys())}")
     
     # Create hedged derivative
     hedged_derivative = DerivativeFactory.create_hedged_derivative(config, precomputed_data)
@@ -170,8 +204,8 @@ def setup_derivatives_from_precomputed(
     
     for i, deriv in enumerate(hedging_derivatives):
         if deriv is None:
-            logger.info(f"  [{i}] Stock")
+            logger.info(f"  Instrument {i}: Stock")
         else:
-            logger.info(f"  [{i}] {type(deriv).__name__}")
+            logger.info(f"  Instrument {i}: {type(deriv).__name__}")
     
     return hedged_derivative, hedging_derivatives
