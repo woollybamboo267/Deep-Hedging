@@ -5,7 +5,7 @@ Example training script showing how to use the flexible derivative system.
 import yaml
 import torch
 from src.agents.policy_net_garch_flexible import PolicyNetGARCH, HedgingEnvGARCH
-from derivative_factory import setup_derivatives
+from derivative_factory import setup_derivatives_from_precomputed
 
 
 def load_config(config_path: str) -> dict:
@@ -19,7 +19,7 @@ def main():
     config = load_config('config_barrier_2inst.yaml')
     
     # Setup derivatives (automatically detects vanilla vs barrier)
-    hedged_derivative, hedging_derivatives, precomp_managers = setup_derivatives(config)
+    hedged_derivative, hedging_derivatives, precomp_managers = setup_derivatives_from_precomputed(config)
     
     print(f"[INFO] Hedged derivative type: {type(hedged_derivative).__name__}")
     print(f"[INFO] Number of hedging instruments: {len(hedging_derivatives)}")
