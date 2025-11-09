@@ -40,7 +40,8 @@ def download_barrier_model(output_dir="models/barrier", force=False):
         force: If True, re-download even if file exists
     """
     # GitHub release URL (update this with your actual release URL)
-    MODEL_URL = "https://github.com/YOUR_USERNAME/YOUR_REPO/releases/download/v1.0/best_finetuned_up-and-in_call.1.pth"
+    MODEL_URL = "https://github.com/woollybamboo267/Deep-Hedging/releases/download/%23surrogate/best_finetuned_up-and-in_call.1.pth
+"
     MODEL_FILENAME = "best_finetuned_up-and-in_call.1.pth"
     
     # Create output directory
