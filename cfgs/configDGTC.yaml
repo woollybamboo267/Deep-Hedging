@@ -28,11 +28,12 @@ instruments:
   n_hedging_instruments: 2
   strikes: [100]
   types: ["call"]
-  maturities: [252, 504]
+  maturities: [504]  # FIXED: Only hedging instrument maturity
 
 hedged_option:
   type: "vanilla"
   K: 100
+  T: 1.0  # ADDED: Hedged option maturity (252 days)
   option_type: "call"
   side: "short"
 
