@@ -6,7 +6,8 @@ and runs the training loop. It replaces the train_garch function with
 a more modular, configuration-driven approach.
 
 Usage:
-    python train.py --config cfgs/config.yaml
+    python train.py --config cfgs/config_vanilla_2inst.yaml
+    python train.py --config cfgs/config_barrier_2inst.yaml
     python train.py --config cfgs/config.yaml --load-model models/uniform/GARCHLSTMDG.pth --inference-only
 """
 
@@ -20,9 +21,10 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 
 # Import your modules
-from src.agents.policy_net_garch import PolicyNetGARCH, HedgingEnvGARCH
+from src.agents.policy_net_garch_flexible import PolicyNetGARCH, HedgingEnvGARCH
 from src.option_greek.precompute import create_precomputation_manager_from_config
 from src.visualization.plot_results import compute_rl_metrics
+from derivative_factory import setup_derivatives_from_precomputed
 
 
 logger = logging.getLogger(__name__)
@@ -58,7 +60,7 @@ def validate_config(config: Dict[str, Any]) -> None:
     n_inst = config["instruments"]["n_hedging_instruments"]
     
     if n_inst < 1 or n_inst > 4:
-        raise ValueError(f"n_hedging_instruments must be 1, 2, or 3, got {n_inst}")
+        raise ValueError(f"n_hedging_instruments must be 1-4, got {n_inst}")
     
     if n_inst > 1:
         n_strikes = len(config["instruments"]["strikes"])
@@ -73,8 +75,6 @@ def validate_config(config: Dict[str, Any]) -> None:
             raise ValueError(
                 f"types must have length {n_inst - 1}, got {n_types}"
             )
-            
-        
     
     n_maturities = len(config["instruments"]["maturities"])
     if n_maturities != n_inst:
@@ -87,14 +87,21 @@ def validate_config(config: Dict[str, Any]) -> None:
         if opt_type not in valid_types:
             raise ValueError(f"Invalid option type: {opt_type}")
     
-    if config["simulation"]["option_type"] not in valid_types:
+    # Validate hedged option config
+    hedged_cfg = config["hedged_option"]
+    deriv_type = hedged_cfg["type"].lower()
+    
+    if deriv_type not in ["vanilla", "barrier"]:
+        raise ValueError(f"Invalid hedged_option type: {deriv_type}")
+    
+    if hedged_cfg["option_type"] not in valid_types:
         raise ValueError(
-            f"Invalid simulation option_type: {config['simulation']['option_type']}"
+            f"Invalid hedged_option option_type: {hedged_cfg['option_type']}"
         )
     
-    if config["simulation"]["side"] not in ["long", "short"]:
+    if hedged_cfg["side"] not in ["long", "short"]:
         raise ValueError(
-            f"Invalid simulation side: {config['simulation']['side']}"
+            f"Invalid hedged_option side: {hedged_cfg['side']}"
         )
     
     logging.info("Configuration validation passed")
@@ -154,51 +161,39 @@ def train_episode(
     config: Dict[str, Any],
     policy_net: PolicyNetGARCH,
     optimizer: torch.optim.Optimizer,
-    precomputed_data: Dict[int, Dict[str, Any]],
+    hedged_derivative,
+    hedging_derivatives,
     HedgingSim,
     device: torch.device
 ) -> Dict[str, Any]:
     """Train for a single episode."""
     
     # Create simulation instance
-    sim_config = config["simulation"]
+    hedged_cfg = config["hedged_option"]
     sim = HedgingSim(
-        S0=sim_config["S0"],
-        K=sim_config["K"],
+        S0=config["simulation"]["S0"],
+        K=hedged_cfg["K"],
         m=0.1,
-        r=sim_config["r"],
+        r=config["simulation"]["r"],
         sigma=config["garch"]["sigma0"],
-        T=sim_config["T"],
-        option_type=sim_config["option_type"],
-        position=sim_config["side"],
-        M=sim_config["M"],
-        N=sim_config["N"],
-        TCP=sim_config["TCP"],
+        T=config["simulation"]["T"],
+        option_type=hedged_cfg["option_type"],
+        position=hedged_cfg["side"],
+        M=config["simulation"]["M"],
+        N=config["simulation"]["N"],
+        TCP=config["simulation"]["TCP"],
         seed=episode
     )
     
-    # Prepare instrument parameters
-    inst_config = config["instruments"]
-    instrument_strikes = None
-    instrument_types = None
-    
-    if inst_config["n_hedging_instruments"] > 1:
-        instrument_strikes = inst_config["strikes"]
-        instrument_types = inst_config["types"]
-    
-    # Create environment
+    # Create environment with derivative objects
     env = HedgingEnvGARCH(
         sim=sim,
+        derivative=hedged_derivative,
+        hedging_derivatives=hedging_derivatives,
         garch_params=config["garch"],
-        precomputed_data_1yr=precomputed_data[252],
-        precomputed_data_1_5yr=precomputed_data.get(378),
-        precomputed_data_2yr=precomputed_data.get(504),
-        precomputed_data_2_5yr=precomputed_data.get(630),
-        n_hedging_instruments=inst_config["n_hedging_instruments"],
+        n_hedging_instruments=config["instruments"]["n_hedging_instruments"],
         dt_min=config["environment"]["dt_min"],
-        device=str(device),
-        instrument_strikes=instrument_strikes,
-        instrument_types=instrument_types
+        device=str(device)
     )
     
     env.reset()
@@ -263,9 +258,10 @@ def save_checkpoint(
 def run_inference(
     config: Dict[str, Any],
     policy_net: PolicyNetGARCH,
+    hedged_derivative,
+    hedging_derivatives,
     HedgingSim,
-    device: torch.device,
-    precomputed_data: Dict[int, Dict[str, Any]]
+    device: torch.device
 ) -> None:
     """Run inference with a pretrained model and generate visualizations."""
     logging.info("Starting inference with pretrained model...")
@@ -273,44 +269,31 @@ def run_inference(
     policy_net.eval()
     
     # Create simulation
-    sim_config = config["simulation"]
+    hedged_cfg = config["hedged_option"]
     sim = HedgingSim(
-        S0=sim_config["S0"],
-        K=sim_config["K"],
+        S0=config["simulation"]["S0"],
+        K=hedged_cfg["K"],
         m=0.1,
-        r=sim_config["r"],
+        r=config["simulation"]["r"],
         sigma=config["garch"]["sigma0"],
-        T=sim_config["T"],
-        option_type=sim_config["option_type"],
-        position=sim_config["side"],
-        M=sim_config["M"],
-        N=sim_config["N"],
-        TCP=sim_config["TCP"],
+        T=config["simulation"]["T"],
+        option_type=hedged_cfg["option_type"],
+        position=hedged_cfg["side"],
+        M=config["simulation"]["M"],
+        N=config["simulation"]["N"],
+        TCP=config["simulation"]["TCP"],
         seed=config["training"]["seed"]
     )
-    
-    # Prepare instrument parameters
-    inst_config = config["instruments"]
-    instrument_strikes = None
-    instrument_types = None
-    
-    if inst_config["n_hedging_instruments"] > 1:
-        instrument_strikes = inst_config["strikes"]
-        instrument_types = inst_config["types"]
     
     # Create environment
     env = HedgingEnvGARCH(
         sim=sim,
+        derivative=hedged_derivative,
+        hedging_derivatives=hedging_derivatives,
         garch_params=config["garch"],
-        precomputed_data_1yr=precomputed_data[252],
-        precomputed_data_1_5yr=precomputed_data.get(378),
-        precomputed_data_2yr=precomputed_data.get(504),
-        precomputed_data_2_5yr=precomputed_data.get(630),
-        n_hedging_instruments=inst_config["n_hedging_instruments"],
+        n_hedging_instruments=config["instruments"]["n_hedging_instruments"],
         dt_min=config["environment"]["dt_min"],
-        device=str(device),
-        instrument_strikes=instrument_strikes,
-        instrument_types=instrument_types
+        device=str(device)
     )
     
     env.reset()
@@ -358,8 +341,9 @@ def run_inference(
 def train(
     config: Dict[str, Any],
     HedgingSim,
+    hedged_derivative,
+    hedging_derivatives,
     visualize: bool = True,
-    precomputed_data: Dict[int, Dict[str, Any]] = None,
     initial_model: Optional[PolicyNetGARCH] = None
 ) -> PolicyNetGARCH:
     """Main training loop."""
@@ -372,13 +356,6 @@ def train(
     # Setup device
     device = torch.device(config["training"]["device"])
     logging.info(f"Using device: {device}")
-    
-    # Precompute coefficients if not provided
-    if precomputed_data is None:
-        logging.info("Starting precomputation...")
-        precomputation_manager = create_precomputation_manager_from_config(config)
-        precomputed_data = precomputation_manager.precompute_all()
-        logging.info("Precomputation complete")
     
     # Create policy network and optimizer
     policy_net = create_policy_network(config, device)
@@ -408,7 +385,8 @@ def train(
                 config=config,
                 policy_net=policy_net,
                 optimizer=optimizer,
-                precomputed_data=precomputed_data,
+                hedged_derivative=hedged_derivative,
+                hedging_derivatives=hedging_derivatives,
                 HedgingSim=HedgingSim,
                 device=device
             )
@@ -440,14 +418,14 @@ def train(
 
 def main():
     """Main entry point."""
-    # Parse arguments FIRST
+    # Parse arguments
     parser = argparse.ArgumentParser(
         description="Train GARCH-based option hedging with RL"
     )
     parser.add_argument(
         "--config",
         type=str,
-        default="cfgs/config.yaml",
+        required=True,
         help="Path to configuration file"
     )
     parser.add_argument(
@@ -489,11 +467,16 @@ def main():
         logging.error("Could not import HedgingSim. Please adjust import path.")
         sys.exit(1)
     
-    # Precompute coefficients
+    # Precompute coefficients (only for vanilla options)
     logging.info("Starting precomputation...")
     precomputation_manager = create_precomputation_manager_from_config(config)
     precomputed_data = precomputation_manager.precompute_all()
     logging.info("Precomputation complete")
+    
+    # Setup derivatives (vanilla or barrier based on config)
+    hedged_derivative, hedging_derivatives = setup_derivatives_from_precomputed(
+        config, precomputed_data
+    )
     
     # Inference-only mode
     if args.inference_only and args.load_model:
@@ -505,9 +488,10 @@ def main():
         run_inference(
             config=config,
             policy_net=policy_net,
+            hedged_derivative=hedged_derivative,
+            hedging_derivatives=hedging_derivatives,
             HedgingSim=HedgingSim,
-            device=device,
-            precomputed_data=precomputed_data
+            device=device
         )
         logging.info("Inference complete!")
         return
@@ -524,8 +508,9 @@ def main():
     policy_net = train(
         config=config,
         HedgingSim=HedgingSim,
+        hedged_derivative=hedged_derivative,
+        hedging_derivatives=hedging_derivatives,
         visualize=not args.no_visualize,
-        precomputed_data=precomputed_data,
         initial_model=initial_model
     )
     
