@@ -29,11 +29,12 @@ instruments:
   n_hedging_instruments: 1
   strikes: []
   types: []
-  maturities: [252]
+  maturities: []  # FIXED: Empty (no hedging options, just stock)
 
 hedged_option:
   type: "barrier"
   K: 100
+  T: 1.0  # Hedged option maturity (252 days)
   option_type: "call"
   side: "short"
   barrier_level: 120.0
