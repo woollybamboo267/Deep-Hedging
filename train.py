@@ -467,11 +467,21 @@ def main():
         logging.error("Could not import HedgingSim. Please adjust import path.")
         sys.exit(1)
     
-    # Precompute coefficients (only for vanilla options)
+    # FIXED PRECOMPUTATION LOGIC:
+    # Always precompute for hedging instruments (they're always vanilla)
+    # Also precompute for hedged derivative if it's vanilla
+    hedged_type = config["hedged_option"]["type"].lower()
+    
     logging.info("Starting precomputation...")
+    logging.info(f"Hedged derivative type: {hedged_type}")
+    
+    # Precompute hedging instruments (always needed)
     precomputation_manager = create_precomputation_manager_from_config(config)
     precomputed_data = precomputation_manager.precompute_all()
-    logging.info("Precomputation complete")
+    logging.info("Precomputation complete for hedging instruments")
+    
+    # If hedged derivative is vanilla, its coefficients are already in precomputed_data
+    # If it's barrier/exotic, derivative_factory will handle Monte Carlo pricing
     
     # Setup derivatives (vanilla or barrier based on config)
     hedged_derivative, hedging_derivatives = setup_derivatives_from_precomputed(
