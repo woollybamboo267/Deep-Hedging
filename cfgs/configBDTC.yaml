@@ -1,0 +1,75 @@
+# ==============================================================================
+# config_barrier_1inst.yaml - Barrier Option Delta Hedging (Stock only)
+# ==============================================================================
+training:
+  learning_rate: 0.0001
+  batch_size: 1000
+  num_epochs: 400
+  weight_decay: 0.00001
+  optimizer: "AdamW"
+  episodes: 400
+  seed: 78020349
+  gamma: 0.9999
+  entropy_coefficient: 0.5
+  device: "cpu"
+  checkpoint_frequency: 25
+  plot_frequency: 100
+  gradient_clip_max_norm: 1.0
+
+garch:
+  omega: 1.593749e-07
+  alpha: 2.308475e-06
+  beta: 0.689984
+  gamma: 342.870019
+  lambda: 0.420499
+  sigma0: 0.127037
+  h0: 5.14e-07  # Initial variance for barrier option
+
+instruments:
+  n_hedging_instruments: 1
+  strikes: []
+  types: []
+  maturities: [252]
+
+hedged_option:
+  type: "barrier"
+  K: 100
+  option_type: "call"
+  side: "short"
+  barrier_level: 120.0
+  barrier_type: "up-and-in"
+  model_path: "models/barrier_model.pth"
+
+simulation:
+  S0: 100
+  r: 0.04
+  T: 1.0
+  contract_size: 1
+  M: 1000
+  N: 252
+  TCP: 0.001  # 2x higher for barrier options
+
+environment:
+  dt_min: 1.0e-10
+
+precomputation:
+  N_quad: 256
+  u_max: 500.0
+  device: "cpu"
+
+model:
+  obs_dim: 5
+  hidden_size: 128
+  num_layers: 1
+  lstm_layers: 1
+
+logging:
+  level: "INFO"
+  log_file: null
+
+output:
+  model_save_path: "policy_net_barrier_1inst.pth"
+  checkpoint_path: "policy_net_barrier_1inst.pth"
+  plot_save_path: "hedge_comparison_barrier_1inst_ep{episode}.png"
+  plot_dpi: 150
+  sample_path_index: 1
