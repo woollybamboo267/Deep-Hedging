@@ -1,10 +1,12 @@
-# Training Configuration
+# ==============================================================================
+# config_barrier_1inst.yaml - Barrier Option Delta Hedging (Stock only)
+# ==============================================================================
 training:
   learning_rate: 0.0001
   batch_size: 1000
   num_epochs: 400
   weight_decay: 0.00001
-  optimizer: "AdamW" # drop-in optimizers include: RAdam, AdaBelief
+  optimizer: "AdamW"
   episodes: 400
   seed: 78020349
   gamma: 0.9999
@@ -14,7 +16,6 @@ training:
   plot_frequency: 100
   gradient_clip_max_norm: 1.0
 
-# GARCH Model Parameters
 garch:
   omega: 1.593749e-07
   alpha: 2.308475e-06
@@ -22,58 +23,53 @@ garch:
   gamma: 342.870019
   lambda: 0.420499
   sigma0: 0.127037
+  h0: 5.14e-07  # Initial variance for barrier option
 
-# Hedging Instruments Configuration
 instruments:
   n_hedging_instruments: 1
-  # Strikes for each hedging instrument (excluding stock which is index 0)
-  # Length must be n_hedging_instruments - 1
   strikes: []
-  # Option types for each hedging instrument (excluding stock)
-  # Options: "call" or "put"
   types: []
-  # Length must be n_hedging_instruments
   maturities: [252]
 
-# Market Simulation Parameters
+hedged_option:
+  type: "barrier"
+  K: 100
+  option_type: "call"
+  side: "short"
+  barrier_level: 120.0
+  barrier_type: "up-and-in"
+  model_path: "models/barrier_model.pth"
+
 simulation:
-  S0: 100  # Initial stock price
-  K: 100   # Strike price of option being hedged
-  r: 0.042  # Annual risk-free rate
-  T: 1.0   # Time to maturity in years
-  option_type: "call"  # "call" or "put"
-  side: "short"  # "short" or "long" - position in option being hedged
-  contract_size: 1  # Contract multiplier
-  M: 1000  # Number of Monte Carlo paths
-  N: 252   # Number of time steps (trading days)
-  TCP: 0.0005  # Transaction cost percentage
+  S0: 100
+  r: 0.04
+  T: 1.0
+  contract_size: 1
+  M: 1000
+  N: 252
+  TCP: 0.001  # 2x higher for barrier options
 
-# Environment Configuration
 environment:
-  dt_min: 1.0e-10  # Minimum time step for numerical stability
+  dt_min: 1.0e-10
 
-# Precomputation Configuration
 precomputation:
-  N_quad: 256  # Number of quadrature points for integration
-  u_max: 500.0  # Maximum value for integration range
-  device: "cpu"  # Device for precomputation
+  N_quad: 256
+  u_max: 500.0
+  device: "cpu"
 
-# Neural Network Architecture
 model:
-  obs_dim: 5  # Observation dimension
+  obs_dim: 5
   hidden_size: 128
-  num_layers: 1  # Number of FC layers after LSTM
-  lstm_layers: 1  # Number of LSTM layers
+  num_layers: 1
+  lstm_layers: 1
 
-# Logging Configuration
 logging:
   level: "INFO"
-  log_file: null  # Set to filename to log to file, null for console only
+  log_file: null
 
-# Output Configuration
 output:
-  model_save_path: "policy_net_mc_garch_lstm_{n_inst}inst.pth"
-  checkpoint_path: "policy_net_mc_garch_lstm_{n_inst}inst.pth"
-  plot_save_path: "hedge_comparison_{n_inst}inst_ep{episode}.png"
+  model_save_path: "policy_net_barrier_1inst.pth"
+  checkpoint_path: "policy_net_barrier_1inst.pth"
+  plot_save_path: "hedge_comparison_barrier_1inst_ep{episode}.png"
   plot_dpi: 150
-  sample_path_index: 1 # Which path to plot for visualization
+  sample_path_index: 1
