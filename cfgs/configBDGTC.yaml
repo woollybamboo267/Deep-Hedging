@@ -38,7 +38,7 @@ hedged_option:
   side: "short"
   barrier_level: 120.0
   barrier_type: "up-and-in"
-  model_path: "models/best_finetuned_up-and-in_call.1.pth"
+  model_path: "models/barrier/best_finetuned_up-and-in_call.1.pth"
 
 simulation:
   S0: 100
