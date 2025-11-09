@@ -62,25 +62,27 @@ def validate_config(config: Dict[str, Any]) -> None:
     if n_inst < 1 or n_inst > 4:
         raise ValueError(f"n_hedging_instruments must be 1-4, got {n_inst}")
     
+    # If we have vanilla options as hedging instruments (n_inst > 1)
     if n_inst > 1:
         n_strikes = len(config["instruments"]["strikes"])
         n_types = len(config["instruments"]["types"])
+        n_maturities = len(config["instruments"]["maturities"])
         
+        # All should have length n_inst - 1 (excluding stock)
         if n_strikes != n_inst - 1:
             raise ValueError(
-                f"strikes must have length {n_inst - 1}, got {n_strikes}"
+                f"strikes must have length {n_inst - 1} (excluding stock), got {n_strikes}"
             )
         
         if n_types != n_inst - 1:
             raise ValueError(
-                f"types must have length {n_inst - 1}, got {n_types}"
+                f"types must have length {n_inst - 1} (excluding stock), got {n_types}"
             )
-    
-    n_maturities = len(config["instruments"]["maturities"])
-    if n_maturities != n_inst:
-        raise ValueError(
-            f"maturities must have length {n_inst}, got {n_maturities}"
-        )
+        
+        if n_maturities != n_inst - 1:
+            raise ValueError(
+                f"maturities must have length {n_inst - 1} (excluding stock), got {n_maturities}"
+            )
     
     valid_types = ["call", "put"]
     for opt_type in config["instruments"]["types"]:
