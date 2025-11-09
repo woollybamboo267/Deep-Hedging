@@ -62,11 +62,17 @@ class DerivativeFactory:
             
             logger.info(f"Created vanilla hedged option with maturity {maturity_days} days")
             
-            return VanillaOption(
+            vanilla_option = VanillaOption(
                 precomputation_manager=precomp_manager,
                 garch_params=config['garch'],
                 option_type=hedged_cfg['option_type']
             )
+            
+            # FIX: Store maturity and strike on the option object
+            vanilla_option.N = maturity_days
+            vanilla_option.K = hedged_cfg['K']
+            
+            return vanilla_option
         
         elif deriv_type == 'barrier':
             # Use BarrierOption with neural network (no precomputation needed)
@@ -75,7 +81,7 @@ class DerivativeFactory:
                 f"{hedged_cfg['option_type']} with barrier={hedged_cfg['barrier_level']}"
             )
             
-            return BarrierOption(
+            barrier_option = BarrierOption(
                 model_path=hedged_cfg['model_path'],
                 barrier_level=hedged_cfg['barrier_level'],
                 barrier_type=hedged_cfg.get('barrier_type', 'up-and-in'),
@@ -83,6 +89,12 @@ class DerivativeFactory:
                 r_annual=config['simulation']['r'],
                 device=config['training']['device']
             )
+            
+            # FIX: Store maturity and strike on barrier option too
+            barrier_option.N = int(hedged_cfg['T'] * 252)
+            barrier_option.K = hedged_cfg['K']
+            
+            return barrier_option
         
         else:
             raise ValueError(f"Unknown derivative type: {deriv_type}")
@@ -148,7 +160,6 @@ class DerivativeFactory:
                 def __init__(self, precomp_dict, r_daily, mat_days):
                     self.r_daily = r_daily
                     self._data = {mat_days: precomp_dict}
-                    self.N = mat_days
                 
                 def get_precomputed_data(self, N):
                     return self._data.get(N)
@@ -159,13 +170,17 @@ class DerivativeFactory:
                 maturity_days
             )
             
-            hedging_derivs.append(
-                VanillaOption(
-                    precomputation_manager=precomp_manager,
-                    garch_params=config['garch'],
-                    option_type=opt_type
-                )
+            hedging_option = VanillaOption(
+                precomputation_manager=precomp_manager,
+                garch_params=config['garch'],
+                option_type=opt_type
             )
+            
+            # FIX: Store maturity and strike on the hedging option object
+            hedging_option.N = maturity_days
+            hedging_option.K = strike
+            
+            hedging_derivs.append(hedging_option)
             
             logger.info(
                 f"Created hedging option {i+1}: {opt_type} with K={strike}, "
