@@ -158,6 +158,8 @@ def create_optimizer(
     return optimizer
 
 
+# In train.py, update train_episode function:
+
 def train_episode(
     episode: int,
     config: Dict[str, Any],
@@ -170,7 +172,6 @@ def train_episode(
 ) -> Dict[str, Any]:
     """Train for a single episode."""
     
-    # Create simulation instance
     hedged_cfg = config["hedged_option"]
     sim = HedgingSim(
         S0=config["simulation"]["S0"],
@@ -187,7 +188,6 @@ def train_episode(
         seed=episode
     )
     
-    # Create environment with derivative objects
     env = HedgingEnvGARCH(
         sim=sim,
         derivative=hedged_derivative,
@@ -195,23 +195,25 @@ def train_episode(
         garch_params=config["garch"],
         n_hedging_instruments=config["instruments"]["n_hedging_instruments"],
         dt_min=config["environment"]["dt_min"],
-        device=str(device)
+        device=str(device),
+        transaction_costs=config.get("transaction_costs", {
+            'stock': config["simulation"]["TCP"],
+            'vanilla_option': config["simulation"]["TCP"] * 10,
+            'barrier_option': config["simulation"]["TCP"] * 20
+        })
     )
     
     env.reset()
     
-    # Simulate trajectory
     S_traj, V_traj, O_traj, obs_sequence, RL_positions = \
         env.simulate_trajectory_and_get_observations(policy_net)
     
     terminal_errors, trajectories = env.simulate_full_trajectory(RL_positions, O_traj)
     
-    # Compute loss
     optimizer.zero_grad()
     loss = torch.abs(terminal_errors).mean()
     loss.backward()
     
-    # Gradient clipping
     torch.nn.utils.clip_grad_norm_(
         policy_net.parameters(),
         max_norm=config["training"]["gradient_clip_max_norm"]
@@ -219,7 +221,6 @@ def train_episode(
     
     optimizer.step()
     
-    # Check for NaN/Inf
     if torch.isnan(loss) or torch.isinf(loss):
         logging.error("Loss became NaN/Inf")
         raise RuntimeError("Loss became NaN/Inf")
