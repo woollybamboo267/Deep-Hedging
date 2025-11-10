@@ -43,11 +43,11 @@ def create_features_batched(S0, K, T, r, barrier, h0, option_type="call"):
         [batch_size, 33] feature tensor
     """
     # Make sure all inputs are tensors and broadcastable
-    K = torch.as_tensor(K, device=S0.device).expand_as(S0)
-    T = torch.as_tensor(T, device=S0.device).expand_as(S0)
-    r = torch.as_tensor(r, device=S0.device).expand_as(S0)
-    barrier = torch.as_tensor(barrier, device=S0.device).expand_as(S0)
-    h0 = torch.as_tensor(h0, device=S0.device).expand_as(S0)
+    K = torch.tensor(K, device=S0.device).expand_as(S0)
+    T = torch.tensor(T, device=S0.device).expand_as(S0)
+    r = torch.tensor(r, device=S0.device).expand_as(S0)
+    barrier = torch.tensor(barrier, device=S0.device).expand_as(S0)
+    h0 = torch.tensor(h0, device=S0.device).expand_as(S0)
 
     moneyness = S0 / K
     barrier_distance_S = barrier / S0
@@ -133,7 +133,7 @@ class BarrierOption(DerivativeBase):
 
     def price(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float) -> torch.Tensor:
         T = self._compute_time_to_maturity(step_idx, N)
-        S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
+        S_t = torch.tensor(S, dtype=torch.float32, device=self.device)
         original_shape = S_t.shape
         S_flat = S_t.reshape(-1)
 
@@ -156,7 +156,7 @@ class BarrierOption(DerivativeBase):
 
     def delta(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float) -> torch.Tensor:
         T = self._compute_time_to_maturity(step_idx, N)
-        S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device, requires_grad=True)
+        S_t = torch.tensor(S, dtype=torch.float32, device=self.device, requires_grad=True)
         original_shape = S_t.shape
         S_flat = S_t.reshape(-1)
 
@@ -179,7 +179,7 @@ class BarrierOption(DerivativeBase):
 
     def gamma(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float) -> torch.Tensor:
         T = self._compute_time_to_maturity(step_idx, N)
-        S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device, requires_grad=True)
+        S_t = torch.tensor(S, dtype=torch.float32, device=self.device, requires_grad=True)
         original_shape = S_t.shape
         S_flat = S_t.reshape(-1)
 
@@ -203,7 +203,7 @@ class BarrierOption(DerivativeBase):
 
     def vega(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float) -> torch.Tensor:
         T = self._compute_time_to_maturity(step_idx, N)
-        S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
+        S_t = torch.tensor(S, dtype=torch.float32, device=self.device)
         original_shape = S_t.shape
         S_flat = S_t.reshape(-1)
 
@@ -232,7 +232,7 @@ class BarrierOption(DerivativeBase):
 
     def theta(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float) -> torch.Tensor:
         T_val = self._compute_time_to_maturity(step_idx, N)
-        S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
+        S_t = torch.tensor(S, dtype=torch.float32, device=self.device)
         original_shape = S_t.shape
         S_flat = S_t.reshape(-1)
 
