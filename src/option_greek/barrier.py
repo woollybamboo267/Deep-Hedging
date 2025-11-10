@@ -29,8 +29,35 @@ class BarrierOptionNN(nn.Module):
         return torch.clamp(x, min=0.0)
 
 
-def create_features(S0, K, T, r, barrier, h0, option_type="call"):
-    """Feature engineering - must match training."""
+def create_features_batched(S0, K, T, r, barrier, h0, option_type="call"):
+    """
+    Batched feature engineering - processes all spot prices at once.
+    
+    Args:
+        S0: [batch_size] tensor of spot prices
+        K: scalar or [batch_size] tensor
+        T: scalar or [batch_size] tensor
+        r: scalar or [batch_size] tensor
+        barrier: scalar or [batch_size] tensor
+        h0: scalar or [batch_size] tensor
+        option_type: 'call' or 'put'
+    
+    Returns:
+        [batch_size, 33] feature tensor
+    """
+    # Ensure all inputs are tensors with same shape
+    if not isinstance(K, torch.Tensor):
+        K = torch.full_like(S0, K)
+    if not isinstance(T, torch.Tensor):
+        T = torch.full_like(S0, T)
+    if not isinstance(r, torch.Tensor):
+        r = torch.full_like(S0, r)
+    if not isinstance(barrier, torch.Tensor):
+        barrier = torch.full_like(S0, barrier)
+    if not isinstance(h0, torch.Tensor):
+        h0 = torch.full_like(S0, h0)
+    
+    # Compute all features in batched manner
     moneyness = S0 / K
     barrier_distance_S = barrier / S0
     barrier_distance_K = barrier / K
@@ -41,37 +68,28 @@ def create_features(S0, K, T, r, barrier, h0, option_type="call"):
     vol_proxy = torch.sqrt(h0)
     vol_time = vol_proxy * sqrt_T
     drift_adj = (r - 0.5 * h0) * T
-    intrinsic = torch.clamp(S0 - K, min=0.0) if option_type == "call" else torch.clamp(K - S0, min=0.0)
+    
+    if option_type == "call":
+        intrinsic = torch.clamp(S0 - K, min=0.0)
+        is_itm = (S0 > K).float()
+        is_otm = (S0 < K).float()
+    else:
+        intrinsic = torch.clamp(K - S0, min=0.0)
+        is_itm = (S0 < K).float()
+        is_otm = (S0 > K).float()
+    
     dist_atm = torch.abs(log_m)
-
-    is_itm = torch.where(
-        (S0 > K) if option_type == "call" else (S0 < K),
-        torch.tensor(1.0, device=S0.device, dtype=S0.dtype),
-        torch.tensor(0.0, device=S0.device, dtype=S0.dtype)
-    )
-    is_otm = torch.where(
-        (S0 < K) if option_type == "call" else (S0 > K),
-        torch.tensor(1.0, device=S0.device, dtype=S0.dtype),
-        torch.tensor(0.0, device=S0.device, dtype=S0.dtype)
-    )
-    is_atm = torch.where(
-        torch.abs(moneyness - 1.0) < 0.05,
-        torch.tensor(1.0, device=S0.device, dtype=S0.dtype),
-        torch.tensor(0.0, device=S0.device, dtype=S0.dtype)
-    )
-
+    is_atm = (torch.abs(moneyness - 1.0) < 0.05).float()
+    
     breach_risk = torch.clamp(1.0 - (barrier - S0) / S0, min=0.0)
     safe_dist = (barrier - S0) / torch.clamp(vol_proxy * S0 * sqrt_T, min=1e-8)
     time_decay = 1.0 / (T + 1e-3)
-    short_dated = torch.where(
-        T < 0.1,
-        torch.tensor(1.0, device=T.device, dtype=T.dtype),
-        torch.tensor(0.0, device=T.device, dtype=T.dtype)
-    )
-
+    short_dated = (T < 0.1).float()
+    
     variance_term = h0 * T
     vol_of_vol = h0 ** 1.5
-
+    
+    # Stack all features: [batch_size, 33]
     features = torch.stack([
         moneyness, K, T, r,
         barrier_distance_S, barrier_distance_K, h0,
@@ -90,7 +108,7 @@ def create_features(S0, K, T, r, barrier, h0, option_type="call"):
 
 
 class BarrierOption(DerivativeBase):
-    """Barrier option using neural network surrogate model."""
+    """Barrier option using neural network surrogate model with batched inference."""
     
     def __init__(self, model_path: str, barrier_level: float, 
                  barrier_type: str = "up-and-in", option_type: str = "call",
@@ -141,7 +159,7 @@ class BarrierOption(DerivativeBase):
     
     def price(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float) -> torch.Tensor:
         """
-        Compute barrier option price.
+        Compute barrier option price with batched inference.
         
         Args:
             S: Spot price(s) - tensor of any shape
@@ -157,98 +175,150 @@ class BarrierOption(DerivativeBase):
         
         # Convert inputs to tensors
         S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
-        K_t = torch.tensor(K, dtype=torch.float32, device=self.device)
-        T_t = torch.tensor(T, dtype=torch.float32, device=self.device)
-        r_t = torch.tensor(self.r_daily * 252.0, dtype=torch.float32, device=self.device)  # Annual rate
-        barrier_t = torch.tensor(self.barrier_level, dtype=torch.float32, device=self.device)
-        h0_t = torch.tensor(h0, dtype=torch.float32, device=self.device)
-        
-        # Handle batching
         original_shape = S_t.shape
         S_flat = S_t.reshape(-1)
         
-        prices = []
-        for s in S_flat:
-            features = create_features(s, K_t, T_t, r_t, barrier_t, h0_t, self.option_type)
-            features_norm = (features - self.mean) / self.std
-            with torch.no_grad():
-                price = self.model(features_norm.unsqueeze(0)).squeeze()
-            prices.append(price)
+        # Create batched tensors for all inputs
+        K_batch = torch.full_like(S_flat, K)
+        T_batch = torch.full_like(S_flat, T)
+        r_batch = torch.full_like(S_flat, self.r_daily * 252.0)
+        barrier_batch = torch.full_like(S_flat, self.barrier_level)
+        h0_batch = torch.full_like(S_flat, h0)
         
-        prices_tensor = torch.stack(prices).reshape(original_shape)
-        return prices_tensor
+        # Batched feature computation
+        features = create_features_batched(
+            S_flat, K_batch, T_batch, r_batch, barrier_batch, h0_batch, 
+            self.option_type
+        )
+        
+        # Normalize features
+        features_norm = (features - self.mean) / self.std
+        
+        # Single batched forward pass
+        with torch.no_grad():
+            prices = self.model(features_norm).squeeze(-1)
+        
+        return prices.reshape(original_shape)
     
     def delta(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float) -> torch.Tensor:
-        """Compute delta via automatic differentiation."""
+        """Compute delta via automatic differentiation with batching."""
         T = self._compute_time_to_maturity(step_idx, N)
         
-        S_t = torch.tensor(S, dtype=torch.float32, requires_grad=True, device=self.device)
-        K_t = torch.tensor(K, dtype=torch.float32, device=self.device)
-        T_t = torch.tensor(T, dtype=torch.float32, device=self.device)
-        r_t = torch.tensor(self.r_daily * 252.0, dtype=torch.float32, device=self.device)
-        barrier_t = torch.tensor(self.barrier_level, dtype=torch.float32, device=self.device)
-        h0_t = torch.tensor(h0, dtype=torch.float32, device=self.device)
+        S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device, requires_grad=True)
+        original_shape = S_t.shape
+        S_flat = S_t.reshape(-1)
         
-        features = create_features(S_t, K_t, T_t, r_t, barrier_t, h0_t, self.option_type)
+        K_batch = torch.full_like(S_flat, K)
+        T_batch = torch.full_like(S_flat, T)
+        r_batch = torch.full_like(S_flat, self.r_daily * 252.0)
+        barrier_batch = torch.full_like(S_flat, self.barrier_level)
+        h0_batch = torch.full_like(S_flat, h0)
+        
+        features = create_features_batched(
+            S_flat, K_batch, T_batch, r_batch, barrier_batch, h0_batch,
+            self.option_type
+        )
         features_norm = (features - self.mean) / self.std
-        price = self.model(features_norm.unsqueeze(0)).squeeze()
+        prices = self.model(features_norm).squeeze(-1)
         
-        delta = torch.autograd.grad(price, S_t, create_graph=False)[0]
-        return delta
+        # Compute gradients for all prices at once
+        deltas = []
+        for i, price in enumerate(prices):
+            delta = torch.autograd.grad(price, S_t, retain_graph=(i < len(prices)-1))[0]
+            deltas.append(delta.reshape(-1)[i])
+        
+        delta_tensor = torch.stack(deltas)
+        return delta_tensor.reshape(original_shape)
     
     def gamma(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float) -> torch.Tensor:
-        """Compute gamma via automatic differentiation."""
+        """Compute gamma via automatic differentiation with batching."""
         T = self._compute_time_to_maturity(step_idx, N)
         
-        S_t = torch.tensor(S, dtype=torch.float32, requires_grad=True, device=self.device)
-        K_t = torch.tensor(K, dtype=torch.float32, device=self.device)
-        T_t = torch.tensor(T, dtype=torch.float32, device=self.device)
-        r_t = torch.tensor(self.r_daily * 252.0, dtype=torch.float32, device=self.device)
-        barrier_t = torch.tensor(self.barrier_level, dtype=torch.float32, device=self.device)
-        h0_t = torch.tensor(h0, dtype=torch.float32, device=self.device)
+        S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device, requires_grad=True)
+        original_shape = S_t.shape
+        S_flat = S_t.reshape(-1)
         
-        features = create_features(S_t, K_t, T_t, r_t, barrier_t, h0_t, self.option_type)
+        K_batch = torch.full_like(S_flat, K)
+        T_batch = torch.full_like(S_flat, T)
+        r_batch = torch.full_like(S_flat, self.r_daily * 252.0)
+        barrier_batch = torch.full_like(S_flat, self.barrier_level)
+        h0_batch = torch.full_like(S_flat, h0)
+        
+        features = create_features_batched(
+            S_flat, K_batch, T_batch, r_batch, barrier_batch, h0_batch,
+            self.option_type
+        )
         features_norm = (features - self.mean) / self.std
-        price = self.model(features_norm.unsqueeze(0)).squeeze()
+        prices = self.model(features_norm).squeeze(-1)
         
-        delta = torch.autograd.grad(price, S_t, create_graph=True, retain_graph=True)[0]
-        gamma = torch.autograd.grad(delta, S_t)[0]
-        return gamma
+        # Compute second derivatives
+        gammas = []
+        for i, price in enumerate(prices):
+            delta = torch.autograd.grad(price, S_t, create_graph=True, retain_graph=True)[0]
+            gamma = torch.autograd.grad(delta.reshape(-1)[i], S_t, retain_graph=(i < len(prices)-1))[0]
+            gammas.append(gamma.reshape(-1)[i])
+        
+        gamma_tensor = torch.stack(gammas)
+        return gamma_tensor.reshape(original_shape)
     
     def vega(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float) -> torch.Tensor:
-        """Compute vega via automatic differentiation."""
+        """Compute vega via automatic differentiation with batching."""
         T = self._compute_time_to_maturity(step_idx, N)
         
-        S_t = torch.tensor(S, dtype=torch.float32, device=self.device)
-        K_t = torch.tensor(K, dtype=torch.float32, device=self.device)
-        T_t = torch.tensor(T, dtype=torch.float32, device=self.device)
-        r_t = torch.tensor(self.r_daily * 252.0, dtype=torch.float32, device=self.device)
-        barrier_t = torch.tensor(self.barrier_level, dtype=torch.float32, device=self.device)
-        h0_t = torch.tensor(h0, dtype=torch.float32, requires_grad=True, device=self.device)
+        S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
+        original_shape = S_t.shape
+        S_flat = S_t.reshape(-1)
         
-        features = create_features(S_t, K_t, T_t, r_t, barrier_t, h0_t, self.option_type)
+        h0_t = torch.tensor(h0, dtype=torch.float32, device=self.device, requires_grad=True)
+        
+        K_batch = torch.full_like(S_flat, K)
+        T_batch = torch.full_like(S_flat, T)
+        r_batch = torch.full_like(S_flat, self.r_daily * 252.0)
+        barrier_batch = torch.full_like(S_flat, self.barrier_level)
+        h0_batch = torch.full_like(S_flat, h0)
+        
+        features = create_features_batched(
+            S_flat, K_batch, T_batch, r_batch, barrier_batch, h0_batch,
+            self.option_type
+        )
         features_norm = (features - self.mean) / self.std
-        price = self.model(features_norm.unsqueeze(0)).squeeze()
+        prices = self.model(features_norm).squeeze(-1)
         
-        vega_raw = torch.autograd.grad(price, h0_t, allow_unused=True)[0]
-        vega = vega_raw * 2 * torch.sqrt(h0_t) if vega_raw is not None else torch.tensor(0.0, device=self.device)
-        return vega
+        # Compute vega for batch (approximate - use central price)
+        vega_raw = torch.autograd.grad(prices.mean(), h0_t, allow_unused=True)[0]
+        if vega_raw is not None:
+            vega = vega_raw * 2 * torch.sqrt(h0_t)
+            return torch.full_like(S_t, vega.item())
+        else:
+            return torch.zeros_like(S_t)
     
     def theta(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float) -> torch.Tensor:
-        """Compute theta via automatic differentiation."""
+        """Compute theta via automatic differentiation with batching."""
         T = self._compute_time_to_maturity(step_idx, N)
         
-        S_t = torch.tensor(S, dtype=torch.float32, device=self.device)
-        K_t = torch.tensor(K, dtype=torch.float32, device=self.device)
-        T_t = torch.tensor(T, dtype=torch.float32, requires_grad=True, device=self.device)
-        r_t = torch.tensor(self.r_daily * 252.0, dtype=torch.float32, device=self.device)
-        barrier_t = torch.tensor(self.barrier_level, dtype=torch.float32, device=self.device)
-        h0_t = torch.tensor(h0, dtype=torch.float32, device=self.device)
+        S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
+        original_shape = S_t.shape
+        S_flat = S_t.reshape(-1)
         
-        features = create_features(S_t, K_t, T_t, r_t, barrier_t, h0_t, self.option_type)
+        T_t = torch.tensor(T, dtype=torch.float32, device=self.device, requires_grad=True)
+        
+        K_batch = torch.full_like(S_flat, K)
+        T_batch = torch.full_like(S_flat, T)
+        r_batch = torch.full_like(S_flat, self.r_daily * 252.0)
+        barrier_batch = torch.full_like(S_flat, self.barrier_level)
+        h0_batch = torch.full_like(S_flat, h0)
+        
+        features = create_features_batched(
+            S_flat, K_batch, T_batch, r_batch, barrier_batch, h0_batch,
+            self.option_type
+        )
         features_norm = (features - self.mean) / self.std
-        price = self.model(features_norm.unsqueeze(0)).squeeze()
+        prices = self.model(features_norm).squeeze(-1)
         
-        theta_raw = torch.autograd.grad(price, T_t, allow_unused=True)[0]
-        theta = -theta_raw if theta_raw is not None else torch.tensor(0.0, device=self.device)
-        return theta
+        # Compute theta for batch (approximate - use central price)
+        theta_raw = torch.autograd.grad(prices.mean(), T_t, allow_unused=True)[0]
+        if theta_raw is not None:
+            theta = -theta_raw
+            return torch.full_like(S_t, theta.item())
+        else:
+            return torch.zeros_like(S_t)
