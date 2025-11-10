@@ -114,7 +114,7 @@ class BarrierOption(DerivativeBase):
         self.r_annual = r_annual
         self.r_daily = r_annual / 252.0
 
-        checkpoint = torch.load(model_path, map_location=self.device)
+        checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
         self.model = BarrierOptionNN(input_dim=33).to(self.device)
         self.model.load_state_dict(checkpoint["model"])
         self.model.eval()
