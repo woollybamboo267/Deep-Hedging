@@ -3,20 +3,6 @@ import matplotlib.pyplot as plt
 import torch
 import logging
 from typing import Dict, Any, Tuple
-"""
-Visualization module for hedging results.
-
-This module handles all plotting and visualization of training results,
-including comparison plots between RL and practitioner hedging strategies.
-
-Location: src/visualization/plot_results.py
-"""
-
-import numpy as np
-import matplotlib.pyplot as plt
-import torch
-import logging
-from typing import Dict, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -27,20 +13,17 @@ def compute_practitioner_benchmark(
     O_traj: Dict[int, torch.Tensor],
     n_hedging_instruments: int
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], np.ndarray]:
-    logger.info(f"DEBUG: S_traj type={type(S_traj)}, shape={S_traj.shape if hasattr(S_traj, 'shape') else 'no shape'}")
-    logger.info(f"DEBUG: n_hedging_instruments={n_hedging_instruments}")
     """
-    Compute the practitioner (Heston-Nandi) benchmark hedge.
+    Compute the practitioner benchmark hedge using derivatives' Greek methods.
     
-    This function calculates the optimal hedging positions using the
-    analytical Heston-Nandi Greeks (delta, gamma, vega) and simulates
-    the hedging strategy to get terminal errors.
+    Works with ANY derivative type (vanilla, barrier, exotic) as long as they
+    implement the standard Greek interface (delta, gamma, vega, theta).
     
     Args:
         env: Hedging environment instance
         S_traj: Stock price trajectory [M, N+1]
         O_traj: Option price trajectories dict {maturity: [M, N+1]}
-        n_hedging_instruments: Number of hedging instruments (1, 2, or 3)
+        n_hedging_instruments: Number of hedging instruments (1, 2, 3, or 4)
         
     Returns:
         Tuple containing:
@@ -48,61 +31,51 @@ def compute_practitioner_benchmark(
             - trajectories_hn: Dict with simulation trajectories
             - terminal_hedge_error_hn: [M,] terminal errors
     """
-    logger.info(f"Computing analytical HN hedge for all {env.M} paths")
+    logger.info(f"Computing analytical hedge for all {env.M} paths using {type(env.derivative).__name__}")
     
-    # Build portfolio greeks based on number of instruments
+    # Define which greeks to hedge based on number of instruments
     if n_hedging_instruments == 1:
-        # Delta hedge only
-        HN_delta_all = env.compute_all_paths_hn_delta(S_traj)
-        portfolio_greeks = {
-            'delta': -env.side * HN_delta_all
-        }
+        greek_names = ['delta']
     elif n_hedging_instruments == 2:
-        # Delta-gamma hedge
-        HN_delta_all = env.compute_all_paths_hn_delta(S_traj)
-        HN_gamma_1yr = env.compute_all_paths_hn_gamma(S_traj)
-        portfolio_greeks = {
-            'delta': -env.side * HN_delta_all,
-            'gamma': -env.side * HN_gamma_1yr
-        }
+        greek_names = ['delta', 'gamma']
     elif n_hedging_instruments == 3:
-        # Delta-gamma-vega hedge
-        HN_delta_all = env.compute_all_paths_hn_delta(S_traj)
-        HN_gamma_1yr = env.compute_all_paths_hn_gamma(S_traj)
-        HN_vega_1yr = env.compute_all_paths_hn_vega(S_traj)
-        portfolio_greeks = {
-            'delta': -env.side * HN_delta_all,
-            'gamma': -env.side * HN_gamma_1yr,
-            'vega': -env.side * HN_vega_1yr
-        }
+        greek_names = ['delta', 'gamma', 'vega']
     elif n_hedging_instruments == 4:
-        # Delta-gamma-vega hedge
-        HN_delta_all = env.compute_all_paths_hn_delta(S_traj)
-        HN_gamma_1yr = env.compute_all_paths_hn_gamma(S_traj)
-        HN_vega_1yr = env.compute_all_paths_hn_vega(S_traj)
-        HN_theta_1yr = env.compute_all_paths_hn_theta(S_traj)
-
-        portfolio_greeks = {
-            'delta': -env.side * HN_delta_all,
-            'gamma': -env.side * HN_gamma_1yr,
-            'vega': -env.side * HN_vega_1yr,
-            'theta': -env.side * HN_theta_1yr
-        }
+        greek_names = ['delta', 'gamma', 'vega', 'theta']
     else:
-        raise ValueError(f"n_hedging_instruments must be 1, 2, 3 or 4")
+        raise ValueError(f"n_hedging_instruments must be 1-4, got {n_hedging_instruments}")
     
-    # Compute optimal HN positions
+    # Compute portfolio greeks using the derivative's Greek methods
+    portfolio_greeks = {}
+    h0_current = env.h_t.mean().item()
+    
+    for greek_name in greek_names:
+        greek_traj = env.compute_all_paths_greeks(S_traj, greek_name)
+        portfolio_greeks[greek_name] = -env.side * greek_traj
+    
+    # Compute optimal positions using linear algebra solver
     HN_positions_all = env.compute_hn_option_positions(S_traj, portfolio_greeks)
     
-    # Simulate HN strategy
+    # Simulate the benchmark strategy
     _, trajectories_hn = env.simulate_full_trajectory(HN_positions_all, O_traj)
     
     # Compute terminal errors
     S_final = trajectories_hn['S'][:, -1]
-    payoff = torch.clamp(S_final - env.K, min=0.0) if env.option_type.lower() == "call" \
-             else torch.clamp(env.K - S_final, min=0.0)
+    
+    # Compute payoff - works for both vanilla and barrier
+    if hasattr(env.derivative, 'option_type'):
+        opt_type = env.derivative.option_type.lower()
+    else:
+        opt_type = env.option_type.lower()
+    
+    if opt_type == "call":
+        payoff = torch.clamp(S_final - env.K, min=0.0)
+    else:
+        payoff = torch.clamp(env.K - S_final, min=0.0)
+    
     payoff = payoff * env.contract_size
     
+    # Compute terminal value
     terminal_value_hn = trajectories_hn['B'][:, -1] + HN_positions_all[:, -1, 0] * S_final
     for i, maturity in enumerate(env.instrument_maturities[1:], start=1):
         terminal_value_hn += HN_positions_all[:, -1, i] * O_traj[maturity][:, -1]
@@ -121,6 +94,8 @@ def compute_rl_metrics(
     """
     Compute RL strategy metrics.
     
+    Works with any derivative type.
+    
     Args:
         env: Hedging environment
         RL_positions: [M, N+1, n_instruments] RL positions
@@ -131,8 +106,18 @@ def compute_rl_metrics(
         Tuple of (terminal_hedge_error, metrics_dict)
     """
     S_final = trajectories['S'][:, -1]
-    payoff = torch.clamp(S_final - env.K, min=0.0) if env.option_type.lower() == "call" \
-             else torch.clamp(env.K - S_final, min=0.0)
+    
+    # Determine option type from derivative
+    if hasattr(env.derivative, 'option_type'):
+        opt_type = env.derivative.option_type.lower()
+    else:
+        opt_type = env.option_type.lower()
+    
+    if opt_type == "call":
+        payoff = torch.clamp(S_final - env.K, min=0.0)
+    else:
+        payoff = torch.clamp(env.K - S_final, min=0.0)
+    
     payoff = payoff * env.contract_size
     
     # Compute terminal value
@@ -164,8 +149,9 @@ def plot_episode_results(
     """
     Create comprehensive visualization of episode results.
     
-    This function generates a 3x2 subplot comparing RL and practitioner
-    hedging strategies, including positions, prices, and error distributions.
+    This function is now derivative-agnostic and works with vanilla options,
+    barrier options, and any future derivative type that implements the
+    standard Greek interface.
     
     Args:
         episode: Episode number
@@ -184,6 +170,10 @@ def plot_episode_results(
     
     n_inst = config["instruments"]["n_hedging_instruments"]
     path_idx = config["output"]["sample_path_index"]
+    
+    # Determine derivative type for logging
+    derivative_type = type(env.derivative).__name__
+    logger.info(f"Plotting results for {derivative_type}")
     
     # Compute RL metrics
     terminal_hedge_error_rl, rl_metrics = compute_rl_metrics(
@@ -210,7 +200,7 @@ def plot_episode_results(
     # ===== PLOT 1: Stock Delta Comparison =====
     axes[0, 0].plot(time_steps, rl_positions_sample[:, 0], label='RL Delta',
                     linewidth=2, color='tab:blue')
-    axes[0, 0].plot(time_steps, hn_positions_sample[:, 0], label='HN Delta (Practitioner)',
+    axes[0, 0].plot(time_steps, hn_positions_sample[:, 0], label='Practitioner Delta',
                     linewidth=2, linestyle='--', alpha=0.8, color='tab:orange')
     axes[0, 0].set_xlabel("Time Step", fontsize=11)
     axes[0, 0].set_ylabel("Delta", fontsize=11)
@@ -229,7 +219,7 @@ def plot_episode_results(
             axes[0, 1].plot(time_steps, rl_positions_sample[:, i],
                           label=f'RL {label_suffix}', linewidth=2)
             axes[0, 1].plot(time_steps, hn_positions_sample[:, i],
-                          label=f'HN {label_suffix}', linewidth=2,
+                          label=f'Prac {label_suffix}', linewidth=2,
                           linestyle='--', alpha=0.8)
         axes[0, 1].axhline(y=0, color='k', linestyle='-', alpha=0.3)
         axes[0, 1].set_xlabel("Time Step", fontsize=11)
@@ -246,6 +236,12 @@ def plot_episode_results(
     axes[1, 0].plot(time_steps, S_traj[path_idx].cpu().detach().numpy(),
                     label='Stock Price', color='tab:green', linewidth=2)
     axes[1, 0].axhline(y=env.K, color='r', linestyle='--', label='Strike', alpha=0.7)
+    
+    # Add barrier level if hedging a barrier option
+    if hasattr(env.derivative, 'barrier_level'):
+        axes[1, 0].axhline(y=env.derivative.barrier_level, color='purple', 
+                          linestyle=':', label='Barrier', alpha=0.7, linewidth=2)
+    
     axes[1, 0].set_xlabel("Time Step", fontsize=11)
     axes[1, 0].set_ylabel("Stock Price", fontsize=11)
     axes[1, 0].set_title(f"Stock Price Trajectory (Path {path_idx})", fontsize=12)
@@ -270,22 +266,24 @@ def plot_episode_results(
     axes[2, 0].axhline(y=0, color='k', linestyle='-', alpha=0.3)
     axes[2, 0].set_xlabel("Time Step", fontsize=11)
     axes[2, 0].set_ylabel("Delta Difference", fontsize=11)
-    axes[2, 0].set_title(f"RL Delta - HN Delta (Path {path_idx})", fontsize=12)
+    axes[2, 0].set_title(f"RL Delta - Practitioner Delta (Path {path_idx})", fontsize=12)
     axes[2, 0].grid(True, alpha=0.3)
     
     # ===== PLOT 6: Terminal Error Distribution =====
     axes[2, 1].hist(terminal_hedge_error_rl, bins=50, color="tab:blue", alpha=0.7,
                     edgecolor='black', label='RL')
     axes[2, 1].hist(terminal_hedge_error_hn, bins=50, color="tab:orange", alpha=0.7,
-                    edgecolor='black', label='HN (Practitioner)')
+                    edgecolor='black', label='Practitioner')
     axes[2, 1].axvline(x=0, color='r', linestyle='--', linewidth=2)
     axes[2, 1].set_xlabel("Terminal Hedge Error", fontsize=11)
     axes[2, 1].set_ylabel("Frequency", fontsize=11)
     
     greek_labels = {1: 'Delta', 2: 'Delta-Gamma', 3: 'Delta-Gamma-Vega', 4: 'Delta-Gamma-Vega-Theta'}
-    title_text = (f"Episode {episode} - {n_inst} Instruments ({greek_labels[n_inst]})\n"
+    hedged_option_type = config["hedged_option"]["type"].capitalize()
+    
+    title_text = (f"Episode {episode} - {n_inst} Instruments ({greek_labels[n_inst]}) - Hedging {hedged_option_type}\n"
                 f"RL: MSE={rl_metrics['mse']:.4f} | SMSE={rl_metrics['smse']:.6f} | CVaR95={rl_metrics['cvar_95']:.4f}\n"
-                f"HN: MSE={mse_hn:.4f} | SMSE={smse_hn:.6f} | CVaR95={cvar_95_hn:.4f}")
+                f"Prac: MSE={mse_hn:.4f} | SMSE={smse_hn:.6f} | CVaR95={cvar_95_hn:.4f}")
     axes[2, 1].set_title(title_text, fontsize=10)
     axes[2, 1].legend(fontsize=10)
     axes[2, 1].grid(True, alpha=0.3)
@@ -324,6 +322,7 @@ def plot_episode_results(
         f"SMSE={rl_metrics['smse']:.6f} | CVaR95={rl_metrics['cvar_95']:.6f}"
     )
     logger.info(
-        f"HN Performance: MSE={mse_hn:.6f} | "
+        f"Practitioner Performance: MSE={mse_hn:.6f} | "
         f"SMSE={smse_hn:.6f} | CVaR95={cvar_95_hn:.6f}"
     )
+    logger.info(f"Derivative Type: {derivative_type}")
