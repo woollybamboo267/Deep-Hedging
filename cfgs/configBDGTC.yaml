@@ -40,7 +40,10 @@ hedged_option:
   barrier_level: 120.0
   barrier_type: "up-and-in"
   model_path: "models/barrier/best_finetuned_up-and-in_call.1.pth"
-
+transaction_costs:
+    stock: 0.0001
+    vanilla_option: 0.001
+    barrier_option: 0.002
 simulation:
   S0: 100
   r: 0.04
@@ -48,7 +51,6 @@ simulation:
   contract_size: 1
   M: 1000
   N: 252
-  TCP: 0.001  # 2x higher for barrier options
 
 environment:
   dt_min: 1.0e-10
