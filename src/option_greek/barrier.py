@@ -268,7 +268,6 @@ class BarrierOption(DerivativeBase):
         return gamma.reshape(original_shape)
     
     def vega(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float) -> torch.Tensor:
-        """Compute vega via automatic differentiation with batching."""
         T = self._compute_time_to_maturity(step_idx, N)
         
         S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
@@ -281,7 +280,7 @@ class BarrierOption(DerivativeBase):
         T_batch = torch.full_like(S_flat, T)
         r_batch = torch.full_like(S_flat, self.r_daily * 252.0)
         barrier_batch = torch.full_like(S_flat, self.barrier_level)
-        h0_batch = torch.full_like(S_flat, h0)
+        h0_batch = h0_t.expand_as(S_flat)  # Changed from torch.full_like(S_flat, h0)
         
         features = create_features_batched(
             S_flat, K_batch, T_batch, r_batch, barrier_batch, h0_batch,
@@ -290,16 +289,13 @@ class BarrierOption(DerivativeBase):
         features_norm = (features - self.mean) / self.std
         prices = self.model(features_norm).squeeze(-1)
         
-        # Compute vega for batch
         vega_raw = torch.autograd.grad(prices.mean(), h0_t, allow_unused=True)[0]
         if vega_raw is not None:
             vega = vega_raw * 2 * torch.sqrt(h0_t)
             return torch.full(original_shape, vega.item(), device=self.device)
         else:
             return torch.zeros(original_shape, device=self.device)
-    
     def theta(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float) -> torch.Tensor:
-        """Compute theta via automatic differentiation with batching."""
         T = self._compute_time_to_maturity(step_idx, N)
         
         S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
@@ -309,7 +305,7 @@ class BarrierOption(DerivativeBase):
         T_t = torch.tensor(T, dtype=torch.float32, device=self.device, requires_grad=True)
         
         K_batch = torch.full_like(S_flat, K)
-        T_batch = torch.full_like(S_flat, T)
+        T_batch = T_t.expand_as(S_flat)  # Changed from torch.full_like(S_flat, T)
         r_batch = torch.full_like(S_flat, self.r_daily * 252.0)
         barrier_batch = torch.full_like(S_flat, self.barrier_level)
         h0_batch = torch.full_like(S_flat, h0)
@@ -321,7 +317,6 @@ class BarrierOption(DerivativeBase):
         features_norm = (features - self.mean) / self.std
         prices = self.model(features_norm).squeeze(-1)
         
-        # Compute theta for batch
         theta_raw = torch.autograd.grad(prices.mean(), T_t, allow_unused=True)[0]
         if theta_raw is not None:
             theta = -theta_raw
