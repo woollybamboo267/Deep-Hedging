@@ -174,7 +174,7 @@ class BarrierOption(DerivativeBase):
         T = self._compute_time_to_maturity(step_idx, N)
         
         # Convert inputs to tensors
-        S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
+        S_t = torch.tensor(S, dtype=torch.float32, device=self.device)
         original_shape = S_t.shape
         S_flat = S_t.reshape(-1)
         
@@ -204,7 +204,7 @@ class BarrierOption(DerivativeBase):
         """Compute delta via automatic differentiation with batching."""
         T = self._compute_time_to_maturity(step_idx, N)
         
-        S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device, requires_grad=True)
+        S_t = torch.tensor(S, dtype=torch.float32, device=self.device, requires_grad=True)
         original_shape = S_t.shape
         S_flat = S_t.reshape(-1)
         
@@ -234,7 +234,7 @@ class BarrierOption(DerivativeBase):
         """Compute gamma via automatic differentiation with batching."""
         T = self._compute_time_to_maturity(step_idx, N)
         
-        S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device, requires_grad=True)
+        S_t = torch.tensor(S, dtype=torch.float32, device=self.device, requires_grad=True)
         original_shape = S_t.shape
         S_flat = S_t.reshape(-1)
         
@@ -265,7 +265,7 @@ class BarrierOption(DerivativeBase):
         """Compute vega via automatic differentiation with batching."""
         T = self._compute_time_to_maturity(step_idx, N)
         
-        S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
+        S_t = torch.tensor(S, dtype=torch.float32, device=self.device)
         original_shape = S_t.shape
         S_flat = S_t.reshape(-1)
         
