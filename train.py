@@ -173,6 +173,15 @@ def train_episode(
     """Train for a single episode."""
     
     hedged_cfg = config["hedged_option"]
+    
+    # Get transaction costs with fallback
+    transaction_costs = config.get("transaction_costs", {
+        'stock': 0.0001,
+        'vanilla_option': 0.001,
+        'barrier_option': 0.002
+    })
+    
+    # Use stock transaction cost for HedgingSim TCP parameter
     sim = HedgingSim(
         S0=config["simulation"]["S0"],
         K=hedged_cfg["K"],
@@ -184,7 +193,7 @@ def train_episode(
         position=hedged_cfg["side"],
         M=config["simulation"]["M"],
         N=config["simulation"]["N"],
-        TCP=config["simulation"]["TCP"],
+        TCP=transaction_costs.get('stock', 0.0001),
         seed=episode
     )
     
@@ -196,11 +205,7 @@ def train_episode(
         n_hedging_instruments=config["instruments"]["n_hedging_instruments"],
         dt_min=config["environment"]["dt_min"],
         device=str(device),
-        transaction_costs=config.get("transaction_costs", {
-            'stock': config["simulation"]["TCP"],
-            'vanilla_option': config["simulation"]["TCP"] * 10,
-            'barrier_option': config["simulation"]["TCP"] * 20
-        })
+        transaction_costs=transaction_costs
     )
     
     env.reset()
@@ -258,6 +263,7 @@ def save_checkpoint(
     logging.info(f"Checkpoint saved at episode {episode}: {checkpoint_path}")
 
 
+
 def run_inference(
     config: Dict[str, Any],
     policy_net: PolicyNetGARCH,
@@ -271,8 +277,15 @@ def run_inference(
     
     policy_net.eval()
     
-    # Create simulation
     hedged_cfg = config["hedged_option"]
+    
+    # Get transaction costs with fallback
+    transaction_costs = config.get("transaction_costs", {
+        'stock': 0.0001,
+        'vanilla_option': 0.001,
+        'barrier_option': 0.002
+    })
+    
     sim = HedgingSim(
         S0=config["simulation"]["S0"],
         K=hedged_cfg["K"],
@@ -284,11 +297,10 @@ def run_inference(
         position=hedged_cfg["side"],
         M=config["simulation"]["M"],
         N=config["simulation"]["N"],
-        TCP=config["simulation"]["TCP"],
+        TCP=transaction_costs.get('stock', 0.0001),
         seed=config["training"]["seed"]
     )
     
-    # Create environment
     env = HedgingEnvGARCH(
         sim=sim,
         derivative=hedged_derivative,
@@ -296,30 +308,27 @@ def run_inference(
         garch_params=config["garch"],
         n_hedging_instruments=config["instruments"]["n_hedging_instruments"],
         dt_min=config["environment"]["dt_min"],
-        device=str(device)
+        device=str(device),
+        transaction_costs=transaction_costs
     )
     
     env.reset()
     
-    # Run inference
     with torch.no_grad():
         S_traj, V_traj, O_traj, obs_sequence, RL_positions = \
             env.simulate_trajectory_and_get_observations(policy_net)
         
         terminal_errors, trajectories = env.simulate_full_trajectory(RL_positions, O_traj)
     
-    # Compute metrics
     terminal_hedge_error_rl, rl_metrics = compute_rl_metrics(
         env, RL_positions, trajectories, O_traj
     )
     
-    # Log metrics
     logging.info(
         f"Inference Results - MSE: {rl_metrics['mse']:.6f} | "
         f"SMSE: {rl_metrics['smse']:.6f} | CVaR95: {rl_metrics['cvar_95']:.6f}"
     )
     
-    # Create metrics dict for visualization
     metrics = {
         "episode": 0,
         "loss": float(torch.abs(terminal_errors).mean().item()),
@@ -332,15 +341,12 @@ def run_inference(
         "env": env
     }
     
-    # Generate plots
     try:
         from src.visualization.plot_results import plot_episode_results
         plot_episode_results(episode=0, metrics=metrics, config=config)
         logging.info("Inference plots generated successfully")
     except Exception as e:
         logging.warning(f"Plot generation failed: {e}")
-
-
 def train(
     config: Dict[str, Any],
     HedgingSim,
