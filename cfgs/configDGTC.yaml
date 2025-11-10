@@ -29,7 +29,10 @@ instruments:
   strikes: [100]
   types: ["call"]
   maturities: [504]  # FIXED: Only hedging instrument maturity
-
+transaction_costs:
+    stock: 0.0001
+    vanilla_option: 0.001
+    barrier_option: 0.002
 hedged_option:
   type: "vanilla"
   K: 100
@@ -44,7 +47,6 @@ simulation:
   contract_size: 1
   M: 1000
   N: 252
-  TCP: 0.0005
 
 environment:
   dt_min: 1.0e-10
