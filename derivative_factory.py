@@ -9,7 +9,7 @@ import logging
 from src.option_greek.vanilla import VanillaOption
 from src.option_greek.barrier import BarrierOption
 from src.option_greek.precompute import PrecomputationManager
-from src.barrier_wrapper import BarrierOptionWithVanillaFallback
+from src.option_greek.barrier_wrapper import BarrierOptionWithVanillaFallback
 
 logger = logging.getLogger(__name__)
 
