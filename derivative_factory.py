@@ -3,7 +3,7 @@ Factory for creating derivative objects from config.
 Supports vanilla and barrier options with vanilla fallback.
 """
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 import torch
 import logging
 from src.option_greek.vanilla import VanillaOption
@@ -35,6 +35,7 @@ class DerivativeFactory:
         hedged_cfg = config['hedged_option']
         deriv_type = hedged_cfg['type'].lower()
         
+        # === VANILLA OPTION ===
         if deriv_type == 'vanilla':
             maturity_days = int(hedged_cfg['T'] * 252)
             
@@ -71,16 +72,17 @@ class DerivativeFactory:
             
             return vanilla_option
         
+        # === BARRIER OPTION ===
         elif deriv_type == 'barrier':
             logger.info(
-                f"Creating barrier hedged option: {hedged_cfg['barrier_type']} "
-                f"{hedged_cfg['option_type']} with barrier={hedged_cfg['barrier_level']}"
+                f"Creating barrier hedged option ({hedged_cfg['option_type']}) "
+                f"with barrier={hedged_cfg['barrier_level']}"
             )
             
+            # Create barrier option (model-driven)
             barrier_option = BarrierOption(
                 model_path=hedged_cfg['model_path'],
                 barrier_level=hedged_cfg['barrier_level'],
-                barrier_type=hedged_cfg.get('barrier_type', 'up-and-in'),
                 option_type=hedged_cfg['option_type'],
                 r_annual=config['simulation']['r'],
                 device=config['training']['device']
@@ -111,6 +113,7 @@ class DerivativeFactory:
                 maturity_days
             )
             
+            # Create vanilla fallback
             vanilla_fallback = VanillaOption(
                 precomputation_manager=precomp_manager,
                 garch_params=config['garch'],
@@ -119,10 +122,10 @@ class DerivativeFactory:
             vanilla_fallback.N = maturity_days
             vanilla_fallback.K = hedged_cfg['K']
             
+            # Wrap barrier + vanilla fallback (no barrier_type arg)
             wrapped_barrier = BarrierOptionWithVanillaFallback(
                 barrier_option=barrier_option,
-                vanilla_option=vanilla_fallback,
-                barrier_type=hedged_cfg.get('barrier_type', 'up-and-in')
+                vanilla_option=vanilla_fallback
             )
             
             logger.info("Wrapped barrier option with vanilla fallback for breach handling")
@@ -132,6 +135,7 @@ class DerivativeFactory:
         else:
             raise ValueError(f"Unknown derivative type: {deriv_type}")
     
+    # === HEDGING DERIVATIVES ===
     @staticmethod
     def create_hedging_derivatives(
         config: Dict[str, Any],
@@ -139,14 +143,6 @@ class DerivativeFactory:
     ) -> List:
         """
         Create hedging instruments (always vanilla).
-        
-        Hedging instruments structure:
-        - Instrument 0: Stock (represented as None)
-        - Instruments 1+: Vanilla options with strikes/maturities from config
-        
-        Args:
-            config: Full config dict
-            precomputed_data: Dict mapping maturity to precomputed coefficients
         
         Returns:
             List of derivative objects [None (stock), VanillaOption1, VanillaOption2, ...]
@@ -222,12 +218,6 @@ def setup_derivatives_from_precomputed(
 ) -> tuple:
     """
     Setup all derivatives from config and existing precomputed data.
-    
-    This function is called AFTER precomputation is done in train.py.
-    
-    Args:
-        config: Full config dict
-        precomputed_data: Dict mapping maturity (in days) to precomputed coefficients
     
     Returns:
         (hedged_derivative, hedging_derivatives_list)
