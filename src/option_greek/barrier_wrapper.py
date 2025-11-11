@@ -7,17 +7,16 @@ from src.option_greek.barrier import BarrierOption
 
 class BarrierOptionWithVanillaFallback(DerivativeBase):
     """
-    Wrapper that handles barrier breach logic by switching pricing methods.
+    Wrapper that handles up-and-in barrier breach logic.
     
-    For up-and-in options: barrier NN pricing before breach, vanilla after breach
-    For up-and-out options: barrier NN pricing before breach, zero after breach
+    Before breach: Uses barrier NN pricing (accounts for probability of future breach)
+    After breach: Switches to vanilla option pricing
     """
     
     def __init__(
         self,
         barrier_option: BarrierOption,
-        vanilla_option: VanillaOption,
-        barrier_type: str
+        vanilla_option: VanillaOption
     ):
         """
         Initialize barrier wrapper with both pricers.
@@ -25,15 +24,12 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
         Args:
             barrier_option: BarrierOption instance for pre-breach pricing
             vanilla_option: VanillaOption instance for post-breach pricing
-            barrier_type: 'up-and-in' or 'up-and-out'
         """
         self.barrier_option = barrier_option
         self.vanilla_option = vanilla_option
-        self.barrier_type = barrier_type
         self.barrier_level = barrier_option.barrier_level
         self.option_type = barrier_option.option_type
         self.K = None
-        
         self.barrier_breached = False
     
     def reset_barrier_status(self):
@@ -63,7 +59,7 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
     
     def price(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float = None, **kwargs) -> torch.Tensor:
         """
-        Price with barrier breach logic.
+        Price up-and-in barrier option with fallback to vanilla after breach.
         
         Args:
             S: Spot price(s)
@@ -76,85 +72,47 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
         self.check_and_update_barrier(S)
         self.K = K
         
-        if self.barrier_type == "up-and-in":
-            if not self.barrier_breached:
-                return self.barrier_option.price(S, K, step_idx, N, h0)
-            else:
-                return self.vanilla_option.price(S, K, step_idx, N)
-        
-        elif self.barrier_type == "up-and-out":
-            if self.barrier_breached:
-                return torch.zeros_like(torch.as_tensor(S, dtype=torch.float32))
-            else:
-                return self.barrier_option.price(S, K, step_idx, N, h0)
-        
+        if not self.barrier_breached:
+            return self.barrier_option.price(S, K, step_idx, N, h0)
         else:
-            raise ValueError(f"Unknown barrier type: {self.barrier_type}")
+            return self.vanilla_option.price(S, K, step_idx, N)
     
     def delta(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float = None, **kwargs) -> torch.Tensor:
-        """Compute delta with barrier breach handling."""
+        """Compute delta for up-and-in barrier option."""
         self.check_and_update_barrier(S)
         self.K = K
         
-        if self.barrier_type == "up-and-in":
-            if not self.barrier_breached:
-                return self.barrier_option.delta(S, K, step_idx, N, h0)
-            else:
-                return self.vanilla_option.delta(S, K, step_idx, N)
-        
-        elif self.barrier_type == "up-and-out":
-            if self.barrier_breached:
-                return torch.zeros_like(torch.as_tensor(S, dtype=torch.float32))
-            else:
-                return self.barrier_option.delta(S, K, step_idx, N, h0)
+        if not self.barrier_breached:
+            return self.barrier_option.delta(S, K, step_idx, N, h0)
+        else:
+            return self.vanilla_option.delta(S, K, step_idx, N)
     
     def gamma(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float = None, **kwargs) -> torch.Tensor:
-        """Compute gamma with barrier breach handling."""
+        """Compute gamma for up-and-in barrier option."""
         self.check_and_update_barrier(S)
         self.K = K
         
-        if self.barrier_type == "up-and-in":
-            if not self.barrier_breached:
-                return self.barrier_option.gamma(S, K, step_idx, N, h0)
-            else:
-                return self.vanilla_option.gamma(S, K, step_idx, N)
-        
-        elif self.barrier_type == "up-and-out":
-            if self.barrier_breached:
-                return torch.zeros_like(torch.as_tensor(S, dtype=torch.float32))
-            else:
-                return self.barrier_option.gamma(S, K, step_idx, N, h0)
+        if not self.barrier_breached:
+            return self.barrier_option.gamma(S, K, step_idx, N, h0)
+        else:
+            return self.vanilla_option.gamma(S, K, step_idx, N)
     
     def vega(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float = None, **kwargs) -> torch.Tensor:
-        """Compute vega with barrier breach handling."""
+        """Compute vega for up-and-in barrier option."""
         self.check_and_update_barrier(S)
         self.K = K
         
-        if self.barrier_type == "up-and-in":
-            if not self.barrier_breached:
-                return self.barrier_option.vega(S, K, step_idx, N, h0)
-            else:
-                return self.vanilla_option.vega(S, K, step_idx, N)
-        
-        elif self.barrier_type == "up-and-out":
-            if self.barrier_breached:
-                return torch.zeros_like(torch.as_tensor(S, dtype=torch.float32))
-            else:
-                return self.barrier_option.vega(S, K, step_idx, N, h0)
+        if not self.barrier_breached:
+            return self.barrier_option.vega(S, K, step_idx, N, h0)
+        else:
+            return self.vanilla_option.vega(S, K, step_idx, N)
     
     def theta(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float = None, **kwargs) -> torch.Tensor:
-        """Compute theta with barrier breach handling."""
+        """Compute theta for up-and-in barrier option."""
         self.check_and_update_barrier(S)
         self.K = K
         
-        if self.barrier_type == "up-and-in":
-            if not self.barrier_breached:
-                return self.barrier_option.theta(S, K, step_idx, N, h0)
-            else:
-                return self.vanilla_option.theta(S, K, step_idx, N)
-        
-        elif self.barrier_type == "up-and-out":
-            if self.barrier_breached:
-                return torch.zeros_like(torch.as_tensor(S, dtype=torch.float32))
-            else:
-                return self.barrier_option.theta(S, K, step_idx, N, h0)
+        if not self.barrier_breached:
+            return self.barrier_option.theta(S, K, step_idx, N, h0)
+        else:
+            return self.vanilla_option.theta(S, K, step_idx, N)
