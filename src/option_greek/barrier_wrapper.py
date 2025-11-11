@@ -7,10 +7,10 @@ from src.option_greek.barrier import BarrierOption
 
 class BarrierOptionWithVanillaFallback(DerivativeBase):
     """
-    Wrapper that handles barrier breach logic by switching to vanilla pricing.
+    Wrapper that handles barrier breach logic by switching pricing methods.
     
-    For up-and-in options: price=0 before breach, vanilla after breach
-    For up-and-out options: vanilla before breach, price=0 after breach
+    For up-and-in options: barrier NN pricing before breach, vanilla after breach
+    For up-and-out options: barrier NN pricing before breach, zero after breach
     """
     
     def __init__(
@@ -23,7 +23,7 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
         Initialize barrier wrapper with both pricers.
         
         Args:
-            barrier_option: BarrierOption instance (not used after breach detection)
+            barrier_option: BarrierOption instance for pre-breach pricing
             vanilla_option: VanillaOption instance for post-breach pricing
             barrier_type: 'up-and-in' or 'up-and-out'
         """
@@ -70,7 +70,7 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
             K: Strike price
             step_idx: Current step index
             N: Total steps
-            h0: Variance (for compatibility)
+            h0: Variance
             **kwargs: Additional arguments
         """
         self.check_and_update_barrier(S)
@@ -78,7 +78,7 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
         
         if self.barrier_type == "up-and-in":
             if not self.barrier_breached:
-                return torch.zeros_like(torch.as_tensor(S, dtype=torch.float32))
+                return self.barrier_option.price(S, K, step_idx, N, h0)
             else:
                 return self.vanilla_option.price(S, K, step_idx, N)
         
@@ -86,7 +86,7 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
             if self.barrier_breached:
                 return torch.zeros_like(torch.as_tensor(S, dtype=torch.float32))
             else:
-                return self.vanilla_option.price(S, K, step_idx, N)
+                return self.barrier_option.price(S, K, step_idx, N, h0)
         
         else:
             raise ValueError(f"Unknown barrier type: {self.barrier_type}")
@@ -98,7 +98,7 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
         
         if self.barrier_type == "up-and-in":
             if not self.barrier_breached:
-                return torch.zeros_like(torch.as_tensor(S, dtype=torch.float32))
+                return self.barrier_option.delta(S, K, step_idx, N, h0)
             else:
                 return self.vanilla_option.delta(S, K, step_idx, N)
         
@@ -106,7 +106,7 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
             if self.barrier_breached:
                 return torch.zeros_like(torch.as_tensor(S, dtype=torch.float32))
             else:
-                return self.vanilla_option.delta(S, K, step_idx, N)
+                return self.barrier_option.delta(S, K, step_idx, N, h0)
     
     def gamma(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float = None, **kwargs) -> torch.Tensor:
         """Compute gamma with barrier breach handling."""
@@ -115,7 +115,7 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
         
         if self.barrier_type == "up-and-in":
             if not self.barrier_breached:
-                return torch.zeros_like(torch.as_tensor(S, dtype=torch.float32))
+                return self.barrier_option.gamma(S, K, step_idx, N, h0)
             else:
                 return self.vanilla_option.gamma(S, K, step_idx, N)
         
@@ -123,7 +123,7 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
             if self.barrier_breached:
                 return torch.zeros_like(torch.as_tensor(S, dtype=torch.float32))
             else:
-                return self.vanilla_option.gamma(S, K, step_idx, N)
+                return self.barrier_option.gamma(S, K, step_idx, N, h0)
     
     def vega(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float = None, **kwargs) -> torch.Tensor:
         """Compute vega with barrier breach handling."""
@@ -132,7 +132,7 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
         
         if self.barrier_type == "up-and-in":
             if not self.barrier_breached:
-                return torch.zeros_like(torch.as_tensor(S, dtype=torch.float32))
+                return self.barrier_option.vega(S, K, step_idx, N, h0)
             else:
                 return self.vanilla_option.vega(S, K, step_idx, N)
         
@@ -140,7 +140,7 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
             if self.barrier_breached:
                 return torch.zeros_like(torch.as_tensor(S, dtype=torch.float32))
             else:
-                return self.vanilla_option.vega(S, K, step_idx, N)
+                return self.barrier_option.vega(S, K, step_idx, N, h0)
     
     def theta(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float = None, **kwargs) -> torch.Tensor:
         """Compute theta with barrier breach handling."""
@@ -149,7 +149,7 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
         
         if self.barrier_type == "up-and-in":
             if not self.barrier_breached:
-                return torch.zeros_like(torch.as_tensor(S, dtype=torch.float32))
+                return self.barrier_option.theta(S, K, step_idx, N, h0)
             else:
                 return self.vanilla_option.theta(S, K, step_idx, N)
         
@@ -157,4 +157,4 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
             if self.barrier_breached:
                 return torch.zeros_like(torch.as_tensor(S, dtype=torch.float32))
             else:
-                return self.vanilla_option.theta(S, K, step_idx, N)
+                return self.barrier_option.theta(S, K, step_idx, N, h0)
