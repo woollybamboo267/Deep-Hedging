@@ -212,135 +212,115 @@ class BarrierOption(DerivativeBase):
         
         return prices.reshape(original_shape)
     
-    def delta(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float) -> torch.Tensor:
-        """Compute delta via automatic differentiation with maturity handling."""
-        T = self._compute_time_to_maturity(step_idx, N)
+    def delta(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float, epsilon: float = 0.01) -> torch.Tensor:
+        """
+        Compute delta using finite difference method.
         
+        Args:
+            S: Spot price(s)
+            K: Strike price
+            step_idx: Current step index
+            N: Total steps
+            h0: Current variance
+            epsilon: Bump size for finite difference (default 0.01)
+        
+        Returns:
+            Delta tensor
+        """
         S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
-        original_shape = S_t.shape
         
-        if T < 1e-6:
-            if self.option_type.lower() == "call":
-                delta = (S_t > K).float()
-            else:
-                delta = -(S_t < K).float()
-            return delta
+        S_up = S_t + epsilon
+        S_down = S_t - epsilon
         
-        S_t = S_t.clone().detach().requires_grad_(True)
-        S_flat = S_t.reshape(-1)
+        price_up = self.price(S_up, K, step_idx, N, h0)
+        price_down = self.price(S_down, K, step_idx, N, h0)
         
-        K_batch = torch.full_like(S_flat, K)
-        T_batch = torch.full_like(S_flat, T)
-        r_batch = torch.full_like(S_flat, self.r_daily * 252.0)
-        barrier_batch = torch.full_like(S_flat, self.barrier_level)
-        h0_batch = torch.full_like(S_flat, h0)
+        delta = (price_up - price_down) / (2.0 * epsilon)
         
-        features = create_features_batched(
-            S_flat, K_batch, T_batch, r_batch, barrier_batch, h0_batch,
-            self.option_type
-        )
-        features_norm = (features - self.mean) / self.std
-        prices = self.model(features_norm).squeeze(-1)
-        
-        delta = torch.autograd.grad(prices.sum(), S_t, create_graph=False)[0]
-        
-        return delta.reshape(original_shape)
+        return delta
     
-    def gamma(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float) -> torch.Tensor:
-        """Compute gamma via automatic differentiation with maturity handling."""
+    def gamma(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float, epsilon: float = 0.01) -> torch.Tensor:
+        """
+        Compute gamma using finite difference method.
+        
+        Args:
+            S: Spot price(s)
+            K: Strike price
+            step_idx: Current step index
+            N: Total steps
+            h0: Current variance
+            epsilon: Bump size for finite difference (default 0.01)
+        
+        Returns:
+            Gamma tensor
+        """
+        S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
+        
+        S_up = S_t + epsilon
+        S_down = S_t - epsilon
+        
+        price_center = self.price(S_t, K, step_idx, N, h0)
+        price_up = self.price(S_up, K, step_idx, N, h0)
+        price_down = self.price(S_down, K, step_idx, N, h0)
+        
+        gamma = (price_up - 2.0 * price_center + price_down) / (epsilon ** 2)
+        
+        return gamma
+    
+    def vega(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float, epsilon: float = 1e-8) -> torch.Tensor:
+        """
+        Compute vega using finite difference method.
+        
+        Args:
+            S: Spot price(s)
+            K: Strike price
+            step_idx: Current step index
+            N: Total steps
+            h0: Current variance
+            epsilon: Bump size for variance (default 1e-8)
+        
+        Returns:
+            Vega tensor
+        """
+        h0_up = h0 + epsilon
+        h0_down = h0 - epsilon
+        
+        price_up = self.price(S, K, step_idx, N, h0_up)
+        price_down = self.price(S, K, step_idx, N, h0_down)
+        
+        vega_h0 = (price_up - price_down) / (2.0 * epsilon)
+        
+        vega = vega_h0 * 2.0 * torch.sqrt(torch.tensor(h0, device=self.device))
+        
+        return vega
+    
+    def theta(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float, epsilon_days: int = 1) -> torch.Tensor:
+        """
+        Compute theta using finite difference method.
+        
+        Args:
+            S: Spot price(s)
+            K: Strike price
+            step_idx: Current step index
+            N: Total steps
+            h0: Current variance
+            epsilon_days: Time step in days (default 1)
+        
+        Returns:
+            Theta tensor
+        """
         T = self._compute_time_to_maturity(step_idx, N)
         
-        S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
-        original_shape = S_t.shape
-        
-        if T < 1e-6:
+        if T < epsilon_days / 252.0:
+            S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
             return torch.zeros_like(S_t)
         
-        S_t = S_t.clone().detach().requires_grad_(True)
-        S_flat = S_t.reshape(-1)
+        price_now = self.price(S, K, step_idx, N, h0)
+        price_future = self.price(S, K, step_idx + epsilon_days, N, h0)
         
-        K_batch = torch.full_like(S_flat, K)
-        T_batch = torch.full_like(S_flat, T)
-        r_batch = torch.full_like(S_flat, self.r_daily * 252.0)
-        barrier_batch = torch.full_like(S_flat, self.barrier_level)
-        h0_batch = torch.full_like(S_flat, h0)
+        theta = -(price_future - price_now) / epsilon_days
         
-        features = create_features_batched(
-            S_flat, K_batch, T_batch, r_batch, barrier_batch, h0_batch,
-            self.option_type
-        )
-        features_norm = (features - self.mean) / self.std
-        prices = self.model(features_norm).squeeze(-1)
-        
-        first_derivative = torch.autograd.grad(prices.sum(), S_t, create_graph=True)[0]
-        gamma = torch.autograd.grad(first_derivative.sum(), S_t, create_graph=False)[0]
-        
-        return gamma.reshape(original_shape)
-    
-    def vega(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float) -> torch.Tensor:
-        """Compute vega via automatic differentiation with maturity handling."""
-        T = self._compute_time_to_maturity(step_idx, N)
-        
-        S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
-        original_shape = S_t.shape
-        
-        if T < 1e-6:
-            return torch.zeros_like(S_t)
-        
-        S_flat = S_t.reshape(-1)
-        
-        h0_t = torch.tensor(h0, dtype=torch.float32, device=self.device, requires_grad=True)
-        
-        K_batch = torch.full_like(S_flat, K)
-        T_batch = torch.full_like(S_flat, T)
-        r_batch = torch.full_like(S_flat, self.r_daily * 252.0)
-        barrier_batch = torch.full_like(S_flat, self.barrier_level)
-        h0_batch = h0_t.expand_as(S_flat)
-        
-        features = create_features_batched(
-            S_flat, K_batch, T_batch, r_batch, barrier_batch, h0_batch,
-            self.option_type
-        )
-        features_norm = (features - self.mean) / self.std
-        prices = self.model(features_norm).squeeze(-1)
-        
-        vega_raw = torch.autograd.grad(prices.mean(), h0_t, allow_unused=True)[0]
-        if vega_raw is not None:
-            vega = vega_raw * 2 * torch.sqrt(h0_t)
-            return torch.full(original_shape, vega.item(), device=self.device)
-        else:
-            return torch.zeros(original_shape, device=self.device)
-    
-    def theta(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float) -> torch.Tensor:
-        """Compute theta via automatic differentiation with maturity handling."""
-        T = self._compute_time_to_maturity(step_idx, N)
-        
-        S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
-        original_shape = S_t.shape
-        
-        if T < 1e-6:
-            return torch.zeros_like(S_t)
-        
-        S_flat = S_t.reshape(-1)
-        
-        T_t = torch.tensor(T, dtype=torch.float32, device=self.device, requires_grad=True)
-        
-        K_batch = torch.full_like(S_flat, K)
-        T_batch = T_t.expand_as(S_flat)
-        r_batch = torch.full_like(S_flat, self.r_daily * 252.0)
-        barrier_batch = torch.full_like(S_flat, self.barrier_level)
-        h0_batch = torch.full_like(S_flat, h0)
-        
-        features = create_features_batched(
-            S_flat, K_batch, T_batch, r_batch, barrier_batch, h0_batch,
-            self.option_type
-        )
-        features_norm = (features - self.mean) / self.std
-        prices = self.model(features_norm).squeeze(-1)
-        
-        theta_raw = torch.autograd.grad(prices.mean(), T_t, allow_unused=True)[0]
-        if theta_raw is not None:
-            theta = -theta_raw
-            return torch.full(original_shape, theta.item(), device=self.device)
-        else:
-            return torch.zeros(original_shape, device=self.device)
+        return theta
+
+
+# Test script remains the same
