@@ -20,7 +20,6 @@ import sys
 from pathlib import Path
 from typing import Dict, Any, Optional
 
-# Import your modules
 from src.agents.policy_net_garch_flexible import PolicyNetGARCH, HedgingEnvGARCH
 from src.option_greek.precompute import create_precomputation_manager_from_config
 from src.visualization.plot_results import compute_rl_metrics
@@ -62,13 +61,11 @@ def validate_config(config: Dict[str, Any]) -> None:
     if n_inst < 1 or n_inst > 4:
         raise ValueError(f"n_hedging_instruments must be 1-4, got {n_inst}")
     
-    # If we have vanilla options as hedging instruments (n_inst > 1)
     if n_inst > 1:
         n_strikes = len(config["instruments"]["strikes"])
         n_types = len(config["instruments"]["types"])
         n_maturities = len(config["instruments"]["maturities"])
         
-        # All should have length n_inst - 1 (excluding stock)
         if n_strikes != n_inst - 1:
             raise ValueError(
                 f"strikes must have length {n_inst - 1} (excluding stock), got {n_strikes}"
@@ -89,7 +86,6 @@ def validate_config(config: Dict[str, Any]) -> None:
         if opt_type not in valid_types:
             raise ValueError(f"Invalid option type: {opt_type}")
     
-    # Validate hedged option config
     hedged_cfg = config["hedged_option"]
     deriv_type = hedged_cfg["type"].lower()
     
@@ -158,8 +154,6 @@ def create_optimizer(
     return optimizer
 
 
-# In train.py, update train_episode function:
-
 def train_episode(
     episode: int,
     config: Dict[str, Any],
@@ -174,14 +168,12 @@ def train_episode(
     
     hedged_cfg = config["hedged_option"]
     
-    # Get transaction costs with fallback
     transaction_costs = config.get("transaction_costs", {
         'stock': 0.0001,
         'vanilla_option': 0.001,
         'barrier_option': 0.002
     })
     
-    # Use stock transaction cost for HedgingSim TCP parameter
     sim = HedgingSim(
         S0=config["simulation"]["S0"],
         K=hedged_cfg["K"],
@@ -263,7 +255,6 @@ def save_checkpoint(
     logging.info(f"Checkpoint saved at episode {episode}: {checkpoint_path}")
 
 
-
 def run_inference(
     config: Dict[str, Any],
     policy_net: PolicyNetGARCH,
@@ -279,7 +270,6 @@ def run_inference(
     
     hedged_cfg = config["hedged_option"]
     
-    # Get transaction costs with fallback
     transaction_costs = config.get("transaction_costs", {
         'stock': 0.0001,
         'vanilla_option': 0.001,
@@ -347,6 +337,8 @@ def run_inference(
         logging.info("Inference plots generated successfully")
     except Exception as e:
         logging.warning(f"Plot generation failed: {e}")
+
+
 def train(
     config: Dict[str, Any],
     HedgingSim,
@@ -357,26 +349,21 @@ def train(
 ) -> PolicyNetGARCH:
     """Main training loop."""
     
-    # Set seeds
     seed = config["training"]["seed"]
     torch.manual_seed(seed)
     np.random.seed(seed)
     
-    # Setup device
     device = torch.device(config["training"]["device"])
     logging.info(f"Using device: {device}")
     
-    # Create policy network and optimizer
     policy_net = create_policy_network(config, device)
     
-    # Load initial model if provided
     if initial_model is not None:
         policy_net.load_state_dict(initial_model.state_dict())
         logging.info("Initialized policy network from pretrained model")
     
     optimizer = create_optimizer(policy_net, config)
     
-    # Training loop
     n_episodes = config["training"]["episodes"]
     checkpoint_freq = config["training"]["checkpoint_frequency"]
     plot_freq = config["training"]["plot_frequency"]
@@ -400,11 +387,9 @@ def train(
                 device=device
             )
             
-            # Save checkpoint
             if episode % checkpoint_freq == 0:
                 save_checkpoint(policy_net, config, episode)
             
-            # Visualization
             if visualize and episode % plot_freq == 0:
                 try:
                     from src.visualization.plot_results import plot_episode_results
@@ -416,7 +401,6 @@ def train(
             logging.exception(f"Error during episode {episode}: {e}")
             raise
     
-    # Save final model
     n_inst = config["instruments"]["n_hedging_instruments"]
     final_path = config["output"]["model_save_path"].format(n_inst=n_inst)
     torch.save(policy_net.state_dict(), final_path)
@@ -427,7 +411,6 @@ def train(
 
 def main():
     """Main entry point."""
-    # Parse arguments
     parser = argparse.ArgumentParser(
         description="Train GARCH-based option hedging with RL"
     )
@@ -456,48 +439,42 @@ def main():
     
     args = parser.parse_args()
     
-    # Load config
     config = load_config(args.config)
     
-    # Setup logging
     setup_logging(config)
     
-    # Validate config
     validate_config(config)
     
-    # Setup device
     device = torch.device(config["training"]["device"])
     logging.info(f"Using device: {device}")
     
-    # Import HedgingSim
     try:
         from src.simulation.hedging_sim import HedgingSim
     except ImportError:
         logging.error("Could not import HedgingSim. Please adjust import path.")
         sys.exit(1)
     
-    # FIXED PRECOMPUTATION LOGIC:
-    # Always precompute for hedging instruments (they're always vanilla)
-    # Also precompute for hedged derivative if it's vanilla
     hedged_type = config["hedged_option"]["type"].lower()
     
     logging.info("Starting precomputation...")
     logging.info(f"Hedged derivative type: {hedged_type}")
     
-    # Precompute hedging instruments (always needed)
     precomputation_manager = create_precomputation_manager_from_config(config)
     precomputed_data = precomputation_manager.precompute_all()
     logging.info("Precomputation complete for hedging instruments")
     
-    # If hedged derivative is vanilla, its coefficients are already in precomputed_data
-    # If it's barrier/exotic, derivative_factory will handle Monte Carlo pricing
+    if hedged_type == "barrier":
+        hedged_maturity_days = int(config["hedged_option"]["T"] * 252)
+        if hedged_maturity_days not in precomputed_data:
+            logging.info(f"Precomputing vanilla coefficients for barrier fallback (N={hedged_maturity_days})...")
+            precomputation_manager.precompute_for_maturity(hedged_maturity_days)
+            precomputed_data[hedged_maturity_days] = precomputation_manager.get_precomputed_data(hedged_maturity_days)
+            logging.info(f"Vanilla fallback coefficients ready for N={hedged_maturity_days}")
     
-    # Setup derivatives (vanilla or barrier based on config)
     hedged_derivative, hedging_derivatives = setup_derivatives_from_precomputed(
         config, precomputed_data
     )
     
-    # Inference-only mode
     if args.inference_only and args.load_model:
         logging.info(f"Loading pretrained model from {args.load_model}")
         policy_net = create_policy_network(config, device)
@@ -515,7 +492,6 @@ def main():
         logging.info("Inference complete!")
         return
     
-    # Training mode with optional model loading
     initial_model = None
     if args.load_model:
         logging.info(f"Loading pretrained model from {args.load_model}")
@@ -523,7 +499,6 @@ def main():
         initial_model.load_state_dict(torch.load(args.load_model, map_location=device))
         logging.info("Model loaded - will continue training from checkpoint")
     
-    # Train
     policy_net = train(
         config=config,
         HedgingSim=HedgingSim,
