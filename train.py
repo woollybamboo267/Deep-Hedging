@@ -460,13 +460,25 @@ def main():
     logging.info(f"Hedged derivative type: {hedged_type}")
     
     precomputation_manager = create_precomputation_manager_from_config(config)
+    
+    if hedged_type == "barrier":
+        hedged_maturity_days = int(config["hedged_option"]["T"] * 252)
+        logging.info(f"Barrier option detected - adding maturity {hedged_maturity_days} days for vanilla fallback precomputation")
+        
+        if hedged_maturity_days not in config["instruments"]["maturities"]:
+            if not hasattr(precomputation_manager, 'maturities'):
+                precomputation_manager.maturities = []
+            if hedged_maturity_days not in precomputation_manager.maturities:
+                precomputation_manager.maturities.append(hedged_maturity_days)
+                logging.info(f"Added barrier maturity {hedged_maturity_days} to precomputation list")
+    
     precomputed_data = precomputation_manager.precompute_all()
-    logging.info("Precomputation complete for hedging instruments")
+    logging.info(f"Precomputation complete for maturities: {list(precomputed_data.keys())}")
     
     if hedged_type == "barrier":
         hedged_maturity_days = int(config["hedged_option"]["T"] * 252)
         if hedged_maturity_days not in precomputed_data:
-            logging.info(f"Precomputing vanilla coefficients for barrier fallback (N={hedged_maturity_days})...")
+            logging.warning(f"Barrier maturity {hedged_maturity_days} not in precomputed data, computing now...")
             precomputation_manager.precompute_for_maturity(hedged_maturity_days)
             precomputed_data[hedged_maturity_days] = precomputation_manager.get_precomputed_data(hedged_maturity_days)
             logging.info(f"Vanilla fallback coefficients ready for N={hedged_maturity_days}")
