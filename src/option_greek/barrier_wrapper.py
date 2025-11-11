@@ -1,8 +1,8 @@
 import torch
 from typing import Optional
-from .base import DerivativeBase
-from .vanilla import VanillaOption
-from .barrier import BarrierOption
+from src.option_greek.base import DerivativeBase
+from src.option_greek.vanilla import VanillaOption
+from src.option_greek.barrier import BarrierOption
 
 
 class BarrierOptionWithVanillaFallback(DerivativeBase):
@@ -148,7 +148,7 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
         self.K = K
         
         if self.barrier_type == "up-and-in":
-            if self.barrier_breached:
+            if not self.barrier_breached:
                 return torch.zeros_like(torch.as_tensor(S, dtype=torch.float32))
             else:
                 return self.vanilla_option.theta(S, K, step_idx, N)
