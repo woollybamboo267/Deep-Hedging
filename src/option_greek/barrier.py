@@ -2,9 +2,12 @@ import torch
 import torch.nn as nn
 import os
 import math
+import numpy as np
 from .base import DerivativeBase
 from typing import Dict
 
+
+# ---------------------- Neural Network ----------------------
 
 class BarrierOptionNN(nn.Module):
     """Neural network architecture for barrier option pricing."""
@@ -29,6 +32,8 @@ class BarrierOptionNN(nn.Module):
         x = self.fc7(x)
         return torch.clamp(x, min=0.0)
 
+
+# ---------------------- Feature Engineering ----------------------
 
 def create_features_batched(S0, K, T, r, barrier, h0, option_type="call"):
     """Feature creation for batched inference."""
@@ -82,6 +87,8 @@ def create_features_batched(S0, K, T, r, barrier, h0, option_type="call"):
     return features
 
 
+# ---------------------- Barrier Option Wrapper ----------------------
+
 class BarrierOption(DerivativeBase):
     """Barrier option using neural network surrogate model with enforced delta=0 at expiry."""
 
@@ -102,7 +109,10 @@ class BarrierOption(DerivativeBase):
         self.r_annual = r_annual
         self.r_daily = r_annual / 252.0
 
-        checkpoint = torch.load(model_path, map_location=self.device)
+        # ---------------------- Fix for PyTorch 2.6 unpickling ----------------------
+        torch.serialization.add_safe_globals([np.core.multiarray.scalar])
+        checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+
         self.model = BarrierOptionNN(33).to(self.device)
         self.model.load_state_dict(checkpoint["model"])
         self.model.eval()
@@ -116,6 +126,8 @@ class BarrierOption(DerivativeBase):
 
         print(f"[INFO] Loaded barrier model from {model_path}")
         print(f"[INFO] Test MAE: {checkpoint.get('test_mae', 'N/A')}")
+
+    # ---------------------- Helpers ----------------------
 
     def _compute_time_to_maturity(self, step_idx: int, N: int) -> float:
         return (N - step_idx) / 252.0
