@@ -174,6 +174,16 @@ class HedgingEnvGARCH:
         sigma0_annual = float(self.garch_params["sigma0"])
         self.sigma_t = torch.full((self.M,), sigma0_annual, dtype=torch.float32, device=self.device)
         self.h_t = (self.sigma_t ** 2 / 252)
+        
+        # Reset barrier breach status for wrapped barrier options
+        from src.option_greek.barrier_wrapper import BarrierOptionWithVanillaFallback
+        
+        if isinstance(self.derivative, BarrierOptionWithVanillaFallback):
+            self.derivative.reset_barrier_status()
+        
+        for deriv in self.hedging_derivatives:
+            if isinstance(deriv, BarrierOptionWithVanillaFallback):
+                deriv.reset_barrier_status()
     
     def compute_all_paths_greeks(self, S_trajectory, greek_name: str):
         """
