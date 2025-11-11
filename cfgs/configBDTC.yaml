@@ -37,7 +37,7 @@ hedged_option:
   T: 1.0  # Hedged option maturity (252 days)
   option_type: "call"
   side: "short"
-  barrier_level: 120.0
+  barrier_level: 110.0
   barrier_type: "up-and-in"
   model_path: "models/barrier/best_finetuned_up-and-in_call.1.pth"
 transaction_costs:
@@ -46,7 +46,7 @@ transaction_costs:
     barrier_option: 0.002
 simulation:
   S0: 100
-  r: 0.04
+  r: 0.1342
   T: 1.0
   contract_size: 1
   M: 1000
@@ -62,7 +62,7 @@ precomputation:
 
 model:
   obs_dim: 5
-  hidden_size: 128
+  hidden_size: 256
   num_layers: 1
   lstm_layers: 1
 
