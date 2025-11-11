@@ -118,7 +118,7 @@ class HedgingEnvGARCH:
                 self.instrument_strikes.append(getattr(deriv, 'K', self.K))
                 
                 from src.option_greek.vanilla import VanillaOption
-                from src.option_greek.barrier import BarrierOption
+                from src.option_greek.barrier_wrapper import BarrierOptionWithVanillaFallback
                 
                 if isinstance(deriv, VanillaOption):
                     self.instrument_types.append('vanilla')
