@@ -45,7 +45,6 @@ def create_features_batched(S0, K, T, r, barrier, h0, option_type="call"):
     Returns:
         [batch_size, 33] feature tensor
     """
-    # Ensure all inputs are tensors with same shape - use as_tensor to avoid copying
     if not isinstance(K, torch.Tensor):
         K = torch.full_like(S0, K)
     else:
@@ -71,7 +70,6 @@ def create_features_batched(S0, K, T, r, barrier, h0, option_type="call"):
     else:
         h0 = h0.expand_as(S0) if h0.numel() == 1 else h0
     
-    # Compute all features in batched manner
     moneyness = S0 / K
     barrier_distance_S = barrier / S0
     barrier_distance_K = barrier / K
@@ -103,7 +101,6 @@ def create_features_batched(S0, K, T, r, barrier, h0, option_type="call"):
     variance_term = h0 * T
     vol_of_vol = h0 ** 1.5
     
-    # Stack all features: [batch_size, 33]
     features = torch.stack([
         moneyness, K, T, r,
         barrier_distance_S, barrier_distance_K, h0,
@@ -149,13 +146,11 @@ class BarrierOption(DerivativeBase):
         self.r_annual = r_annual
         self.r_daily = r_annual / 252.0
         
-        # Load model
         checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
         self.model = BarrierOptionNN(input_dim=33).to(self.device)
         self.model.load_state_dict(checkpoint["model"])
         self.model.eval()
         
-        # Disable dropout at inference
         for m in self.model.modules():
             if isinstance(m, nn.Dropout):
                 m.p = 0.0
@@ -187,39 +182,51 @@ class BarrierOption(DerivativeBase):
         """
         T = self._compute_time_to_maturity(step_idx, N)
         
-        # Convert inputs to tensors
         S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
         original_shape = S_t.shape
+        
+        if T < 1e-6:
+            if self.option_type.lower() == "call":
+                intrinsic = torch.clamp(S_t - K, min=0.0)
+            else:
+                intrinsic = torch.clamp(K - S_t, min=0.0)
+            return intrinsic
+        
         S_flat = S_t.reshape(-1)
         
-        # Create batched tensors for all inputs
         K_batch = torch.full_like(S_flat, K)
         T_batch = torch.full_like(S_flat, T)
         r_batch = torch.full_like(S_flat, self.r_daily * 252.0)
         barrier_batch = torch.full_like(S_flat, self.barrier_level)
         h0_batch = torch.full_like(S_flat, h0)
         
-        # Batched feature computation
         features = create_features_batched(
             S_flat, K_batch, T_batch, r_batch, barrier_batch, h0_batch, 
             self.option_type
         )
         
-        # Normalize features
         features_norm = (features - self.mean) / self.std
         
-        # Single batched forward pass
         with torch.no_grad():
             prices = self.model(features_norm).squeeze(-1)
         
         return prices.reshape(original_shape)
     
     def delta(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float) -> torch.Tensor:
-        """Compute delta via automatic differentiation with batching."""
+        """Compute delta via automatic differentiation with maturity handling."""
         T = self._compute_time_to_maturity(step_idx, N)
         
-        S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device).clone().detach().requires_grad_(True)
+        S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
         original_shape = S_t.shape
+        
+        if T < 1e-6:
+            if self.option_type.lower() == "call":
+                delta = (S_t > K).float()
+            else:
+                delta = -(S_t < K).float()
+            return delta
+        
+        S_t = S_t.clone().detach().requires_grad_(True)
         S_flat = S_t.reshape(-1)
         
         K_batch = torch.full_like(S_flat, K)
@@ -235,17 +242,21 @@ class BarrierOption(DerivativeBase):
         features_norm = (features - self.mean) / self.std
         prices = self.model(features_norm).squeeze(-1)
         
-        # Compute gradients
         delta = torch.autograd.grad(prices.sum(), S_t, create_graph=False)[0]
         
         return delta.reshape(original_shape)
     
     def gamma(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float) -> torch.Tensor:
-        """Compute gamma via automatic differentiation with batching."""
+        """Compute gamma via automatic differentiation with maturity handling."""
         T = self._compute_time_to_maturity(step_idx, N)
         
-        S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device).clone().detach().requires_grad_(True)
+        S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
         original_shape = S_t.shape
+        
+        if T < 1e-6:
+            return torch.zeros_like(S_t)
+        
+        S_t = S_t.clone().detach().requires_grad_(True)
         S_flat = S_t.reshape(-1)
         
         K_batch = torch.full_like(S_flat, K)
@@ -261,17 +272,21 @@ class BarrierOption(DerivativeBase):
         features_norm = (features - self.mean) / self.std
         prices = self.model(features_norm).squeeze(-1)
         
-        # Compute second derivatives
         first_derivative = torch.autograd.grad(prices.sum(), S_t, create_graph=True)[0]
         gamma = torch.autograd.grad(first_derivative.sum(), S_t, create_graph=False)[0]
         
         return gamma.reshape(original_shape)
     
     def vega(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float) -> torch.Tensor:
+        """Compute vega via automatic differentiation with maturity handling."""
         T = self._compute_time_to_maturity(step_idx, N)
         
         S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
         original_shape = S_t.shape
+        
+        if T < 1e-6:
+            return torch.zeros_like(S_t)
+        
         S_flat = S_t.reshape(-1)
         
         h0_t = torch.tensor(h0, dtype=torch.float32, device=self.device, requires_grad=True)
@@ -280,7 +295,7 @@ class BarrierOption(DerivativeBase):
         T_batch = torch.full_like(S_flat, T)
         r_batch = torch.full_like(S_flat, self.r_daily * 252.0)
         barrier_batch = torch.full_like(S_flat, self.barrier_level)
-        h0_batch = h0_t.expand_as(S_flat)  # Changed from torch.full_like(S_flat, h0)
+        h0_batch = h0_t.expand_as(S_flat)
         
         features = create_features_batched(
             S_flat, K_batch, T_batch, r_batch, barrier_batch, h0_batch,
@@ -295,17 +310,23 @@ class BarrierOption(DerivativeBase):
             return torch.full(original_shape, vega.item(), device=self.device)
         else:
             return torch.zeros(original_shape, device=self.device)
+    
     def theta(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float) -> torch.Tensor:
+        """Compute theta via automatic differentiation with maturity handling."""
         T = self._compute_time_to_maturity(step_idx, N)
         
         S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
         original_shape = S_t.shape
+        
+        if T < 1e-6:
+            return torch.zeros_like(S_t)
+        
         S_flat = S_t.reshape(-1)
         
         T_t = torch.tensor(T, dtype=torch.float32, device=self.device, requires_grad=True)
         
         K_batch = torch.full_like(S_flat, K)
-        T_batch = T_t.expand_as(S_flat)  # Changed from torch.full_like(S_flat, T)
+        T_batch = T_t.expand_as(S_flat)
         r_batch = torch.full_like(S_flat, self.r_daily * 252.0)
         barrier_batch = torch.full_like(S_flat, self.barrier_level)
         h0_batch = torch.full_like(S_flat, h0)
