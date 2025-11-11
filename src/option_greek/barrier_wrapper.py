@@ -7,10 +7,10 @@ from src.option_greek.barrier import BarrierOption
 
 class BarrierOptionWithVanillaFallback(DerivativeBase):
     """
-    Wrapper that handles up-and-in barrier breach logic.
+    Wrapper for up-and-in barrier options with vanilla fallback after breach.
     
-    Before breach: Uses barrier NN pricing (accounts for probability of future breach)
-    After breach: Switches to vanilla option pricing
+    Before breach: Uses barrier neural network pricing (accounts for breach probability)
+    After breach: Switches to vanilla option analytical pricing
     """
     
     def __init__(
@@ -19,7 +19,7 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
         vanilla_option: VanillaOption
     ):
         """
-        Initialize barrier wrapper with both pricers.
+        Initialize barrier wrapper.
         
         Args:
             barrier_option: BarrierOption instance for pre-breach pricing
@@ -33,7 +33,7 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
         self.barrier_breached = False
     
     def reset_barrier_status(self):
-        """Reset barrier breach status to False (call at start of new path)."""
+        """Reset barrier breach status to False."""
         self.barrier_breached = False
     
     def check_and_update_barrier(self, S: torch.Tensor) -> bool:
@@ -59,7 +59,7 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
     
     def price(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float = None, **kwargs) -> torch.Tensor:
         """
-        Price up-and-in barrier option with fallback to vanilla after breach.
+        Price up-and-in barrier option.
         
         Args:
             S: Spot price(s)
@@ -67,7 +67,9 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
             step_idx: Current step index
             N: Total steps
             h0: Variance
-            **kwargs: Additional arguments
+            
+        Returns:
+            Option price
         """
         self.check_and_update_barrier(S)
         self.K = K
@@ -78,7 +80,7 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
             return self.vanilla_option.price(S, K, step_idx, N)
     
     def delta(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float = None, **kwargs) -> torch.Tensor:
-        """Compute delta for up-and-in barrier option."""
+        """Compute delta."""
         self.check_and_update_barrier(S)
         self.K = K
         
@@ -88,7 +90,7 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
             return self.vanilla_option.delta(S, K, step_idx, N)
     
     def gamma(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float = None, **kwargs) -> torch.Tensor:
-        """Compute gamma for up-and-in barrier option."""
+        """Compute gamma."""
         self.check_and_update_barrier(S)
         self.K = K
         
@@ -98,7 +100,7 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
             return self.vanilla_option.gamma(S, K, step_idx, N)
     
     def vega(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float = None, **kwargs) -> torch.Tensor:
-        """Compute vega for up-and-in barrier option."""
+        """Compute vega."""
         self.check_and_update_barrier(S)
         self.K = K
         
@@ -108,7 +110,7 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
             return self.vanilla_option.vega(S, K, step_idx, N)
     
     def theta(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float = None, **kwargs) -> torch.Tensor:
-        """Compute theta for up-and-in barrier option."""
+        """Compute theta."""
         self.check_and_update_barrier(S)
         self.K = K
         
