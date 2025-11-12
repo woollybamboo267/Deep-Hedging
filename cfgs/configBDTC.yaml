@@ -41,9 +41,9 @@ hedged_option:
   barrier_type: "up-and-in"
   model_path: "models/barrier/best_finetuned_up-and-in_call.1.pth"
 transaction_costs:
-    stock: 0
-    vanilla_option: 0
-    barrier_option: 0
+    stock: 0.0001
+    vanilla_option: 0.001
+    barrier_option: 0.002
 simulation:
   S0: 100
   r: 0.1342
