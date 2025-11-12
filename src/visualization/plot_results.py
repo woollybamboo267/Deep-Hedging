@@ -104,6 +104,8 @@ def compute_practitioner_benchmark(
     logger.info("=" * 80)
 
     return HN_positions_all, trajectories_hn, terminal_hedge_error_hn
+
+
 def compute_rl_metrics(
     env: Any,
     RL_positions: torch.Tensor,
@@ -251,9 +253,12 @@ def plot_episode_results(
                       ha='center', va='center', transform=axes[0, 1].transAxes)
         axes[0, 1].set_title("Option Positions", fontsize=12)
     
-    # ===== PLOT 3: Stock Price Trajectory =====
+    # ===== PLOT 3: Stock Price Trajectory with Derivative Price =====
     axes[1, 0].plot(time_steps, S_traj[path_idx].cpu().detach().numpy(),
                     label='Stock Price', color='tab:green', linewidth=2)
+    axes[1, 0].plot(time_steps, V_traj[path_idx].cpu().detach().numpy(),
+                    label=f'{derivative_type} Price', color='tab:blue', 
+                    linewidth=2, alpha=0.8)
     axes[1, 0].axhline(y=env.K, color='r', linestyle='--', label='Strike', alpha=0.7)
     
     # Add barrier level if hedging a barrier option
@@ -262,8 +267,8 @@ def plot_episode_results(
                           linestyle=':', label='Barrier', alpha=0.7, linewidth=2)
     
     axes[1, 0].set_xlabel("Time Step", fontsize=11)
-    axes[1, 0].set_ylabel("Stock Price", fontsize=11)
-    axes[1, 0].set_title(f"Stock Price Trajectory (Path {path_idx})", fontsize=12)
+    axes[1, 0].set_ylabel("Price", fontsize=11)
+    axes[1, 0].set_title(f"Stock & {derivative_type} Price (Path {path_idx})", fontsize=12)
     axes[1, 0].legend(fontsize=10)
     axes[1, 0].grid(True, alpha=0.3)
     
