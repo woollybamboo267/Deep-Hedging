@@ -31,9 +31,12 @@ def compute_practitioner_benchmark(
             - trajectories_hn: Dict with simulation trajectories
             - terminal_hedge_error_hn: [M,] terminal errors
     """
-    logger.info(f"Computing analytical hedge for all {env.M} paths using {type(env.derivative).__name__}")
+    logger.info("="*80)
+    logger.info(f"COMPUTING ANALYTICAL HEDGE for {env.M} paths using {type(env.derivative).__name__}")
+    logger.info("="*80)
     
-    # Define which greeks to hedge based on number of instruments
+    # ========== STEP 1: Determine Greeks to Hedge ==========
+    logger.info(f"STEP 1/5: Determining Greeks to hedge based on {n_hedging_instruments} instruments")
     if n_hedging_instruments == 1:
         greek_names = ['delta']
     elif n_hedging_instruments == 2:
@@ -45,21 +48,37 @@ def compute_practitioner_benchmark(
     else:
         raise ValueError(f"n_hedging_instruments must be 1-4, got {n_hedging_instruments}")
     
-    # Compute portfolio greeks using the derivative's Greek methods
+    logger.info(f"  → Greeks to hedge: {greek_names}")
+    
+    # ========== STEP 2: Compute Portfolio Greeks ==========
+    logger.info(f"STEP 2/5: Computing portfolio Greeks along all price paths")
     portfolio_greeks = {}
     h0_current = env.h_t.mean().item()
     
-    for greek_name in greek_names:
+    for idx, greek_name in enumerate(greek_names, 1):
+        logger.info(f"  → Computing {greek_name} ({idx}/{len(greek_names)})...")
         greek_traj = env.compute_all_paths_greeks(S_traj, greek_name)
         portfolio_greeks[greek_name] = -env.side * greek_traj
+        logger.info(f"    ✓ {greek_name} computed: shape {greek_traj.shape}")
     
-    # Compute optimal positions using linear algebra solver
+    logger.info(f"  → Portfolio Greeks computation complete")
+    
+    # ========== STEP 3: Solve for Optimal Hedge Positions ==========
+    logger.info(f"STEP 3/5: Solving for optimal hedge positions using linear algebra")
+    logger.info(f"  → Matching {len(greek_names)} Greeks with {n_hedging_instruments} instruments")
     HN_positions_all = env.compute_hn_option_positions(S_traj, portfolio_greeks)
+    logger.info(f"  → Hedge positions computed: shape {HN_positions_all.shape}")
+    logger.info(f"    ✓ Positions = [M={HN_positions_all.shape[0]}, N+1={HN_positions_all.shape[1]}, instruments={HN_positions_all.shape[2]}]")
     
-    # Simulate the benchmark strategy
+    # ========== STEP 4: Simulate Hedge Strategy ==========
+    logger.info(f"STEP 4/5: Simulating practitioner hedge strategy across all paths")
     _, trajectories_hn = env.simulate_full_trajectory(HN_positions_all, O_traj)
+    logger.info(f"  → Simulation complete")
+    logger.info(f"    ✓ Bank account trajectory: shape {trajectories_hn['B'].shape}")
+    logger.info(f"    ✓ Stock trajectory: shape {trajectories_hn['S'].shape}")
     
-    # Compute terminal errors
+    # ========== STEP 5: Compute Terminal Hedge Errors ==========
+    logger.info(f"STEP 5/5: Computing terminal hedge errors")
     S_final = trajectories_hn['S'][:, -1]
     
     # Compute payoff - works for both vanilla and barrier
@@ -68,19 +87,30 @@ def compute_practitioner_benchmark(
     else:
         opt_type = env.option_type.lower()
     
+    logger.info(f"  → Computing payoff for {opt_type} option at maturity")
     if opt_type == "call":
         payoff = torch.clamp(S_final - env.K, min=0.0)
     else:
         payoff = torch.clamp(env.K - S_final, min=0.0)
     
     payoff = payoff * env.contract_size
+    logger.info(f"    ✓ Payoff computed: mean={payoff.mean().item():.4f}, std={payoff.std().item():.4f}")
     
     # Compute terminal value
+    logger.info(f"  → Computing terminal portfolio value")
     terminal_value_hn = trajectories_hn['B'][:, -1] + HN_positions_all[:, -1, 0] * S_final
     for i, maturity in enumerate(env.instrument_maturities[1:], start=1):
         terminal_value_hn += HN_positions_all[:, -1, i] * O_traj[maturity][:, -1]
     
     terminal_hedge_error_hn = (terminal_value_hn - env.side * payoff).cpu().detach().numpy()
+    
+    logger.info(f"    ✓ Terminal hedge error computed")
+    logger.info(f"      - Mean error: {terminal_hedge_error_hn.mean():.6f}")
+    logger.info(f"      - Std error: {terminal_hedge_error_hn.std():.6f}")
+    logger.info(f"      - MSE: {(terminal_hedge_error_hn**2).mean():.6f}")
+    logger.info("="*80)
+    logger.info("ANALYTICAL HEDGE COMPUTATION COMPLETE")
+    logger.info("="*80)
     
     return HN_positions_all, trajectories_hn, terminal_hedge_error_hn
 
