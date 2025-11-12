@@ -254,23 +254,38 @@ def plot_episode_results(
         axes[0, 1].set_title("Option Positions", fontsize=12)
     
     # ===== PLOT 3: Stock Price Trajectory with Derivative Price =====
-    axes[1, 0].plot(time_steps, S_traj[path_idx].cpu().detach().numpy(),
-                    label='Stock Price', color='tab:green', linewidth=2)
-    axes[1, 0].plot(time_steps, V_traj[path_idx].cpu().detach().numpy(),
-                    label=f'{derivative_type} Price', color='tab:blue', 
-                    linewidth=2, alpha=0.8)
-    axes[1, 0].axhline(y=env.K, color='r', linestyle='--', label='Strike', alpha=0.7)
+    # Plot stock price on primary y-axis
+    ax1 = axes[1, 0]
+    color_stock = 'tab:green'
+    ax1.plot(time_steps, S_traj[path_idx].cpu().detach().numpy(),
+             label='Stock Price', color=color_stock, linewidth=2)
+    ax1.axhline(y=env.K, color='r', linestyle='--', label='Strike', alpha=0.7)
     
     # Add barrier level if hedging a barrier option
     if hasattr(env.derivative, 'barrier_level'):
-        axes[1, 0].axhline(y=env.derivative.barrier_level, color='purple', 
-                          linestyle=':', label='Barrier', alpha=0.7, linewidth=2)
+        ax1.axhline(y=env.derivative.barrier_level, color='purple', 
+                   linestyle=':', label='Barrier', alpha=0.7, linewidth=2)
     
-    axes[1, 0].set_xlabel("Time Step", fontsize=11)
-    axes[1, 0].set_ylabel("Price", fontsize=11)
-    axes[1, 0].set_title(f"Stock & {derivative_type} Price (Path {path_idx})", fontsize=12)
-    axes[1, 0].legend(fontsize=10)
-    axes[1, 0].grid(True, alpha=0.3)
+    ax1.set_xlabel("Time Step", fontsize=11)
+    ax1.set_ylabel("Stock Price", fontsize=11, color=color_stock)
+    ax1.tick_params(axis='y', labelcolor=color_stock)
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot derivative price on secondary y-axis with independent scale
+    ax2 = ax1.twinx()
+    color_derivative = 'tab:blue'
+    ax2.plot(time_steps, V_traj[path_idx].cpu().detach().numpy(),
+             label=f'{derivative_type} Price', color=color_derivative, 
+             linewidth=2, alpha=0.8)
+    ax2.set_ylabel(f"{derivative_type} Price", fontsize=11, color=color_derivative)
+    ax2.tick_params(axis='y', labelcolor=color_derivative)
+    
+    # Combine legends from both axes
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=10, loc='best')
+    
+    ax1.set_title(f"Stock & {derivative_type} Price (Path {path_idx})", fontsize=12)
     
     # ===== PLOT 4: Hedging Instrument Prices =====
     for i, maturity in enumerate(env.instrument_maturities[1:], start=1):
