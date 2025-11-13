@@ -291,7 +291,7 @@ def plot_episode_results(
     for i, maturity in enumerate(env.instrument_maturities[1:], start=1):
         opt_type = env.instrument_types[i]
         strike = env.instrument_strikes[i]
-        axes[1, 1].plot(time_steps, O_traj[maturity][path_idx].cpu().detach().numpy(),
+        axes[1, 1].plot(time_steps, O_traj[i - 1][path_idx].cpu().detach().numpy(),
                       label=f'{maturity}d {opt_type.upper()} K={strike}', linewidth=2)
     axes[1, 1].set_xlabel("Time Step", fontsize=11)
     axes[1, 1].set_ylabel("Option Price", fontsize=11)
