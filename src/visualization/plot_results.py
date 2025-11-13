@@ -91,7 +91,7 @@ def compute_practitioner_benchmark(
 
     terminal_value_hn = trajectories_hn['B'][:, -1] + HN_positions_all[:, -1, 0] * S_final
     for i, maturity in enumerate(env.instrument_maturities[1:], start=1):
-        terminal_value_hn += HN_positions_all[:, -1, i] * O_traj[maturity][:, -1]
+        terminal_value_hn += HN_positions_all[:, -1, i] * O_traj[i - 1][:, -1]
 
     terminal_hedge_error_hn = (terminal_value_hn - env.side * payoff).cpu().detach().numpy()
     
@@ -144,7 +144,7 @@ def compute_rl_metrics(
     # Compute terminal value
     terminal_value_rl = trajectories['B'][:, -1] + RL_positions[:, -1, 0] * S_final
     for i, maturity in enumerate(env.instrument_maturities[1:], start=1):
-        terminal_value_rl += RL_positions[:, -1, i] * O_traj[maturity][:, -1]
+        terminal_value_rl += RL_positions[:, -1, i] * O_traj[i - 1][:, -1]
     
     terminal_hedge_error_rl = (terminal_value_rl - env.side * payoff).cpu().detach().numpy()
     
