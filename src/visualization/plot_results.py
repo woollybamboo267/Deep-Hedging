@@ -202,6 +202,12 @@ def plot_episode_results(
         logger.info("=" * 80)
         logger.info(f"Type of O_traj: {type(O_traj)}")
         logger.info(f"Number of entries in O_traj: {len(O_traj)}")
+        
+        # Convert O_traj to dict if it's a list
+        if isinstance(O_traj, list):
+            logger.info("O_traj is a list, converting to dict with integer keys")
+            O_traj = {i: tensor for i, tensor in enumerate(O_traj)}
+        
         for key in O_traj.keys():
             value = O_traj[key]
             logger.info(f"O_traj[{key}]: shape={value.shape}, dtype={value.dtype}, numel={value.numel()}")
@@ -444,8 +450,12 @@ def plot_episode_results(
                 logger.error(f"O_traj info:")
                 logger.error(f"  - Type: {type(O_traj)}")
                 logger.error(f"  - Length: {len(O_traj)}")
-                for key, value in O_traj.items():
-                    logger.error(f"  - O_traj[{key}]: shape={value.shape}, dtype={value.dtype}")
+                if isinstance(O_traj, dict):
+                    for key, value in O_traj.items():
+                        logger.error(f"  - O_traj[{key}]: shape={value.shape}, dtype={value.dtype}")
+                elif isinstance(O_traj, list):
+                    for i, value in enumerate(O_traj):
+                        logger.error(f"  - O_traj[{i}]: shape={value.shape}, dtype={value.dtype}")
         except Exception as diag_error:
             logger.error(f"Could not provide diagnostics: {diag_error}")
         
