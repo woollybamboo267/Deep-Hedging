@@ -1,5 +1,3 @@
-# src/agents/policy_net_garch_flexible.py
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -342,7 +340,7 @@ class HedgingEnvGARCH:
         outputs = []
         for i, head in enumerate(policy_net.instrument_heads):
             if i == 0:
-                output = torch.sigmoid(head(x)).squeeze(-1)[:, 0]
+                output = torch.tanh(head(x)).squeeze(-1)[:, 0]
             else:
                 output = head(x).squeeze(-1)[:, 0]
             outputs.append(output)
@@ -388,7 +386,7 @@ class HedgingEnvGARCH:
             outputs = []
             for i, head in enumerate(policy_net.instrument_heads):
                 if i == 0:
-                    output = torch.sigmoid(head(x)).squeeze(-1)[:, 0]
+                    output = torch.tanh(head(x)).squeeze(-1)[:, 0]
                 else:
                     output = head(x).squeeze(-1)[:, 0]
                 outputs.append(output)
