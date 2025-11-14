@@ -15,12 +15,37 @@ def compute_practitioner_benchmark(
     n_hedging_instruments: int
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], np.ndarray]:
     """
-    Compute the practitioner benchmark hedge using derivatives' Greek methods,
-    now with a progress bar and estimated time remaining display.
+    Compute the practitioner benchmark hedge with extensive diagnostics.
     """
     logger.info("=" * 80)
     logger.info(f"COMPUTING ANALYTICAL HEDGE for {env.M} paths using {type(env.derivative).__name__}")
     logger.info("=" * 80)
+    
+    # ========== DIAGNOSTIC: BARRIER BREACH ANALYSIS ==========
+    logger.info("DIAGNOSTIC: Analyzing barrier breach patterns")
+    S_np = S_traj.cpu().numpy()
+    barrier_level = env.derivative.barrier_level
+    
+    breached_paths = []
+    breach_times = []
+    for path_idx in range(env.M):
+        breach_idx = np.where(S_np[path_idx, :] >= barrier_level)[0]
+        if len(breach_idx) > 0:
+            breached_paths.append(path_idx)
+            breach_times.append(breach_idx[0])
+    
+    n_breached = len(breached_paths)
+    breach_pct = 100 * n_breached / env.M
+    
+    logger.info(f"  → Paths that breached barrier: {n_breached}/{env.M} ({breach_pct:.1f}%)")
+    logger.info(f"  → Paths that never breached: {env.M - n_breached}/{env.M} ({100-breach_pct:.1f}%)")
+    
+    if n_breached > 0:
+        logger.info(f"  → Average breach time: {np.mean(breach_times):.1f} steps")
+        logger.info(f"  → Earliest breach: step {np.min(breach_times)}")
+        logger.info(f"  → Latest breach: step {np.max(breach_times)}")
+    
+    breach_mask = np.array([i in breached_paths for i in range(env.M)])
 
     # ========== STEP 1: Determine Greeks to Hedge ==========
     logger.info(f"STEP 1/5: Determining Greeks to hedge based on {n_hedging_instruments} instruments")
@@ -37,12 +62,13 @@ def compute_practitioner_benchmark(
     
     logger.info(f"  → Greeks to hedge: {greek_names}")
 
-    # ========== STEP 2: Compute Portfolio Greeks ==========
+    # ========== STEP 2: Compute Portfolio Greeks with Diagnostics ==========
     logger.info(f"STEP 2/5: Computing portfolio Greeks along all price paths")
     portfolio_greeks = {}
+    greek_stats = {}
     start_time = time.time()
 
-    with tqdm(total=len(greek_names), desc="Computing Greeks", ncols=80) as pbar:
+    with tqdm(total=len(greek_names), desc="Computing Greeks", ncols=100) as pbar:
         for idx, greek_name in enumerate(greek_names, 1):
             iter_start = time.time()
             logger.info(f"  → Computing {greek_name} ({idx}/{len(greek_names)})...")
@@ -50,11 +76,43 @@ def compute_practitioner_benchmark(
             greek_traj = env.compute_all_paths_greeks(S_traj, greek_name)
             portfolio_greeks[greek_name] = -env.side * greek_traj
 
+            # DIAGNOSTIC: Compute Greek statistics
+            greek_np = greek_traj.cpu().numpy()
+            greek_stats[greek_name] = {
+                'mean': greek_np.mean(),
+                'std': greek_np.std(),
+                'min': greek_np.min(),
+                'max': greek_np.max(),
+                'nan_count': np.isnan(greek_np).sum(),
+                'inf_count': np.isinf(greek_np).sum(),
+                'zero_count': (greek_np == 0).sum(),
+                'total_count': greek_np.size
+            }
+
             iter_time = time.time() - iter_start
             elapsed = time.time() - start_time
             remaining = (len(greek_names) - idx) * iter_time
+            
             logger.info(f"    ✓ {greek_name} computed: shape {greek_traj.shape}")
+            logger.info(f"    ✓ Range: [{greek_stats[greek_name]['min']:.6f}, {greek_stats[greek_name]['max']:.6f}]")
+            logger.info(f"    ✓ Mean: {greek_stats[greek_name]['mean']:.6f} | Std: {greek_stats[greek_name]['std']:.6f}")
             logger.info(f"    ⏱ Time for {greek_name}: {iter_time:.2f}s | ETA remaining: {remaining:.2f}s")
+            
+            # DIAGNOSTIC: Check for issues
+            if greek_stats[greek_name]['nan_count'] > 0:
+                logger.warning(f"    ⚠ WARNING: {greek_stats[greek_name]['nan_count']} NaN values in {greek_name}!")
+            if greek_stats[greek_name]['inf_count'] > 0:
+                logger.warning(f"    ⚠ WARNING: {greek_stats[greek_name]['inf_count']} Inf values in {greek_name}!")
+            
+            zero_pct = 100 * greek_stats[greek_name]['zero_count'] / greek_stats[greek_name]['total_count']
+            if zero_pct > 50:
+                logger.warning(f"    ⚠ WARNING: {zero_pct:.1f}% zero values in {greek_name}!")
+            
+            # DIAGNOSTIC: Breach vs non-breach comparison
+            if n_breached > 0 and (env.M - n_breached) > 0:
+                greek_breached = greek_np[breach_mask, :].mean()
+                greek_not_breached = greek_np[~breach_mask, :].mean()
+                logger.info(f"    ✓ Mean (breached): {greek_breached:.6f} | Mean (not breached): {greek_not_breached:.6f}")
 
             pbar.set_postfix_str(f"{idx}/{len(greek_names)} done | ETA {remaining:.1f}s")
             pbar.update(1)
@@ -66,13 +124,28 @@ def compute_practitioner_benchmark(
     logger.info(f"STEP 3/5: Solving for optimal hedge positions using linear algebra")
     HN_positions_all = env.compute_hn_option_positions(S_traj, portfolio_greeks)
     logger.info(f"  → Hedge positions computed: shape {HN_positions_all.shape}")
+    
+    # DIAGNOSTIC: Analyze hedge positions
+    positions_np = HN_positions_all.cpu().numpy()
+    logger.info(f"  → Position diagnostics:")
+    for inst_idx in range(n_hedging_instruments):
+        inst_type = 'Stock' if inst_idx == 0 else f'Option {inst_idx}'
+        pos = positions_np[:, :, inst_idx]
+        logger.info(f"    {inst_type}: Range=[{pos.min():.4f}, {pos.max():.4f}], Mean={pos.mean():.4f}, Std={pos.std():.4f}")
+        
+        nan_count = np.isnan(pos).sum()
+        inf_count = np.isinf(pos).sum()
+        if nan_count > 0:
+            logger.warning(f"    ⚠ {inst_type}: {nan_count} NaN values!")
+        if inf_count > 0:
+            logger.warning(f"    ⚠ {inst_type}: {inf_count} Inf values!")
 
     # ========== STEP 4: Simulate Hedge Strategy ==========
     logger.info(f"STEP 4/5: Simulating practitioner hedge strategy across all paths")
     _, trajectories_hn = env.simulate_full_trajectory(HN_positions_all, O_traj)
     logger.info(f"  → Simulation complete")
 
-    # ========== STEP 5: Compute Terminal Hedge Errors ==========
+    # ========== STEP 5: Compute Terminal Hedge Errors with Diagnostics ==========
     logger.info(f"STEP 5/5: Computing terminal hedge errors")
     S_final = trajectories_hn['S'][:, -1]
 
@@ -87,17 +160,81 @@ def compute_practitioner_benchmark(
     else:
         payoff = torch.clamp(env.K - S_final, min=0.0)
     payoff = payoff * env.contract_size
+    
+    # DIAGNOSTIC: Payoff statistics
+    payoff_np = payoff.cpu().numpy()
+    logger.info(f"  → Payoff: Range=[{payoff_np.min():.4f}, {payoff_np.max():.4f}], Mean={payoff_np.mean():.4f}")
+    logger.info(f"  → Paths ITM: {(payoff_np > 0).sum()}/{env.M}")
 
     terminal_value_hn = trajectories_hn['B'][:, -1] + HN_positions_all[:, -1, 0] * S_final
     for i, maturity in enumerate(env.instrument_maturities[1:], start=1):
-        terminal_value_hn += HN_positions_all[:, -1, i] * O_traj[i - 1][:, -1]
+        option_contrib = HN_positions_all[:, -1, i] * O_traj[i - 1][:, -1]
+        terminal_value_hn += option_contrib
+        # DIAGNOSTIC: Option contribution
+        option_contrib_np = option_contrib.cpu().numpy()
+        logger.info(f"  → Option {i} contribution: Range=[{option_contrib_np.min():.4f}, {option_contrib_np.max():.4f}]")
 
     terminal_hedge_error_hn = (terminal_value_hn - env.side * payoff).cpu().detach().numpy()
     
+    # DIAGNOSTIC: Detailed error statistics
     logger.info(f"  ✓ Terminal hedge error computed")
     logger.info(f"    Mean error: {terminal_hedge_error_hn.mean():.6f}")
     logger.info(f"    Std error: {terminal_hedge_error_hn.std():.6f}")
-    logger.info(f"    MSE: {(terminal_hedge_error_hn ** 2).mean():.6f}")
+    logger.info(f"    Min error: {terminal_hedge_error_hn.min():.6f}")
+    logger.info(f"    Max error: {terminal_hedge_error_hn.max():.6f}")
+    logger.info(f"    Median error: {np.median(terminal_hedge_error_hn):.6f}")
+    
+    # Check for extreme errors
+    extreme_threshold = 3 * terminal_hedge_error_hn.std()
+    extreme_errors = np.abs(terminal_hedge_error_hn) > extreme_threshold
+    if extreme_errors.sum() > 0:
+        logger.warning(f"    ⚠ {extreme_errors.sum()} paths with extreme errors (>3σ)")
+        extreme_indices = np.where(extreme_errors)[0]
+        logger.warning(f"    ⚠ Example extreme error paths: {extreme_indices[:5].tolist()}")
+    
+    # Performance metrics
+    mse = (terminal_hedge_error_hn ** 2).mean()
+    smse = mse / (env.S0 ** 2)
+    cvar_95 = np.mean(np.sort(terminal_hedge_error_hn ** 2)[-int(0.05 * env.M):])
+    
+    logger.info(f"    MSE: {mse:.6f}")
+    logger.info(f"    SMSE: {smse:.8f}")
+    logger.info(f"    CVaR95: {cvar_95:.6f}")
+    
+    # DIAGNOSTIC: Error breakdown by breach status
+    if n_breached > 0 and (env.M - n_breached) > 0:
+        logger.info("=" * 80)
+        logger.info("DIAGNOSTIC: ERROR BREAKDOWN BY BREACH STATUS")
+        logger.info("=" * 80)
+        
+        errors_breached = terminal_hedge_error_hn[breach_mask]
+        errors_not_breached = terminal_hedge_error_hn[~breach_mask]
+        
+        mse_breached = (errors_breached ** 2).mean()
+        mse_not_breached = (errors_not_breached ** 2).mean()
+        
+        logger.info(f"BREACHED PATHS ({n_breached} paths, {breach_pct:.1f}%):")
+        logger.info(f"  Mean error: {errors_breached.mean():.6f}")
+        logger.info(f"  Std error: {errors_breached.std():.6f}")
+        logger.info(f"  MSE: {mse_breached:.6f}")
+        
+        logger.info(f"NON-BREACHED PATHS ({env.M - n_breached} paths, {100-breach_pct:.1f}%):")
+        logger.info(f"  Mean error: {errors_not_breached.mean():.6f}")
+        logger.info(f"  Std error: {errors_not_breached.std():.6f}")
+        logger.info(f"  MSE: {mse_not_breached:.6f}")
+        
+        # Identify dominant error source
+        if mse_breached > 5 * mse_not_breached:
+            logger.warning("⚠ CRITICAL: MSE dominated by BREACHED paths!")
+            logger.warning("⚠ Issue likely in vanilla option fallback after breach")
+            logger.warning("⚠ Check barrier_wrapper.py Greeks after breach")
+        elif mse_not_breached > 5 * mse_breached:
+            logger.warning("⚠ CRITICAL: MSE dominated by NON-BREACHED paths!")
+            logger.warning("⚠ Issue likely in barrier option neural network pricing/Greeks")
+            logger.warning("⚠ Check barrier.py Greeks before breach")
+        else:
+            logger.info("✓ Error contributions are balanced between breached and non-breached paths")
+    
     logger.info("=" * 80)
     logger.info("ANALYTICAL HEDGE COMPUTATION COMPLETE")
     logger.info("=" * 80)
@@ -240,7 +377,7 @@ def plot_episode_results(
             env, RL_positions, trajectories, O_traj
         )
         
-        # Compute practitioner benchmark
+        # Compute practitioner benchmark (now with enhanced diagnostics)
         logger.info("Computing practitioner benchmark...")
         HN_positions_all, trajectories_hn, terminal_hedge_error_hn = \
             compute_practitioner_benchmark(env, S_traj, O_traj, n_inst)
