@@ -194,43 +194,75 @@ class BarrierOption(DerivativeBase):
         return gamma.reshape(orig_shape)
 
     def vega(self, S, K, step_idx, N, h0):
+        """
+        Compute vega with proper gradient tracking for h0.
+        
+        FIX: h0_t must be a batched tensor, not scalar, to match S_flat dimensions.
+        """
         T = self._compute_time_to_maturity(step_idx, N)
         S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
         orig_shape = S_t.shape
-
+    
         if T < 1e-6:
             return torch.zeros_like(S_t)
-
+    
         S_flat = S_t.reshape(-1)
-        h0_t = torch.tensor(h0, dtype=torch.float32, device=self.device, requires_grad=True)
+        batch_size = S_flat.shape[0]
+        
+        # Create h0_t as a batched tensor with the same size as S_flat
+        # This ensures all features have consistent dimensions in create_features_batched
+        h0_t = torch.full((batch_size,), h0, dtype=torch.float32, 
+                          device=self.device, requires_grad=True)
+        
         features = create_features_batched(
             S_flat, K, T, self.r_daily * 252.0, self.barrier_level, h0_t, self.option_type
         )
         features_norm = (features - self.mean) / self.std
         prices = self.model(features_norm).squeeze(-1)
+        
+        # Compute gradient with respect to h0
         vega_raw = torch.autograd.grad(prices.mean(), h0_t, allow_unused=True)[0]
         if vega_raw is None:
             return torch.zeros(orig_shape, device=self.device)
-        vega = vega_raw * 2 * torch.sqrt(h0_t)
+        
+        # Convert d(price)/d(h0) to d(price)/d(sigma)
+        # Since h0 = sigma^2, we have d/d(sigma) = d/d(h0) * 2*sigma
+        vega = vega_raw.mean() * 2 * torch.sqrt(torch.tensor(h0, device=self.device))
         return torch.full(orig_shape, vega.item(), device=self.device)
+    
 
     def theta(self, S, K, step_idx, N, h0):
+        """
+        Compute theta with proper gradient tracking for T.
+        
+        FIX: T_t must be a batched tensor, not scalar, to match S_flat dimensions.
+        """
         T = self._compute_time_to_maturity(step_idx, N)
         S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
         orig_shape = S_t.shape
-
+    
         if T < 1e-6:
             return torch.zeros_like(S_t)
-
+    
         S_flat = S_t.reshape(-1)
-        T_t = torch.tensor(T, dtype=torch.float32, device=self.device, requires_grad=True)
+        batch_size = S_flat.shape[0]
+        
+        # Create T_t as a batched tensor with the same size as S_flat
+        # This ensures all features have consistent dimensions in create_features_batched
+        T_t = torch.full((batch_size,), T, dtype=torch.float32,
+                         device=self.device, requires_grad=True)
+        
         features = create_features_batched(
             S_flat, K, T_t, self.r_daily * 252.0, self.barrier_level, h0, self.option_type
         )
         features_norm = (features - self.mean) / self.std
         prices = self.model(features_norm).squeeze(-1)
+        
+        # Compute gradient with respect to T
         theta_raw = torch.autograd.grad(prices.mean(), T_t, allow_unused=True)[0]
         if theta_raw is None:
             return torch.zeros(orig_shape, device=self.device)
-        theta = -theta_raw
+        
+        # Negative because theta is -dV/dT (value decays with time)
+        theta = -theta_raw.mean()
         return torch.full(orig_shape, theta.item(), device=self.device)
