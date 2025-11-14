@@ -29,7 +29,7 @@ instruments:
   n_hedging_instruments: 3
   strikes: [95, 105]          # Length = n_hedging_instruments - 1 = 2
   types: ["call", "put"]      # Length = 2
-  maturities: [378, 378]      # Length = 2 (in days)
+  maturities: [252, 504]      # Length = 2 (in days)
 
 hedged_option:
   type: "barrier"
@@ -42,9 +42,9 @@ hedged_option:
   model_path: "models/barrier/best_finetuned_up-and-in_call.1.pth"
 
 transaction_costs:
-  stock: 0
-  vanilla_option: 0
-  barrier_option: 0
+  stock: 0.0001
+  vanilla_option: 0.001
+  barrier_option: 0.002
 
 simulation:
   S0: 100
