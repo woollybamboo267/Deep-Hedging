@@ -37,7 +37,7 @@ hedged_option:
   T: 1.0  # Hedged option maturity (252 days)
   option_type: "call"
   side: "short"
-  barrier_level: 110.0
+  barrier_level: 105.0
   barrier_type: "up-and-in"
   model_path: "models/barrier/best_finetuned_up-and-in_call.1.pth"
 transaction_costs:
