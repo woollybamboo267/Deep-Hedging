@@ -4,10 +4,10 @@
 training:
   learning_rate: 0.0001
   batch_size: 1000
-  num_epochs: 300
+  num_epochs: 400
   weight_decay: 0.00001
   optimizer: "AdamW"
-  episodes: 400
+  episodes: 300
   seed: 78020349
   gamma: 0.9999
   entropy_coefficient: 0.5
