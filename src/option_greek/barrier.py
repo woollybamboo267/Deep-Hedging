@@ -4,7 +4,7 @@ import os
 import math
 import numpy as np
 from .base import DerivativeBase
-from typing import Dict
+from typing import Dict, Union
 
 
 # ---------------------- Neural Network ----------------------
@@ -36,47 +36,82 @@ class BarrierOptionNN(nn.Module):
 # ---------------------- Feature Engineering ----------------------
 
 def create_features_batched(S0, K, T, r, barrier, h0, option_type="call"):
-    """Feature creation for batched inference."""
-    def ensure_tensor(x):
-        return x if isinstance(x, torch.Tensor) else torch.full_like(S0, x)
+    """
+    Feature creation for batched inference with proper autograd support.
+    
+    CRITICAL FIX: Handles both scalar and batched parameters correctly.
+    When h0 or T are scalar tensors with requires_grad, they're properly
+    broadcast to match batch size while maintaining gradient flow.
+    """
+    def ensure_tensor(x, reference_shape):
+        """
+        Convert parameter to tensor with proper shape for batching.
+        
+        Args:
+            x: Parameter (can be float, tensor scalar, or batched tensor)
+            reference_shape: Shape to match (typically S0.shape)
+        """
+        if isinstance(x, torch.Tensor):
+            # Already a tensor
+            if x.dim() == 0:
+                # Scalar tensor - expand to batch size while keeping gradients
+                return x.unsqueeze(0).expand(reference_shape)
+            elif x.shape == reference_shape:
+                # Already correct shape
+                return x
+            elif x.shape[0] == reference_shape[0]:
+                # Correct batch size
+                return x
+            else:
+                raise ValueError(f"Tensor shape {x.shape} incompatible with reference {reference_shape}")
+        else:
+            # Float or other type - convert to tensor
+            return torch.full(reference_shape, x, dtype=S0.dtype, device=S0.device)
 
-    K, T, r, barrier, h0 = map(ensure_tensor, (K, T, r, barrier, h0))
-    moneyness = S0 / K
-    barrier_distance_S = barrier / S0
-    barrier_distance_K = barrier / K
+    # Ensure all parameters have consistent batch dimension
+    K_t = ensure_tensor(K, S0.shape)
+    T_t = ensure_tensor(T, S0.shape)
+    r_t = ensure_tensor(r, S0.shape)
+    barrier_t = ensure_tensor(barrier, S0.shape)
+    h0_t = ensure_tensor(h0, S0.shape)
+    
+    # Compute features
+    moneyness = S0 / K_t
+    barrier_distance_S = barrier_t / S0
+    barrier_distance_K = barrier_t / K_t
     log_m = torch.log(moneyness)
     log_HS = torch.log(barrier_distance_S)
     log_HK = torch.log(barrier_distance_K)
-    sqrt_T = torch.sqrt(T)
-    vol_proxy = torch.sqrt(h0)
+    sqrt_T = torch.sqrt(T_t)
+    vol_proxy = torch.sqrt(h0_t)
     vol_time = vol_proxy * sqrt_T
-    drift_adj = (r - 0.5 * h0) * T
+    drift_adj = (r_t - 0.5 * h0_t) * T_t
 
     if option_type == "call":
-        intrinsic = torch.clamp(S0 - K, min=0.0)
-        is_itm = (S0 > K).float()
-        is_otm = (S0 < K).float()
+        intrinsic = torch.clamp(S0 - K_t, min=0.0)
+        is_itm = (S0 > K_t).float()
+        is_otm = (S0 < K_t).float()
     else:
-        intrinsic = torch.clamp(K - S0, min=0.0)
-        is_itm = (S0 < K).float()
-        is_otm = (S0 > K).float()
+        intrinsic = torch.clamp(K_t - S0, min=0.0)
+        is_itm = (S0 < K_t).float()
+        is_otm = (S0 > K_t).float()
 
     dist_atm = torch.abs(torch.log(moneyness))
     is_atm = (torch.abs(moneyness - 1.0) < 0.05).float()
-    breach_risk = torch.clamp(1.0 - (barrier - S0) / S0, min=0.0)
-    safe_dist = (barrier - S0) / torch.clamp(vol_proxy * S0 * sqrt_T, min=1e-8)
-    time_decay = 1.0 / (T + 1e-3)
-    short_dated = (T < 0.1).float()
-    variance_term = h0 * T
-    vol_of_vol = h0 ** 1.5
+    breach_risk = torch.clamp(1.0 - (barrier_t - S0) / S0, min=0.0)
+    safe_dist = (barrier_t - S0) / torch.clamp(vol_proxy * S0 * sqrt_T, min=1e-8)
+    time_decay = 1.0 / (T_t + 1e-3)
+    short_dated = (T_t < 0.1).float()
+    variance_term = h0_t * T_t
+    vol_of_vol = h0_t ** 1.5
 
     features = torch.stack([
-        moneyness, K, T, r,
-        barrier_distance_S, barrier_distance_K, h0,
+        moneyness, K_t, T_t, r_t,
+        barrier_distance_S, barrier_distance_K, h0_t,
         log_m, log_HS, log_HK,
         sqrt_T, vol_proxy, vol_time, drift_adj,
-        S0, barrier, S0 * r, K * r, barrier * r,
-        barrier - S0, barrier - K, S0 - K,
+        S0, barrier_t, S0 * r_t, K_t * r_t, barrier_t * r_t,
+        barrier_t - S0, barrier_t - K_t, S0 - K_t,
         intrinsic,
         dist_atm, is_itm, is_otm, is_atm,
         breach_risk, safe_dist,
@@ -135,6 +170,16 @@ class BarrierOption(DerivativeBase):
     # ---------------------- Pricing ----------------------
 
     def price(self, S, K, step_idx, N, h0):
+        """
+        Price barrier option.
+        
+        Args:
+            S: Spot price(s) - tensor of shape [M] or scalar
+            K: Strike price - float
+            step_idx: Current time step - int
+            N: Total time steps - int
+            h0: Variance - float or scalar tensor (can have requires_grad=True)
+        """
         T = self._compute_time_to_maturity(step_idx, N)
         S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
         orig_shape = S_t.shape
@@ -144,8 +189,15 @@ class BarrierOption(DerivativeBase):
             return torch.zeros_like(S_t)
 
         S_flat = S_t.reshape(-1)
+        
+        # Convert h0 to tensor if needed, preserving gradients
+        if not isinstance(h0, torch.Tensor):
+            h0_t = torch.tensor(h0, dtype=torch.float32, device=self.device)
+        else:
+            h0_t = h0
+        
         features = create_features_batched(
-            S_flat, K, T, self.r_daily * 252.0, self.barrier_level, h0, self.option_type
+            S_flat, K, T, self.r_daily * 252.0, self.barrier_level, h0_t, self.option_type
         )
         features_norm = (features - self.mean) / self.std
         with torch.no_grad():
@@ -166,8 +218,15 @@ class BarrierOption(DerivativeBase):
 
         S_t = S_t.clone().detach().requires_grad_(True)
         S_flat = S_t.reshape(-1)
+        
+        # Convert h0 to tensor if needed
+        if not isinstance(h0, torch.Tensor):
+            h0_t = torch.tensor(h0, dtype=torch.float32, device=self.device)
+        else:
+            h0_t = h0
+        
         features = create_features_batched(
-            S_flat, K, T, self.r_daily * 252.0, self.barrier_level, h0, self.option_type
+            S_flat, K, T, self.r_daily * 252.0, self.barrier_level, h0_t, self.option_type
         )
         features_norm = (features - self.mean) / self.std
         prices = self.model(features_norm).squeeze(-1)
@@ -175,6 +234,7 @@ class BarrierOption(DerivativeBase):
         return delta.reshape(orig_shape)
 
     def gamma(self, S, K, step_idx, N, h0):
+        """Compute gamma via second derivative."""
         T = self._compute_time_to_maturity(step_idx, N)
         S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
         orig_shape = S_t.shape
@@ -184,8 +244,15 @@ class BarrierOption(DerivativeBase):
 
         S_t = S_t.clone().detach().requires_grad_(True)
         S_flat = S_t.reshape(-1)
+        
+        # Convert h0 to tensor if needed
+        if not isinstance(h0, torch.Tensor):
+            h0_t = torch.tensor(h0, dtype=torch.float32, device=self.device)
+        else:
+            h0_t = h0
+        
         features = create_features_batched(
-            S_flat, K, T, self.r_daily * 252.0, self.barrier_level, h0, self.option_type
+            S_flat, K, T, self.r_daily * 252.0, self.barrier_level, h0_t, self.option_type
         )
         features_norm = (features - self.mean) / self.std
         prices = self.model(features_norm).squeeze(-1)
@@ -197,7 +264,7 @@ class BarrierOption(DerivativeBase):
         """
         Compute vega with proper gradient tracking for h0.
         
-        FIX: h0_t must be a batched tensor, not scalar, to match S_flat dimensions.
+        CRITICAL FIX: h0 is passed as scalar tensor and broadcast internally.
         """
         T = self._compute_time_to_maturity(step_idx, N)
         S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
@@ -207,13 +274,17 @@ class BarrierOption(DerivativeBase):
             return torch.zeros_like(S_t)
     
         S_flat = S_t.reshape(-1)
-        batch_size = S_flat.shape[0]
         
-        # Create h0_t as a batched tensor with the same size as S_flat
-        # This ensures all features have consistent dimensions in create_features_batched
-        h0_t = torch.full((batch_size,), h0, dtype=torch.float32, 
-                          device=self.device, requires_grad=True)
+        # Convert h0 to scalar tensor with gradient tracking
+        if not isinstance(h0, torch.Tensor):
+            h0_t = torch.tensor(h0, dtype=torch.float32, device=self.device, requires_grad=True)
+        else:
+            if not h0.requires_grad:
+                h0_t = h0.clone().detach().requires_grad_(True)
+            else:
+                h0_t = h0
         
+        # create_features_batched will handle broadcasting h0_t to match S_flat
         features = create_features_batched(
             S_flat, K, T, self.r_daily * 252.0, self.barrier_level, h0_t, self.option_type
         )
@@ -221,13 +292,18 @@ class BarrierOption(DerivativeBase):
         prices = self.model(features_norm).squeeze(-1)
         
         # Compute gradient with respect to h0
-        vega_raw = torch.autograd.grad(prices.mean(), h0_t, allow_unused=True)[0]
+        mean_price = prices.mean()
+        vega_raw = torch.autograd.grad(mean_price, h0_t, allow_unused=True)[0]
+        
         if vega_raw is None:
             return torch.zeros(orig_shape, device=self.device)
         
         # Convert d(price)/d(h0) to d(price)/d(sigma)
         # Since h0 = sigma^2, we have d/d(sigma) = d/d(h0) * 2*sigma
-        vega = vega_raw.mean() * 2 * torch.sqrt(torch.tensor(h0, device=self.device))
+        sigma = torch.sqrt(h0_t)
+        vega = vega_raw * 2 * sigma
+        
+        # Replicate scalar gradient across all paths
         return torch.full(orig_shape, vega.item(), device=self.device)
     
 
@@ -235,7 +311,7 @@ class BarrierOption(DerivativeBase):
         """
         Compute theta with proper gradient tracking for T.
         
-        FIX: T_t must be a batched tensor, not scalar, to match S_flat dimensions.
+        CRITICAL FIX: T is passed as scalar tensor and broadcast internally.
         """
         T = self._compute_time_to_maturity(step_idx, N)
         S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
@@ -245,24 +321,32 @@ class BarrierOption(DerivativeBase):
             return torch.zeros_like(S_t)
     
         S_flat = S_t.reshape(-1)
-        batch_size = S_flat.shape[0]
         
-        # Create T_t as a batched tensor with the same size as S_flat
-        # This ensures all features have consistent dimensions in create_features_batched
-        T_t = torch.full((batch_size,), T, dtype=torch.float32,
-                         device=self.device, requires_grad=True)
+        # Create T as scalar tensor with gradient tracking
+        T_t = torch.tensor(T, dtype=torch.float32, device=self.device, requires_grad=True)
         
+        # Convert h0 to tensor if needed
+        if not isinstance(h0, torch.Tensor):
+            h0_t = torch.tensor(h0, dtype=torch.float32, device=self.device)
+        else:
+            h0_t = h0
+        
+        # create_features_batched will handle broadcasting T_t to match S_flat
         features = create_features_batched(
-            S_flat, K, T_t, self.r_daily * 252.0, self.barrier_level, h0, self.option_type
+            S_flat, K, T_t, self.r_daily * 252.0, self.barrier_level, h0_t, self.option_type
         )
         features_norm = (features - self.mean) / self.std
         prices = self.model(features_norm).squeeze(-1)
         
         # Compute gradient with respect to T
-        theta_raw = torch.autograd.grad(prices.mean(), T_t, allow_unused=True)[0]
+        mean_price = prices.mean()
+        theta_raw = torch.autograd.grad(mean_price, T_t, allow_unused=True)[0]
+        
         if theta_raw is None:
             return torch.zeros(orig_shape, device=self.device)
         
         # Negative because theta is -dV/dT (value decays with time)
-        theta = -theta_raw.mean()
+        theta = -theta_raw
+        
+        # Replicate scalar gradient across all paths
         return torch.full(orig_shape, theta.item(), device=self.device)
