@@ -9,12 +9,16 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
     """
     Wrapper for up-and-in barrier options with vanilla fallback after breach.
     
-    CRITICAL FIX: This version tracks barrier breach status PER PATH.
-    The original version used a single boolean flag for all paths, causing
-    massive hedging errors when some paths breached and others didn't.
+    CRITICAL FIX: This version tracks barrier breach status PER PATH and properly
+    handles autograd for barrier parameter sensitivities.
     
     Before breach: Uses barrier neural network pricing (accounts for breach probability)
     After breach: Switches to vanilla option analytical pricing
+    
+    KEY FIXES:
+    1. Per-path barrier breach tracking (not single boolean)
+    2. Proper autograd handling for barrier_level parameter
+    3. Correct batched parameter handling without dimension mismatches
     """
     
     def __init__(
@@ -31,13 +35,31 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
         """
         self.barrier_option = barrier_option
         self.vanilla_option = vanilla_option
-        self.barrier_level = barrier_option.barrier_level
+        
+        # Ensure barrier_level is a scalar tensor with requires_grad for autograd
+        if not isinstance(barrier_option.barrier_level, torch.Tensor):
+            self.barrier_level = torch.tensor(
+                barrier_option.barrier_level, 
+                dtype=torch.float32,
+                device=barrier_option.device,
+                requires_grad=True
+            )
+            # Update the barrier_option's barrier_level to point to this tensor
+            self.barrier_option.barrier_level = self.barrier_level
+        else:
+            self.barrier_level = barrier_option.barrier_level
+            
         self.option_type = barrier_option.option_type
         self.K = None
         
         # Path-specific breach tracking (CRITICAL FIX)
         self.barrier_breached_mask = None  # Will be [M] boolean tensor
         self.num_paths = None
+    
+    @property
+    def device(self):
+        """Get device from barrier option."""
+        return self.barrier_option.device if hasattr(self.barrier_option, 'device') else 'cpu'
     
     def reset_barrier_status(self, num_paths: int = None):
         """
@@ -48,9 +70,8 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
         """
         if num_paths is not None:
             self.num_paths = num_paths
-            device = self.barrier_option.device if hasattr(self.barrier_option, 'device') else 'cpu'
             self.barrier_breached_mask = torch.zeros(
-                num_paths, dtype=torch.bool, device=device
+                num_paths, dtype=torch.bool, device=self.device
             )
         else:
             self.barrier_breached_mask = None
@@ -60,7 +81,8 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
         """
         Check if barrier is breached for each path independently.
         
-        CRITICAL: This now returns a per-path boolean mask instead of a single boolean.
+        CRITICAL: Returns per-path boolean mask, not single boolean.
+        Uses detached barrier_level for comparison to avoid breaking autograd graph.
         
         Args:
             S: Current spot price(s) - shape [M] or [M, ...]
@@ -86,8 +108,12 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
         else:
             S_check = S
         
+        # CRITICAL: Use detached barrier_level for comparison
+        # Comparison operations don't need gradients and can break autograd
+        barrier_threshold = self.barrier_level.detach() if isinstance(self.barrier_level, torch.Tensor) else self.barrier_level
+        
         # Update breach status: once breached, stays breached
-        newly_breached = S_check >= self.barrier_level
+        newly_breached = S_check >= barrier_threshold
         self.barrier_breached_mask = self.barrier_breached_mask | newly_breached
         
         return self.barrier_breached_mask
@@ -98,21 +124,24 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
         K: float, 
         step_idx: int, 
         N: int, 
-        h0: float,
+        h0: Optional[float],
         greek_name: str
     ) -> torch.Tensor:
         """
-        Compute Greek with path-specific barrier handling.
+        Compute Greek with path-specific barrier handling and proper autograd support.
         
         This is the core fix: compute both barrier and vanilla Greeks,
         then use torch.where() to select the correct value per path.
+        
+        AUTOGRAD FIX: Pass h0 as scalar to barrier methods, letting PyTorch
+        handle broadcasting internally. This avoids dimension mismatches.
         
         Args:
             S: Spot prices [M] or [M, ...]
             K: Strike price
             step_idx: Current step index
             N: Total steps
-            h0: Variance
+            h0: Variance (scalar or None)
             greek_name: 'price', 'delta', 'gamma', 'vega', or 'theta'
             
         Returns:
@@ -126,59 +155,187 @@ class BarrierOptionWithVanillaFallback(DerivativeBase):
         barrier_method = getattr(self.barrier_option, greek_name)
         vanilla_method = getattr(self.vanilla_option, greek_name)
         
-        # Compute both barrier and vanilla values
-        barrier_values = barrier_method(S, K, step_idx, N, h0)
+        # Compute barrier values
+        # CRITICAL FIX: Pass h0 as scalar, not batched tensor
+        # PyTorch will handle broadcasting internally during feature creation
+        if h0 is not None:
+            # Ensure h0 is a scalar tensor if it needs gradients
+            if not isinstance(h0, torch.Tensor):
+                h0_tensor = torch.tensor(h0, dtype=torch.float32, device=self.device)
+            else:
+                h0_tensor = h0
+            barrier_values = barrier_method(S, K, step_idx, N, h0_tensor)
+        else:
+            barrier_values = barrier_method(S, K, step_idx, N)
+        
+        # Compute vanilla values (doesn't need h0)
         vanilla_values = vanilla_method(S, K, step_idx, N)
         
         # Ensure both have the same shape
         if barrier_values.shape != vanilla_values.shape:
-            raise ValueError(
-                f"Shape mismatch: barrier={barrier_values.shape}, "
-                f"vanilla={vanilla_values.shape}"
-            )
+            # Try to broadcast if dimensions don't match
+            try:
+                barrier_values = barrier_values.expand_as(vanilla_values)
+            except RuntimeError:
+                try:
+                    vanilla_values = vanilla_values.expand_as(barrier_values)
+                except RuntimeError:
+                    raise ValueError(
+                        f"Shape mismatch that cannot be broadcast: "
+                        f"barrier={barrier_values.shape}, vanilla={vanilla_values.shape}"
+                    )
         
         # Broadcast breach mask to match value dimensions if needed
         mask = breach_mask
         while mask.dim() < barrier_values.dim():
             mask = mask.unsqueeze(-1)
         
+        # Expand mask to match full shape
+        mask = mask.expand_as(barrier_values)
+        
         # Select: vanilla where breached, barrier where not breached
         result = torch.where(mask, vanilla_values, barrier_values)
         
         return result
     
-    def price(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float = None, **kwargs) -> torch.Tensor:
+    def price(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: Optional[float] = None, **kwargs) -> torch.Tensor:
         """
         Price up-and-in barrier option with path-specific barrier handling.
         
         Args:
-            S: Spot price(s)
+            S: Spot price(s) [M] or [M, ...]
             K: Strike price
             step_idx: Current step index
             N: Total steps
-            h0: Variance
+            h0: Variance (optional, scalar)
             
         Returns:
-            Option price per path
+            Option price per path [M] or [M, ...]
         """
         return self._compute_mixed_greek(S, K, step_idx, N, h0, 'price')
     
-    def delta(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float = None, **kwargs) -> torch.Tensor:
+    def delta(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: Optional[float] = None, **kwargs) -> torch.Tensor:
         """
         Compute delta with path-specific barrier handling.
         
         CRITICAL: Paths that breached use vanilla delta, paths that haven't use barrier delta.
+        
+        Args:
+            S: Spot price(s) [M] or [M, ...]
+            K: Strike price
+            step_idx: Current step index
+            N: Total steps
+            h0: Variance (optional, scalar)
+            
+        Returns:
+            Delta per path [M] or [M, ...]
         """
         return self._compute_mixed_greek(S, K, step_idx, N, h0, 'delta')
     
-    def gamma(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float = None, **kwargs) -> torch.Tensor:
-        """Compute gamma with path-specific barrier handling."""
+    def gamma(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: Optional[float] = None, **kwargs) -> torch.Tensor:
+        """
+        Compute gamma with path-specific barrier handling.
+        
+        Args:
+            S: Spot price(s) [M] or [M, ...]
+            K: Strike price
+            step_idx: Current step index
+            N: Total steps
+            h0: Variance (optional, scalar)
+            
+        Returns:
+            Gamma per path [M] or [M, ...]
+        """
         return self._compute_mixed_greek(S, K, step_idx, N, h0, 'gamma')
     
-    def vega(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float = None, **kwargs) -> torch.Tensor:
-        """Compute vega with path-specific barrier handling."""
+    def vega(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: Optional[float] = None, **kwargs) -> torch.Tensor:
+        """
+        Compute vega with path-specific barrier handling.
+        
+        Args:
+            S: Spot price(s) [M] or [M, ...]
+            K: Strike price
+            step_idx: Current step index
+            N: Total steps
+            h0: Variance (optional, scalar)
+            
+        Returns:
+            Vega per path [M] or [M, ...]
+        """
         return self._compute_mixed_greek(S, K, step_idx, N, h0, 'vega')
     
-    def theta(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: float = None, **kwargs) -> torch.Tensor:
-        """Compute theta with path-specific barrier handling."""
+    def theta(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: Optional[float] = None, **kwargs) -> torch.Tensor:
+        """
+        Compute theta with path-specific barrier handling.
+        
+        Args:
+            S: Spot price(s) [M] or [M, ...]
+            K: Strike price
+            step_idx: Current step index
+            N: Total steps
+            h0: Variance (optional, scalar)
+            
+        Returns:
+            Theta per path [M] or [M, ...]
+        """
         return self._compute_mixed_greek(S, K, step_idx, N, h0, 'theta')
+    
+    def compute_barrier_delta(self, S: torch.Tensor, K: float, step_idx: int, N: int, h0: Optional[float] = None) -> torch.Tensor:
+        """
+        Compute sensitivity of option price to barrier level (barrier delta).
+        
+        This requires autograd through the barrier_level parameter.
+        Only applicable to paths that haven't breached (breached paths have zero sensitivity).
+        
+        Args:
+            S: Spot price(s) [M]
+            K: Strike price
+            step_idx: Current step index
+            N: Total steps
+            h0: Variance (optional, scalar)
+            
+        Returns:
+            Barrier delta per path [M]
+        """
+        # Get breach status
+        breach_mask = self.check_and_update_barrier(S)
+        
+        # For breached paths, barrier delta is zero
+        # For non-breached paths, compute via autograd
+        
+        if not torch.any(~breach_mask):
+            # All paths breached - return zeros
+            return torch.zeros_like(S)
+        
+        # Ensure barrier_level requires grad
+        if not self.barrier_level.requires_grad:
+            raise ValueError("barrier_level must have requires_grad=True for barrier_delta computation")
+        
+        # Compute price with autograd enabled
+        # CRITICAL: Pass h0 as scalar for proper broadcasting
+        if h0 is not None:
+            if not isinstance(h0, torch.Tensor):
+                h0_tensor = torch.tensor(h0, dtype=torch.float32, device=self.device, requires_grad=True)
+            else:
+                h0_tensor = h0
+            prices = self.barrier_option.price(S, K, step_idx, N, h0_tensor)
+        else:
+            prices = self.barrier_option.price(S, K, step_idx, N)
+        
+        # Compute gradient of mean price w.r.t. barrier_level
+        mean_price = prices.mean()
+        
+        grad = torch.autograd.grad(
+            outputs=mean_price,
+            inputs=self.barrier_level,
+            create_graph=False,
+            retain_graph=True
+        )[0]
+        
+        # The gradient is a scalar - replicate for all non-breached paths
+        barrier_deltas = torch.full_like(S, grad.item())
+        
+        # Zero out breached paths
+        barrier_deltas = torch.where(breach_mask, torch.zeros_like(S), barrier_deltas)
+        
+        return barrier_deltas
