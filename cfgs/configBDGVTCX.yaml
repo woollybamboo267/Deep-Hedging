@@ -1,5 +1,6 @@
 # ==============================================================================
 # config_barrier_3inst.yaml - Barrier Option Delta-Gamma Hedging (Stock + 2 Options)
+# FIX: Changed to use options with better Greek separation
 # ==============================================================================
 training:
   learning_rate: 0.0001
@@ -27,9 +28,22 @@ garch:
 
 instruments:
   n_hedging_instruments: 3
-  strikes: [95, 105]          # Length = n_hedging_instruments - 1 = 2
-  types: ["call", "put"]      # Length = 2
-  maturities: [252, 504]      # Length = 2 (in days)
+  
+  # FIX 1: Use wider strike separation for better Greek differentiation
+  # Old: [95, 105] - only 5% apart, very similar Greeks near ATM
+  # New: [90, 110] - 10% apart each side, better separation
+  strikes: [90, 110]          # Length = n_hedging_instruments - 1 = 2
+  
+  # FIX 2: Use same option type to avoid sign confusion
+  # Mixed call/put can create confusing Greek profiles
+  # If hedging a call barrier, use call options for hedging too
+  types: ["call", "call"]     # Length = 2 (both calls for consistency)
+  
+  # FIX 3: Use different maturities for better Greek orthogonality
+  # Old: [378, 378] - same maturity means similar vega profiles
+  # New: [252, 378] - one matches hedged option, one is longer
+  # This creates: short-dated (gamma-heavy) vs long-dated (vega-heavy)
+  maturities: [252, 378]      # Length = 2 (in days)
 
 hedged_option:
   type: "barrier"
