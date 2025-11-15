@@ -89,7 +89,3 @@ Pre-trained weights are available in `models/`:
   - **NoTC/** — Models without transaction costs
   - **TC/** — Models with transaction costs
 - **miscellaneous/** — Alternative models
-
-## License
-
-This project is licensed under the terms specified in the LICENSE file.
