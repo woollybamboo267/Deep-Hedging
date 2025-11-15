@@ -74,18 +74,11 @@ Examples:
 - `configDGVTC.yaml` — European option, Delta-Gamma-Vega hedging, Transaction costs
 - `configBDGTC.yaml` — Barrier option, Delta-Gamma hedging, Transaction costs
 
-## Results
+## Example Visualization
 
-Visual comparisons of hedging performance across different Greek strategies:
 
 ### Delta Hedging
 ![Delta Hedging Results](visual-results/european/TC/D.png)
-
-### Delta-Gamma Hedging
-![Delta-Gamma Hedging Results](visual-results/european/TC/DG.png)
-
-### Delta-Gamma-Vega Hedging
-![Delta-Gamma-Vega Hedging Results](visual-results/european/TC/DGV.png)
 
 ## Models
 
