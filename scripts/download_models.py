@@ -22,7 +22,7 @@ from tqdm import tqdm
 # Model configurations
 MODELS = {
     "american": {
-        "url": "https://github.com/woollybamboo267/Deep-Hedging/releases/download/surrogate1/discriminative_v5_american_put.pth",
+        "url": "https://github.com/woollybamboo267/Deep-Hedging/releases/download/%23surrogate1/discriminative_v5_american_put.pth",
         "filename": "discriminative_v5_american_put.pth",
         "output_dir": "models/american",
         "size_mb": 26.9,
