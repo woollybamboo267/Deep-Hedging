@@ -19,19 +19,18 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # Model configurations
 MODELS = {
     "american": {
-        "path": "models/american/discriminative_v5_american_put.pth",
+        "path": "surrogates/american/discriminative_v5_american_put.pth",  # Changed
         "expected_size_mb": 26.9,
         "option_class": "AmericanOption",
         "config": "cfgs/config_american_2inst.yaml"
     },
     "barrier": {
-        "path": "models/barrier/best_finetuned_up-and-in_call.1.pth",
+        "path": "surrogates/barrier/best_finetuned_up-and-in_call.1.pth",  # Changed
         "expected_size_mb": 107.0,
         "option_class": "BarrierOption",
         "config": "cfgs/config_barrier_2inst.yaml"
     }
 }
-
 
 def check_file_exists(model_name):
     """Check if model file exists."""
