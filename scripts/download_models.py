@@ -1,13 +1,14 @@
 """
 Download pre-trained surrogate models from GitHub releases.
 
-This script downloads American and Barrier option neural network models (~26-107MB each)
+This script downloads American, Barrier, and Asian option neural network models (~22-107MB each)
 stored in GitHub releases to the correct locations.
 
 Usage:
     python scripts/download_models.py                    # Download all models
     python scripts/download_models.py --model american   # Download only American
     python scripts/download_models.py --model barrier    # Download only Barrier
+    python scripts/download_models.py --model asian      # Download only Asian
     python scripts/download_models.py --force            # Force re-download
 """
 
@@ -22,18 +23,25 @@ from tqdm import tqdm
 # Model configurations
 MODELS = {
     "american": {
-        "url": "https://github.com/woollybamboo267/Deep-Hedging/releases/download/%23surrogate1/discriminative_v5_american_put.pth",
+        "url": "https://github.com/woollybamboo267/Deep-Hedging/releases/download/%23surrogate3/discriminative_v5_american_put.pth",
         "filename": "discriminative_v5_american_put.pth",
-        "output_dir": "surrogates/american",  # Changed from models/american
+        "output_dir": "surrogates/american",
         "size_mb": 26.9,
         "description": "American option surrogate model"
     },
     "barrier": {
-        "url": "https://github.com/woollybamboo267/Deep-Hedging/releases/download/%23surrogate/best_finetuned_up-and-in_call.1.pth",
+        "url": "https://github.com/woollybamboo267/Deep-Hedging/releases/download/%23surrogate3/best_finetuned_up-and-in_call.1.pth",
         "filename": "best_finetuned_up-and-in_call.1.pth",
-        "output_dir": "surrogates/barrier",  # Changed from models/barrier
+        "output_dir": "surrogates/barrier",
         "size_mb": 107.0,
         "description": "Barrier option surrogate model"
+    },
+    "asian": {
+        "url": "https://github.com/woollybamboo267/Deep-Hedging/releases/download/%23surrogate2/asian_t4_optimized.pth",
+        "filename": "asian_t4_optimized.pth",
+        "output_dir": "surrogates/asian",
+        "size_mb": 21.9,
+        "description": "Asian option surrogate model"
     }
 }
 
@@ -57,7 +65,7 @@ def download_model(model_name, force=False):
     Download a specific surrogate model from GitHub releases.
     
     Args:
-        model_name: Name of the model ('american' or 'barrier')
+        model_name: Name of the model ('american', 'barrier', or 'asian')
         force: If True, re-download even if file exists
         
     Returns:
@@ -139,6 +147,7 @@ Examples:
   python scripts/download_models.py                    # Download all models
   python scripts/download_models.py --model american   # Download only American
   python scripts/download_models.py --model barrier    # Download only Barrier
+  python scripts/download_models.py --model asian      # Download only Asian
   python scripts/download_models.py --force            # Force re-download all
         """
     )
@@ -212,6 +221,8 @@ Examples:
             print(f"       python train.py --config cfgs/config_american_2inst.yaml")
         if "barrier" in [m[0] for m in downloaded_models]:
             print(f"       python train.py --config cfgs/config_barrier_2inst.yaml")
+        if "asian" in [m[0] for m in downloaded_models]:
+            print(f"       python train.py --config cfgs/config_asian_2inst.yaml")
         print("=" * 70)
     
     if failed_models:
