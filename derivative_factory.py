@@ -1,6 +1,6 @@
 """
 Factory for creating derivative objects from config.
-Supports vanilla and barrier options with vanilla fallback.
+Supports vanilla, barrier, and American options.
 """
 
 from typing import Dict, Any, List
@@ -8,6 +8,7 @@ import torch
 import logging
 from src.option_greek.vanilla import VanillaOption
 from src.option_greek.barrier import BarrierOption
+from src.option_greek.american import AmericanOption
 from src.option_greek.precompute import PrecomputationManager
 from src.option_greek.barrier_wrapper import BarrierOptionWithVanillaFallback
 
@@ -28,9 +29,10 @@ class DerivativeFactory:
         Args:
             config: Full config dict
             precomputed_data: Dict mapping maturity (in days) to precomputed coefficients
+                             Only required for vanilla and barrier options
         
         Returns:
-            VanillaOption or BarrierOptionWithVanillaFallback instance
+            VanillaOption, BarrierOptionWithVanillaFallback, or AmericanOption instance
         """
         hedged_cfg = config['hedged_option']
         deriv_type = hedged_cfg['type'].lower()
@@ -122,7 +124,7 @@ class DerivativeFactory:
             vanilla_fallback.N = maturity_days
             vanilla_fallback.K = hedged_cfg['K']
             
-            # Wrap barrier + vanilla fallback (no barrier_type arg)
+            # Wrap barrier + vanilla fallback
             wrapped_barrier = BarrierOptionWithVanillaFallback(
                 barrier_option=barrier_option,
                 vanilla_option=vanilla_fallback
@@ -131,6 +133,28 @@ class DerivativeFactory:
             logger.info("Wrapped barrier option with vanilla fallback for breach handling")
             
             return wrapped_barrier
+        
+        # === AMERICAN OPTION ===
+        elif deriv_type == 'american':
+            logger.info(
+                f"Creating American hedged option ({hedged_cfg['option_type']}) "
+                f"with strike K={hedged_cfg['K']}"
+            )
+            
+            # Create American option (model-driven, no precomputation needed)
+            american_option = AmericanOption(
+                model_path=hedged_cfg['model_path'],
+                option_type=hedged_cfg['option_type'],
+                r_annual=config['simulation']['r'],
+                device=config['training']['device']
+            )
+            
+            american_option.N = int(hedged_cfg['T'] * 252)
+            american_option.K = hedged_cfg['K']
+            
+            logger.info(f"Created American option with maturity {american_option.N} days")
+            
+            return american_option
         
         else:
             raise ValueError(f"Unknown derivative type: {deriv_type}")
@@ -142,7 +166,12 @@ class DerivativeFactory:
         precomputed_data: Dict[int, Dict[str, Any]]
     ) -> List:
         """
-        Create hedging instruments (always vanilla).
+        Create hedging instruments (always vanilla options).
+        
+        Args:
+            config: Full config dict
+            precomputed_data: Dict mapping maturity (in days) to precomputed coefficients
+                             Only required if using vanilla options as hedging instruments
         
         Returns:
             List of derivative objects [None (stock), VanillaOption1, VanillaOption2, ...]
@@ -153,7 +182,7 @@ class DerivativeFactory:
         hedging_derivs = [None]
         
         if n_instruments == 1:
-            logger.info("Hedging with stock only (no vanilla options)")
+            logger.info("Hedging with stock only (no options)")
             return hedging_derivs
         
         strikes = instruments_cfg['strikes']
@@ -218,6 +247,11 @@ def setup_derivatives_from_precomputed(
 ) -> tuple:
     """
     Setup all derivatives from config and existing precomputed data.
+    
+    Args:
+        config: Full config dict
+        precomputed_data: Dict mapping maturity (in days) to precomputed coefficients
+                         Only required for vanilla options (hedged or hedging)
     
     Returns:
         (hedged_derivative, hedging_derivatives_list)
