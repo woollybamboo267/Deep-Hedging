@@ -5,6 +5,7 @@ Usage:
     python scripts/check_models.py                  # Check all models
     python scripts/check_models.py --model american # Check only American
     python scripts/check_models.py --model barrier  # Check only Barrier
+    python scripts/check_models.py --model asian    # Check only Asian
 """
 
 import os
@@ -19,16 +20,22 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # Model configurations
 MODELS = {
     "american": {
-        "path": "surrogates/american/discriminative_v5_american_put.pth",  # Changed
+        "path": "surrogates/american/discriminative_v5_american_put.pth",
         "expected_size_mb": 26.9,
         "option_class": "AmericanOption",
         "config": "cfgs/config_american_2inst.yaml"
     },
     "barrier": {
-        "path": "surrogates/barrier/best_finetuned_up-and-in_call.1.pth",  # Changed
+        "path": "surrogates/barrier/best_finetuned_up-and-in_call.1.pth",
         "expected_size_mb": 107.0,
         "option_class": "BarrierOption",
         "config": "cfgs/config_barrier_2inst.yaml"
+    },
+    "asian": {
+        "path": "surrogates/asian/asian_t4_optimized.pth",
+        "expected_size_mb": 21.9,
+        "option_class": "AsianOption",
+        "config": "cfgs/config_asian_2inst.yaml"
     }
 }
 
@@ -176,6 +183,52 @@ def check_american_inference():
         return False
 
 
+def check_asian_inference():
+    """Check if asian model can perform inference."""
+    import torch
+    from src.option_greek.asian import AsianOption
+    
+    try:
+        asian = AsianOption(
+            model_path=MODELS["asian"]["path"],
+            option_type="call",
+            r_annual=0.04,
+            device="cpu"
+        )
+        print(f"[✓] AsianOption instance created")
+        
+        # Test pricing
+        S = torch.tensor([100.0], dtype=torch.float32)
+        A = torch.tensor([100.0], dtype=torch.float32)  # Running average
+        price = asian.price(S=S, A=A, K=100.0, step_idx=0, N=252, h0=5.14e-7)
+        
+        if torch.isfinite(price).all() and (price >= 0).all():
+            print(f"[✓] Asian pricing works: price={price.item():.4f}")
+        else:
+            print(f"[!] Warning: Price is invalid: {price.item()}")
+            return False
+        
+        # Test Greeks
+        delta = asian.delta(S=S, A=A, K=100.0, step_idx=0, N=252, h0=5.14e-7)
+        gamma = asian.gamma(S=S, A=A, K=100.0, step_idx=0, N=252, h0=5.14e-7)
+        vega = asian.vega(S=S, A=A, K=100.0, step_idx=0, N=252, h0=5.14e-7)
+        theta = asian.theta(S=S, A=A, K=100.0, step_idx=0, N=252, h0=5.14e-7)
+        
+        if all(torch.isfinite(g).all() for g in [delta, gamma, vega, theta]):
+            print(f"[✓] Asian Greeks computation works")
+            print(f"    Delta: {delta.item():.4f}, Gamma: {gamma.item():.6f}")
+            print(f"    Vega:  {vega.item():.4f}, Theta: {theta.item():.4f}")
+        else:
+            print(f"[!] Warning: Some Greeks are invalid")
+            return False
+        
+        return True
+    
+    except Exception as e:
+        print(f"[✗] Asian inference test failed: {e}")
+        return False
+
+
 def check_model(model_name):
     """Run all checks for a specific model."""
     print(f"\nChecking {model_name.upper()} model")
@@ -206,6 +259,8 @@ def check_model(model_name):
             inference_ok = check_barrier_inference()
         elif model_name == "american":
             inference_ok = check_american_inference()
+        elif model_name == "asian":
+            inference_ok = check_asian_inference()
         else:
             print(f"[!] No inference test available for {model_name}")
             inference_ok = True
@@ -228,6 +283,7 @@ Examples:
   python scripts/check_models.py                  # Check all models
   python scripts/check_models.py --model american # Check only American
   python scripts/check_models.py --model barrier  # Check only Barrier
+  python scripts/check_models.py --model asian    # Check only Asian
         """
     )
     parser.add_argument(
@@ -288,4 +344,4 @@ Examples:
 
 
 if __name__ == "__main__":
-    main()
+    main(
