@@ -1,73 +1,66 @@
-training:
-  learning_rate: 0.0001
-  batch_size: 1000
-  num_epochs: 400
-  weight_decay: 0.00001
-  optimizer: "AdamW"
-  episodes: 300
-  seed: 78020349
-  gamma: 0.9999
-  entropy_coefficient: 0.5
-  device: "cpu"
-  checkpoint_frequency: 25
-  plot_frequency: 100
-  gradient_clip_max_norm: 1.0
-
+environment:
+  dt_min: 1.0e-10
 garch:
-  omega: 1.593749e-07
   alpha: 2.308475e-06
   beta: 0.689984
   gamma: 342.870019
-  lambda: 0.420499
-  sigma0: 0.127037
   h0: 5.14e-07
-
-instruments:
-  n_hedging_instruments: 2
-  strikes: [100]              # ATM put for gamma hedging
-  types: ["put"]              # Must be put to match American put
-  maturities: [378]           # 1.5 years (longer than hedged option)
-
+  lambda: 0.420499
+  omega: 1.593749e-07
+  sigma0: 0.127037
 hedged_option:
-  type: "american"
   K: 100
-  T: 1.0                      # 252 trading days
-  option_type: "put"          # American puts only (early exercise premium)
-  side: "short"
-  model_path: "models/american/discriminative_v5_american_put.pth"
-
-transaction_costs:
-  TC: false                    # Use default transaction costs
-
-simulation:
-  S0: 100
-  r: 0.04                     # 4% risk-free rate (important for early exercise)
   T: 1.0
-  contract_size: 1
-  M: 1000
-  N: 252
-
-environment:
-  dt_min: 1.0e-10
-
+  model_path: surrogates/american/discriminative_v5_american_put.pth
+  option_type: put
+  side: short
+  type: american
+instruments:
+  maturities:
+  - 378
+  n_hedging_instruments: 2
+  strikes:
+  - 100
+  types:
+  - put
+logging:
+  level: INFO
+  log_file: null
+model:
+  hidden_size: 128
+  lstm_layers: 1
+  num_layers: 1
+  obs_dim: 5
+output:
+  checkpoint_path: policy_net_am_dg_TC.pth
+  model_save_path: policy_net_am_dg_TC.pth
+  plot_dpi: 150
+  plot_save_path: hedge_comparison_am_dg_TC_ep{episode}.png
+  sample_path_index: 1
 precomputation:
   N_quad: 256
+  device: cpu
   u_max: 500.0
-  device: "cpu"
-
-model:
-  obs_dim: 5
-  hidden_size: 128
-  num_layers: 1
-  lstm_layers: 1
-
-logging:
-  level: "INFO"
-  log_file: null
-
-output:
-  model_save_path: "policy_net_am_dg_TC.pth"
-  checkpoint_path: "policy_net_am_dg_TC.pth"
-  plot_save_path: "hedge_comparison_am_dg_TC_ep{episode}.png"
-  plot_dpi: 150
-  sample_path_index: 1
+simulation:
+  M: 1000
+  N: 252
+  S0: 100
+  T: 1.0
+  contract_size: 1
+  r: 0.04
+training:
+  batch_size: 1000
+  checkpoint_frequency: 25
+  device: cpu
+  entropy_coefficient: 0.5
+  episodes: 300
+  gamma: 0.9999
+  gradient_clip_max_norm: 1.0
+  learning_rate: 0.0001
+  num_epochs: 400
+  optimizer: AdamW
+  plot_frequency: 100
+  seed: 78020349
+  weight_decay: 1.0e-05
+transaction_costs:
+  TC: false
