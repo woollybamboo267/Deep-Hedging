@@ -5,9 +5,12 @@ This script loads configuration from YAML, initializes all components,
 and runs the training loop. It replaces the train_garch function with
 a more modular, configuration-driven approach.
 
+Supports vanilla European, barrier, and American options.
+
 Usage:
     python train.py --config cfgs/config_vanilla_2inst.yaml
     python train.py --config cfgs/config_barrier_2inst.yaml
+    python train.py --config cfgs/config_american_1inst.yaml
     python train.py --config cfgs/config.yaml --load-model models/uniform/GARCHLSTMDG.pth --inference-only
 """
 
@@ -54,6 +57,45 @@ def load_config(config_path: str) -> Dict[str, Any]:
     return config
 
 
+def get_transaction_costs(config: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Get transaction costs from config.
+    
+    Supports two formats:
+    1. Simple flag: transaction_costs: {TC: true/false}
+    2. Detailed: transaction_costs: {stock: 0.0001, vanilla_option: 0.001, ...}
+    """
+    tc_config = config.get("transaction_costs", {})
+    
+    # Check if using simple TC flag format
+    if "TC" in tc_config:
+        if tc_config["TC"]:
+            # Use default transaction costs
+            return {
+                'stock': 0.0001,
+                'vanilla_option': 0.001,
+                'barrier_option': 0.002,
+                'american_option': 0.0015
+            }
+        else:
+            # All zero transaction costs
+            return {
+                'stock': 0.0,
+                'vanilla_option': 0.0,
+                'barrier_option': 0.0,
+                'american_option': 0.0
+            }
+    else:
+        # Use detailed transaction costs with defaults for missing values
+        defaults = {
+            'stock': 0.0001,
+            'vanilla_option': 0.001,
+            'barrier_option': 0.002,
+            'american_option': 0.0015
+        }
+        return {key: tc_config.get(key, defaults[key]) for key in defaults}
+
+
 def validate_config(config: Dict[str, Any]) -> None:
     """Validate configuration parameters."""
     n_inst = config["instruments"]["n_hedging_instruments"]
@@ -89,7 +131,8 @@ def validate_config(config: Dict[str, Any]) -> None:
     hedged_cfg = config["hedged_option"]
     deriv_type = hedged_cfg["type"].lower()
     
-    if deriv_type not in ["vanilla", "barrier"]:
+    # Extended validation for American options
+    if deriv_type not in ["vanilla", "barrier", "american"]:
         raise ValueError(f"Invalid hedged_option type: {deriv_type}")
     
     if hedged_cfg["option_type"] not in valid_types:
@@ -101,6 +144,10 @@ def validate_config(config: Dict[str, Any]) -> None:
         raise ValueError(
             f"Invalid hedged_option side: {hedged_cfg['side']}"
         )
+    
+    # Validate that American options have model_path if needed
+    if deriv_type == "american" and "model_path" not in hedged_cfg:
+        logging.warning("American option specified but no model_path provided in config")
     
     logging.info("Configuration validation passed")
 
@@ -168,11 +215,8 @@ def train_episode(
     
     hedged_cfg = config["hedged_option"]
     
-    transaction_costs = config.get("transaction_costs", {
-        'stock': 0.0001,
-        'vanilla_option': 0.001,
-        'barrier_option': 0.002
-    })
+    # Get transaction costs from config
+    transaction_costs = get_transaction_costs(config)
     
     sim = HedgingSim(
         S0=config["simulation"]["S0"],
@@ -248,8 +292,7 @@ def save_checkpoint(
     episode: int
 ) -> None:
     """Save model checkpoint."""
-    n_inst = config["instruments"]["n_hedging_instruments"]
-    checkpoint_path = config["output"]["checkpoint_path"].format(n_inst=n_inst)
+    checkpoint_path = config["output"]["checkpoint_path"]
     
     torch.save(policy_net.state_dict(), checkpoint_path)
     logging.info(f"Checkpoint saved at episode {episode}: {checkpoint_path}")
@@ -270,11 +313,8 @@ def run_inference(
     
     hedged_cfg = config["hedged_option"]
     
-    transaction_costs = config.get("transaction_costs", {
-        'stock': 0.0001,
-        'vanilla_option': 0.001,
-        'barrier_option': 0.002
-    })
+    # Get transaction costs from config
+    transaction_costs = get_transaction_costs(config)
     
     sim = HedgingSim(
         S0=config["simulation"]["S0"],
@@ -401,8 +441,7 @@ def train(
             logging.exception(f"Error during episode {episode}: {e}")
             raise
     
-    n_inst = config["instruments"]["n_hedging_instruments"]
-    final_path = config["output"]["model_save_path"].format(n_inst=n_inst)
+    final_path = config["output"]["model_save_path"]
     torch.save(policy_net.state_dict(), final_path)
     logging.info(f"Training finished. Model saved to {final_path}")
     
@@ -412,7 +451,7 @@ def train(
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Train GARCH-based option hedging with RL"
+        description="Train GARCH-based option hedging with RL (supports vanilla, barrier, and American options)"
     )
     parser.add_argument(
         "--config",
@@ -459,29 +498,41 @@ def main():
     logging.info("Starting precomputation...")
     logging.info(f"Hedged derivative type: {hedged_type}")
     
+    # Precomputation is needed for:
+    # 1. Vanilla options used as hedging instruments (specified in config["instruments"]["maturities"])
+    # 2. Vanilla option being hedged (if hedged_type == "vanilla")
+    # 3. Barrier option being hedged (needs vanilla fallback at same maturity)
+    
     precomputation_manager = create_precomputation_manager_from_config(config)
     
-    if hedged_type == "barrier":
+    # Check if hedged derivative needs precomputation
+    needs_hedged_precompute = hedged_type in ["vanilla", "barrier"]
+    
+    if needs_hedged_precompute:
         hedged_maturity_days = int(config["hedged_option"]["T"] * 252)
-        logging.info(f"Barrier option detected - adding maturity {hedged_maturity_days} days for vanilla fallback precomputation")
         
+        # Check if this maturity is already in the list (from hedging instruments)
         if hedged_maturity_days not in config["instruments"]["maturities"]:
             if not hasattr(precomputation_manager, 'maturities'):
                 precomputation_manager.maturities = []
             if hedged_maturity_days not in precomputation_manager.maturities:
                 precomputation_manager.maturities.append(hedged_maturity_days)
-                logging.info(f"Added barrier maturity {hedged_maturity_days} to precomputation list")
+                logging.info(
+                    f"{hedged_type.capitalize()} hedged derivative at maturity {hedged_maturity_days} days "
+                    f"requires precomputation - added to list"
+                )
     
     precomputed_data = precomputation_manager.precompute_all()
     logging.info(f"Precomputation complete for maturities: {list(precomputed_data.keys())}")
     
-    if hedged_type == "barrier":
+    # Verify all needed maturities are precomputed
+    if needs_hedged_precompute:
         hedged_maturity_days = int(config["hedged_option"]["T"] * 252)
         if hedged_maturity_days not in precomputed_data:
-            logging.warning(f"Barrier maturity {hedged_maturity_days} not in precomputed data, computing now...")
+            logging.warning(f"Maturity {hedged_maturity_days} not in precomputed data, computing now...")
             precomputation_manager.precompute_for_maturity(hedged_maturity_days)
             precomputed_data[hedged_maturity_days] = precomputation_manager.get_precomputed_data(hedged_maturity_days)
-            logging.info(f"Vanilla fallback coefficients ready for N={hedged_maturity_days}")
+            logging.info(f"Precomputation complete for N={hedged_maturity_days}")
     
     hedged_derivative, hedging_derivatives = setup_derivatives_from_precomputed(
         config, precomputed_data
