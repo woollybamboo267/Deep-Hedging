@@ -2,8 +2,8 @@
 One-command setup script for Deep Hedging.
 
 Usage:
-    python setup.py                    # Full setup with barrier models
-    python setup.py --vanilla-only     # Skip barrier model download
+    python setup.py                    # Full setup with all models
+    python setup.py --vanilla-only     # Skip barrier/American model download
     python setup.py --check-only       # Only verify installation
 """
 
@@ -115,7 +115,7 @@ def setup_barrier_models():
     
     try:
         result = subprocess.run(
-            [sys.executable, 'scripts/download_models.py'],
+            [sys.executable, 'scripts/download_models.py', '--barrier'],
             capture_output=True,
             text=True
         )
@@ -127,21 +127,49 @@ def setup_barrier_models():
             print(result.stderr)
             print(f"\n[!] Barrier model download failed")
             print(f"[INFO] You can download manually later:")
-            print(f"       python scripts/download_models.py")
+            print(f"       python scripts/download_models.py --barrier")
             return False
     
     except Exception as e:
         print(f"[!] Could not download barrier models: {e}")
         print(f"[INFO] You can download manually later:")
-        print(f"       python scripts/download_models.py")
+        print(f"       python scripts/download_models.py --barrier")
         return False
 
 
-def verify_barrier_setup():
-    """Verify barrier option setup."""
+def setup_american_models():
+    """Download American option models."""
+    print_header("Setting up American option models")
+    
     try:
         result = subprocess.run(
-            [sys.executable, 'scripts/check_barrier_model.py'],
+            [sys.executable, 'scripts/download_models.py', '--american'],
+            capture_output=True,
+            text=True
+        )
+        
+        if result.returncode == 0:
+            print(result.stdout)
+            return True
+        else:
+            print(result.stderr)
+            print(f"\n[!] American model download failed")
+            print(f"[INFO] You can download manually later:")
+            print(f"       python scripts/download_models.py --american")
+            return False
+    
+    except Exception as e:
+        print(f"[!] Could not download American models: {e}")
+        print(f"[INFO] You can download manually later:")
+        print(f"       python scripts/download_models.py --american")
+        return False
+
+
+def verify_model_setup(model_type):
+    """Verify model setup."""
+    try:
+        result = subprocess.run(
+            [sys.executable, 'scripts/check_models.py', f'--{model_type}'],
             capture_output=True,
             text=True
         )
@@ -150,7 +178,7 @@ def verify_barrier_setup():
         return result.returncode == 0
     
     except Exception as e:
-        print(f"[!] Could not verify barrier setup: {e}")
+        print(f"[!] Could not verify {model_type} setup: {e}")
         return False
 
 
@@ -158,6 +186,7 @@ def create_models_directory():
     """Create models directory structure."""
     dirs = [
         'models/barrier',
+        'models/american',
         'models/uniform',
         'models/non-uniform',
     ]
@@ -167,11 +196,15 @@ def create_models_directory():
         print(f"[✓] Created {dir_path}")
 
 
-def print_usage_instructions(barrier_enabled):
+def print_usage_instructions(barrier_enabled, american_enabled):
     """Print usage instructions."""
     print_header("Setup Complete!")
     
     print("Quick Start:")
+    print()
+    
+    print("# Vanilla option hedging")
+    print("python train.py --config cfgs/config_vanilla_2inst.yaml")
     print()
     
     if barrier_enabled:
@@ -179,23 +212,29 @@ def print_usage_instructions(barrier_enabled):
         print("python train.py --config cfgs/config_barrier_2inst.yaml")
         print()
     
-    print("# Vanilla option hedging")
-    print("python train.py --config cfgs/config_vanilla_2inst.yaml")
-    print()
+    if american_enabled:
+        print("# American option hedging")
+        print("python train.py --config cfgs/config_american_1inst.yaml")
+        print()
+    
     print("# Custom configuration")
-    print("python train.py --config cfgs/my_config.yaml")
+    print("python train.py --config cfgs/your_config.yaml")
     print()
     print("# Inference only")
-    print("python train.py --config PATH --load-model PATH --inference-only")
+    print("python train.py --config CONFIG_PATH --load-model MODEL_PATH --inference-only")
     print()
     
     print("Documentation:")
     print("  - README.md           - Project overview")
-    print("  - BARRIER_SETUP.md    - Barrier option details")
+    if barrier_enabled:
+        print("  - BARRIER_SETUP.md    - Barrier option details")
+    if american_enabled:
+        print("  - AMERICAN_SETUP.md   - American option details")
     print()
     
     print("Troubleshooting:")
-    print("  - Check barrier setup: python scripts/check_barrier_model.py")
+    if barrier_enabled or american_enabled:
+        print("  - Check model setup:   python scripts/check_models.py")
     print("  - Re-run setup:        python setup.py")
     print()
 
@@ -205,7 +244,7 @@ def main():
     parser.add_argument(
         "--vanilla-only",
         action="store_true",
-        help="Skip barrier model download (vanilla options only)"
+        help="Skip barrier and American model download (vanilla options only)"
     )
     parser.add_argument(
         "--check-only",
@@ -216,6 +255,16 @@ def main():
         "--no-install",
         action="store_true",
         help="Don't install missing dependencies"
+    )
+    parser.add_argument(
+        "--barrier-only",
+        action="store_true",
+        help="Setup barrier models only (skip American)"
+    )
+    parser.add_argument(
+        "--american-only",
+        action="store_true",
+        help="Setup American models only (skip barrier)"
     )
     
     args = parser.parse_args()
@@ -251,16 +300,27 @@ def main():
     if not args.check_only:
         create_models_directory()
     
-    # Setup barrier models
+    # Setup models
     barrier_enabled = False
+    american_enabled = False
+    
     if not args.vanilla_only and not args.check_only:
-        if setup_barrier_models():
-            barrier_enabled = True
-            print_header("Verifying barrier setup")
-            verify_barrier_setup()
+        # Setup barrier models
+        if not args.american_only:
+            if setup_barrier_models():
+                barrier_enabled = True
+                print_header("Verifying barrier setup")
+                verify_model_setup('barrier')
+        
+        # Setup American models
+        if not args.barrier_only:
+            if setup_american_models():
+                american_enabled = True
+                print_header("Verifying American setup")
+                verify_model_setup('american')
     
     # Print usage
-    print_usage_instructions(barrier_enabled)
+    print_usage_instructions(barrier_enabled, american_enabled)
     
     print("=" * 70)
 
