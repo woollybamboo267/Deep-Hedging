@@ -34,7 +34,7 @@ hedged_option:
   T: 1.0                      # 252 trading days
   option_type: "put"          # American puts only (early exercise premium)
   side: "short"
-  model_path: "models/discriminative_v5_american_put.pth"
+  model_path: "models/american/discriminative_v5_american_put.pth"
 
 transaction_costs:
   TC: true                    # Use default transaction costs
