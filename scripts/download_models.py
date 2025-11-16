@@ -24,14 +24,14 @@ MODELS = {
     "american": {
         "url": "https://github.com/woollybamboo267/Deep-Hedging/releases/download/%23surrogate1/discriminative_v5_american_put.pth",
         "filename": "discriminative_v5_american_put.pth",
-        "output_dir": "models/american",
+        "output_dir": "surrogates/american",  # Changed from models/american
         "size_mb": 26.9,
         "description": "American option surrogate model"
     },
     "barrier": {
         "url": "https://github.com/woollybamboo267/Deep-Hedging/releases/download/%23surrogate/best_finetuned_up-and-in_call.1.pth",
         "filename": "best_finetuned_up-and-in_call.1.pth",
-        "output_dir": "models/barrier",
+        "output_dir": "surrogates/barrier",  # Changed from models/barrier
         "size_mb": 107.0,
         "description": "Barrier option surrogate model"
     }
