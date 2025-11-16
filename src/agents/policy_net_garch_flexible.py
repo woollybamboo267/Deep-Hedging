@@ -53,13 +53,13 @@ class HedgingEnvGARCH:
         
         Args:
             sim: Simulation parameters object
-            derivative: The derivative to hedge (VanillaOption or BarrierOption)
+            derivative: The derivative to hedge (VanillaOption, BarrierOption, AmericanOption, or AsianOption)
             hedging_derivatives: List of derivative objects to use for hedging
             garch_params: GARCH model parameters
             n_hedging_instruments: Number of hedging instruments (stock + options)
             dt_min: Minimum time step
             device: 'cpu' or 'cuda'
-            transaction_costs: Dict with keys 'stock', 'vanilla_option', 'barrier_option'
+            transaction_costs: Dict with keys 'stock', 'vanilla_option', 'barrier_option', 'american_option', 'asian_option'
         """
         self.sim = sim
         self.M = sim.M
@@ -97,7 +97,9 @@ class HedgingEnvGARCH:
         self.transaction_costs = transaction_costs or {
             'stock': getattr(self.sim, "TCP", 0.0001),
             'vanilla_option': getattr(self.sim, "TCP", 0.0001) * 10,
-            'barrier_option': getattr(self.sim, "TCP", 0.0001) * 20
+            'barrier_option': getattr(self.sim, "TCP", 0.0001) * 20,
+            'american_option': getattr(self.sim, "TCP", 0.0001) * 15,  # American options slightly cheaper than barriers
+            'asian_option': getattr(self.sim, "TCP", 0.0001) * 15
         }
         
         self.instrument_types_list = self._classify_instruments()
@@ -116,12 +118,18 @@ class HedgingEnvGARCH:
                 self.instrument_strikes.append(getattr(deriv, 'K', self.K))
                 
                 from src.option_greek.vanilla import VanillaOption
-                from src.option_greek.barrier_wrapper import BarrierOptionWithVanillaFallback
+                from src.option_greek.barrier import BarrierOption
+                from src.option_greek.american import AmericanOption
+                from src.option_greek.asian import AsianOption
                 
                 if isinstance(deriv, VanillaOption):
                     self.instrument_types.append('vanilla')
                 elif isinstance(deriv, BarrierOption):
                     self.instrument_types.append('barrier')
+                elif isinstance(deriv, AmericanOption):
+                    self.instrument_types.append('american')
+                elif isinstance(deriv, AsianOption):
+                    self.instrument_types.append('asian')
                 else:
                     self.instrument_types.append('vanilla')
         
@@ -131,23 +139,27 @@ class HedgingEnvGARCH:
     
     def _classify_instruments(self) -> List[str]:
         """
-        Classify each hedging instrument as 'stock', 'vanilla_option', or 'barrier_option'.
+        Classify each hedging instrument as 'stock', 'vanilla_option', 'barrier_option', 'american_option', or 'asian_option'.
         
         Returns:
             List of instrument type strings
         """
         from src.option_greek.vanilla import VanillaOption
         from src.option_greek.barrier import BarrierOption
+        from src.option_greek.american import AmericanOption
+        from src.option_greek.asian import AsianOption
         
         instrument_types = []
         
         for deriv in self.hedging_derivatives:
             if deriv is None:
                 instrument_types.append('stock')
-            elif isinstance(deriv, VanillaOption):
-                instrument_types.append('vanilla_option')
+            elif isinstance(deriv, AmericanOption):
+                instrument_types.append('american_option')
             elif isinstance(deriv, BarrierOption):
                 instrument_types.append('barrier_option')
+            elif isinstance(deriv, AsianOption):
+                instrument_types.append('asian_option')
             else:
                 instrument_types.append('vanilla_option')
         
@@ -242,6 +254,7 @@ class HedgingEnvGARCH:
         
         for j, hedge_deriv in enumerate(self.hedging_derivatives):
             if hedge_deriv is None:
+                # Stock: delta=1, all other Greeks=0
                 greeks = {
                     'delta': torch.ones((M, N_plus_1), device=self.device),
                     'gamma': torch.zeros((M, N_plus_1), device=self.device),
@@ -269,21 +282,26 @@ class HedgingEnvGARCH:
             
             instrument_greeks.append(greeks)
         
+        # Build matrix A where A[i,j] = greek_i of instrument_j
         A = torch.zeros((M, N_plus_1, n, n), device=self.device)
         
         for i, greek_name in enumerate(greek_names):
             for j, inst_greeks in enumerate(instrument_greeks):
                 A[:, :, i, j] = inst_greeks[greek_name]
         
+        # Build target vector b (negative of portfolio Greeks)
         b = torch.stack([-portfolio_greeks[g] for g in greek_names], dim=-1)
         
+        # Solve with regularization for numerical stability
         epsilon = 1e-12
         lambda_reg = 1e-6
         
+        # Scale rows for better conditioning
         row_norm = A.norm(dim=-1, keepdim=True)
         A_scaled = A / (row_norm + epsilon)
         b_scaled = b / (row_norm[..., 0] + epsilon)
         
+        # Regularized least squares: (A^T A + λI) x = A^T b
         I = torch.eye(n, device=A.device).reshape(1, 1, n, n)
         ATA = torch.matmul(A_scaled.transpose(-2, -1), A_scaled)
         ATb = torch.matmul(A_scaled.transpose(-2, -1), b_scaled.unsqueeze(-1))
@@ -415,6 +433,7 @@ class HedgingEnvGARCH:
         h0_current = self.h_t.mean().item()
         V0 = self.derivative.price(S=S_t, K=self.K, step_idx=0, N=self.N, h0=h0_current)
         
+        # Initialize bank account: short derivative, hold hedge positions
         B_t = self.side * V0 - positions_t[:, 0] * S_t
         for i in range(len(O_trajectories)):
             B_t -= positions_t[:, i+1] * O_trajectories[i][:, 0]
@@ -427,22 +446,28 @@ class HedgingEnvGARCH:
         cost_breakdown = {
             'stock': torch.zeros(self.M, device=self.device),
             'vanilla_option': torch.zeros(self.M, device=self.device),
-            'barrier_option': torch.zeros(self.M, device=self.device)
+            'barrier_option': torch.zeros(self.M, device=self.device),
+            'american_option': torch.zeros(self.M, device=self.device),
+            'asian_option': torch.zeros(self.M, device=self.device)
         }
         
         for t in range(self.N):
+            # Evolve GARCH volatility
             sqrt_h = torch.sqrt(h_t)
             h_t = self.omega + self.beta * h_t + self.alpha * (self.Z[:, t] - self.gamma * sqrt_h) ** 2
             h_t = torch.clamp(h_t, min=1e-12)
             
+            # Evolve stock price
             r_t = (self.r + self.lambda_ * h_t - 0.5 * h_t) + torch.sqrt(h_t) * self.Z[:, t]
             S_t = S_t * torch.exp(r_t)
             
             positions_new = all_positions[:, t+1]
             
+            # Accrue interest on bank account
             dt = 1.0 / self.N
             B_t = B_t * torch.exp(torch.tensor(self.r * 252.0, device=self.device) * dt)
             
+            # Rebalance each instrument with appropriate transaction cost
             for i in range(self.n_hedging_instruments):
                 trade = positions_new[:, i] - positions_t[:, i]
                 
@@ -467,21 +492,25 @@ class HedgingEnvGARCH:
             for i in range(self.n_hedging_instruments):
                 position_trajs[i].append(positions_t[:, i])
         
+        # Compute terminal payoff based on derivative type
         if hasattr(self.derivative, 'option_type'):
             opt_type = self.derivative.option_type.lower()
             if opt_type == "call":
                 payoff = torch.clamp(S_t - self.K, min=0.0)
-            else:
+            else:  # put
                 payoff = torch.clamp(self.K - S_t, min=0.0)
         else:
+            # Default to call if type not specified
             payoff = torch.clamp(S_t - self.K, min=0.0)
         
         payoff = payoff * self.contract_size
         
+        # Calculate terminal portfolio value
         terminal_value = B_t + positions_t[:, 0] * S_t
         for i in range(len(O_trajectories)):
             terminal_value += positions_t[:, i+1] * O_trajectories[i][:, -1]
         
+        # Terminal hedging error
         terminal_error = terminal_value - self.side * payoff
         
         trajectories = {
