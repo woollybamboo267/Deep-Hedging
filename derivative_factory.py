@@ -1,6 +1,6 @@
 """
 Factory for creating derivative objects from config.
-Supports vanilla, barrier, and American options.
+Supports vanilla, barrier, American, and Asian options.
 """
 
 from typing import Dict, Any, List
@@ -9,19 +9,7 @@ import logging
 from src.option_greek.vanilla import VanillaOption
 from src.option_greek.barrier import BarrierOption
 from src.option_greek.american import AmericanOption
-from src.option_greek.precompute import PrecomputationManager
-from src.option_greek.barrier_wrapper import BarrierOptionWithVanillaFallback
-
-logger = logging.getLogger(__name__)
-
-
-from typing import Dict, Any, List
-import torch
-import logging
-from src.option_greek.vanilla import VanillaOption
-from src.option_greek.barrier import BarrierOption
-from src.option_greek.american import AmericanOption
-from src.option_greek.asian import AsianOption  # ADD THIS
+from src.option_greek.asian import AsianOption
 from src.option_greek.precompute import PrecomputationManager
 from src.option_greek.barrier_wrapper import BarrierOptionWithVanillaFallback
 
@@ -169,7 +157,7 @@ class DerivativeFactory:
             
             return american_option
         
-        # === ASIAN OPTION === [NEW]
+        # === ASIAN OPTION ===
         elif deriv_type == 'asian':
             logger.info(
                 f"Creating Asian hedged option ({hedged_cfg['option_type']}) "
@@ -177,17 +165,22 @@ class DerivativeFactory:
             )
             
             # Create Asian option (model-driven, no precomputation needed)
+            # Running average will be tracked by HedgingEnvGARCH
             asian_option = AsianOption(
                 model_path=hedged_cfg['model_path'],
                 option_type=hedged_cfg['option_type'],
                 r_annual=config['simulation']['r'],
-                device=config['training']['device']
+                device=config['training']['device'],
+                averaging_days=hedged_cfg.get('averaging_days', None)  # Optional: specify averaging period
             )
             
             asian_option.N = int(hedged_cfg['T'] * 252)
             asian_option.K = hedged_cfg['K']
             
-            logger.info(f"Created Asian option with maturity {asian_option.N} days")
+            logger.info(
+                f"Created Asian option with maturity {asian_option.N} days "
+                f"(averaging_days: {asian_option.default_averaging_days or 'full period'})"
+            )
             
             return asian_option
         
@@ -202,7 +195,12 @@ class DerivativeFactory:
         precomputed_data: Dict[int, Dict[str, Any]]
     ) -> List:
         """
-        Create hedging instruments (always vanilla options).
+        Create hedging instruments.
+        
+        Currently supports:
+        - Stock (None)
+        - Vanilla options (requires precomputation)
+        - Asian options (model-driven, for future extension)
         
         Args:
             config: Full config dict
@@ -211,11 +209,12 @@ class DerivativeFactory:
         
         Returns:
             List of derivative objects [None (stock), VanillaOption1, VanillaOption2, ...]
+            or [None (stock), AsianOption1, ...] (if extended)
         """
         instruments_cfg = config['instruments']
         n_instruments = instruments_cfg['n_hedging_instruments']
         
-        hedging_derivs = [None]
+        hedging_derivs = [None]  # First instrument is always stock
         
         if n_instruments == 1:
             logger.info("Hedging with stock only (no options)")
@@ -225,6 +224,10 @@ class DerivativeFactory:
         option_types = instruments_cfg['types']
         maturities = instruments_cfg['maturities']
         
+        # Optional: specify which hedging instruments are Asian
+        # If not specified, defaults to vanilla
+        hedging_instrument_classes = instruments_cfg.get('instrument_classes', ['vanilla'] * (n_instruments - 1))
+        
         n_options = n_instruments - 1
         if len(strikes) != n_options:
             raise ValueError(f"Expected {n_options} strikes, got {len(strikes)}")
@@ -232,47 +235,81 @@ class DerivativeFactory:
             raise ValueError(f"Expected {n_options} option types, got {len(option_types)}")
         if len(maturities) != n_options:
             raise ValueError(f"Expected {n_options} maturities, got {len(maturities)}")
+        if len(hedging_instrument_classes) != n_options:
+            raise ValueError(f"Expected {n_options} instrument_classes, got {len(hedging_instrument_classes)}")
         
         for i in range(n_options):
             maturity_days = maturities[i]
             strike = strikes[i]
             opt_type = option_types[i]
+            inst_class = hedging_instrument_classes[i].lower()
             
-            if maturity_days not in precomputed_data:
-                raise ValueError(
-                    f"No precomputed data for hedging maturity {maturity_days} days. "
-                    f"Available maturities: {list(precomputed_data.keys())}"
+            # === VANILLA HEDGING INSTRUMENT ===
+            if inst_class == 'vanilla':
+                if maturity_days not in precomputed_data:
+                    raise ValueError(
+                        f"No precomputed data for hedging maturity {maturity_days} days. "
+                        f"Available maturities: {list(precomputed_data.keys())}"
+                    )
+                
+                class PrecompManagerWrapper:
+                    def __init__(self, precomp_dict, r_daily, mat_days):
+                        self.r_daily = r_daily
+                        self._data = {mat_days: precomp_dict}
+                    
+                    def get_precomputed_data(self, N):
+                        return self._data.get(N)
+                
+                precomp_manager = PrecompManagerWrapper(
+                    precomputed_data[maturity_days],
+                    config['simulation']['r'] / 252.0,
+                    maturity_days
+                )
+                
+                hedging_option = VanillaOption(
+                    precomputation_manager=precomp_manager,
+                    garch_params=config['garch'],
+                    option_type=opt_type
+                )
+                
+                hedging_option.N = maturity_days
+                hedging_option.K = strike
+                
+                hedging_derivs.append(hedging_option)
+                
+                logger.info(
+                    f"Created vanilla hedging option {i+1}: {opt_type} with K={strike}, "
+                    f"T={maturity_days} days"
                 )
             
-            class PrecompManagerWrapper:
-                def __init__(self, precomp_dict, r_daily, mat_days):
-                    self.r_daily = r_daily
-                    self._data = {mat_days: precomp_dict}
+            # === ASIAN HEDGING INSTRUMENT (FUTURE EXTENSION) ===
+            elif inst_class == 'asian':
+                # This is for future extension: hedging with Asian options
+                # Requires Asian option model at the specified strike/maturity
                 
-                def get_precomputed_data(self, N):
-                    return self._data.get(N)
+                model_path = instruments_cfg.get('asian_model_paths', [])[i]
+                averaging_days = instruments_cfg.get('asian_averaging_days', [None] * n_options)[i]
+                
+                asian_hedging = AsianOption(
+                    model_path=model_path,
+                    option_type=opt_type,
+                    r_annual=config['simulation']['r'],
+                    device=config['training']['device'],
+                    averaging_days=averaging_days
+                )
+                
+                asian_hedging.N = maturity_days
+                asian_hedging.K = strike
+                
+                hedging_derivs.append(asian_hedging)
+                
+                logger.info(
+                    f"Created Asian hedging option {i+1}: {opt_type} with K={strike}, "
+                    f"T={maturity_days} days, averaging_days={averaging_days}"
+                )
             
-            precomp_manager = PrecompManagerWrapper(
-                precomputed_data[maturity_days],
-                config['simulation']['r'] / 252.0,
-                maturity_days
-            )
-            
-            hedging_option = VanillaOption(
-                precomputation_manager=precomp_manager,
-                garch_params=config['garch'],
-                option_type=opt_type
-            )
-            
-            hedging_option.N = maturity_days
-            hedging_option.K = strike
-            
-            hedging_derivs.append(hedging_option)
-            
-            logger.info(
-                f"Created hedging option {i+1}: {opt_type} with K={strike}, "
-                f"T={maturity_days} days"
-            )
+            else:
+                raise ValueError(f"Unknown hedging instrument class: {inst_class}")
         
         return hedging_derivs
 
