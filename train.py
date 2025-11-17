@@ -5,12 +5,13 @@ This script loads configuration from YAML, initializes all components,
 and runs the training loop. It replaces the train_garch function with
 a more modular, configuration-driven approach.
 
-Supports vanilla European, barrier, and American options.
+Supports vanilla European, barrier, American, and Asian options.
 
 Usage:
     python train.py --config cfgs/config_vanilla_2inst.yaml
     python train.py --config cfgs/config_barrier_2inst.yaml
     python train.py --config cfgs/config_american_1inst.yaml
+    python train.py --config cfgs/config_asian_2inst.yaml
     python train.py --config cfgs/config.yaml --load-model models/uniform/GARCHLSTMDG.pth --inference-only
 """
 
@@ -75,7 +76,8 @@ def get_transaction_costs(config: Dict[str, Any]) -> Dict[str, float]:
                 'stock': 0.0001,
                 'vanilla_option': 0.001,
                 'barrier_option': 0.002,
-                'american_option': 0.0015
+                'american_option': 0.0015,
+                'asian_option': 0.0015
             }
         else:
             # All zero transaction costs
@@ -83,7 +85,8 @@ def get_transaction_costs(config: Dict[str, Any]) -> Dict[str, float]:
                 'stock': 0.0,
                 'vanilla_option': 0.0,
                 'barrier_option': 0.0,
-                'american_option': 0.0
+                'american_option': 0.0,
+                'asian_option': 0.0
             }
     else:
         # Use detailed transaction costs with defaults for missing values
@@ -91,7 +94,8 @@ def get_transaction_costs(config: Dict[str, Any]) -> Dict[str, float]:
             'stock': 0.0001,
             'vanilla_option': 0.001,
             'barrier_option': 0.002,
-            'american_option': 0.0015
+            'american_option': 0.0015,
+            'asian_option': 0.0015
         }
         return {key: tc_config.get(key, defaults[key]) for key in defaults}
 
@@ -131,8 +135,8 @@ def validate_config(config: Dict[str, Any]) -> None:
     hedged_cfg = config["hedged_option"]
     deriv_type = hedged_cfg["type"].lower()
     
-    # Extended validation for American options
-    if deriv_type not in ["vanilla", "barrier", "american"]:
+    # Extended validation for American and Asian options
+    if deriv_type not in ["vanilla", "barrier", "american", "asian"]:
         raise ValueError(f"Invalid hedged_option type: {deriv_type}")
     
     if hedged_cfg["option_type"] not in valid_types:
@@ -145,9 +149,9 @@ def validate_config(config: Dict[str, Any]) -> None:
             f"Invalid hedged_option side: {hedged_cfg['side']}"
         )
     
-    # Validate that American options have model_path if needed
-    if deriv_type == "american" and "model_path" not in hedged_cfg:
-        logging.warning("American option specified but no model_path provided in config")
+    # Validate that American and Asian options have model_path if needed
+    if deriv_type in ["american", "asian"] and "model_path" not in hedged_cfg:
+        logging.warning(f"{deriv_type.capitalize()} option specified but no model_path provided in config")
     
     logging.info("Configuration validation passed")
 
@@ -451,7 +455,7 @@ def train(
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Train GARCH-based option hedging with RL (supports vanilla, barrier, and American options)"
+        description="Train GARCH-based option hedging with RL (supports vanilla, barrier, American, and Asian options)"
     )
     parser.add_argument(
         "--config",
@@ -502,6 +506,7 @@ def main():
     # 1. Vanilla options used as hedging instruments (specified in config["instruments"]["maturities"])
     # 2. Vanilla option being hedged (if hedged_type == "vanilla")
     # 3. Barrier option being hedged (needs vanilla fallback at same maturity)
+    # NOTE: American and Asian options do NOT need precomputation
     
     precomputation_manager = create_precomputation_manager_from_config(config)
     
