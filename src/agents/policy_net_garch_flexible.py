@@ -71,6 +71,14 @@ class HedgingEnvGARCH:
         self.hedging_derivatives = hedging_derivatives
         self.n_hedging_instruments = n_hedging_instruments
         
+        # Check if main derivative is Asian (needs running average)
+        from src.option_greek.asian import AsianOption
+        self.is_asian_hedged = isinstance(derivative, AsianOption)
+        
+        # Check which hedging instruments are Asian
+        self.hedging_is_asian = [isinstance(d, AsianOption) if d is not None else False 
+                                  for d in hedging_derivatives]
+        
         self.garch_params = garch_params or {
             "omega": 1.593749e-07,
             "alpha": 2.308475e-06,
@@ -136,6 +144,10 @@ class HedgingEnvGARCH:
         self.sigma0 = float(self.garch_params["sigma0"])
         self.sigma_t = torch.full((self.M,), self.sigma0, dtype=torch.float32, device=self.device)
         self.h_t = (self.sigma_t ** 2 / 252)
+        
+        # Initialize running averages for Asian options
+        self.A_hedged = None  # Running average for hedged derivative (shape: [M])
+        self.A_hedging = None  # Running averages for hedging instruments (list of [M] tensors)
     
     def _classify_instruments(self) -> List[str]:
         """
@@ -178,12 +190,38 @@ class HedgingEnvGARCH:
         instrument_type = self.instrument_types_list[instrument_idx]
         return self.transaction_costs.get(instrument_type, 0.0001)
     
+    def _update_running_average(self, A_prev, S_current, t, N):
+        """
+        Update running average for Asian option.
+        
+        Arithmetic average formula: A_t = (t * A_{t-1} + S_t) / (t + 1)
+        
+        Args:
+            A_prev: Previous average [M] or None
+            S_current: Current spot price [M]
+            t: Current timestep (0-indexed)
+            N: Total timesteps
+        
+        Returns:
+            Updated average [M]
+        """
+        if A_prev is None:
+            # First step: average is just the initial price
+            return S_current.clone()
+        else:
+            # Arithmetic average: A_t = (t * A_{t-1} + S_t) / (t + 1)
+            return (t * A_prev + S_current) / (t + 1)
+    
     def reset(self):
-        """Reset environment state."""
+        """Reset environment state including running averages."""
         self.Z = torch.randn((self.M, self.N), dtype=torch.float32, device=self.device)
         sigma0_annual = float(self.garch_params["sigma0"])
         self.sigma_t = torch.full((self.M,), sigma0_annual, dtype=torch.float32, device=self.device)
         self.h_t = (self.sigma_t ** 2 / 252)
+        
+        # Reset running averages
+        self.A_hedged = None
+        self.A_hedging = [None] * len([d for d in self.hedging_derivatives if d is not None])
         
         # Reset barrier breach status for wrapped barrier options
         from src.option_greek.barrier_wrapper import BarrierOptionWithVanillaFallback
@@ -198,6 +236,7 @@ class HedgingEnvGARCH:
     def compute_all_paths_greeks(self, S_trajectory, greek_name: str):
         """
         Compute specified Greek for the hedged derivative across all paths.
+        NOW SUPPORTS ASIAN OPTIONS with running average tracking.
         
         Args:
             S_trajectory: [M, N+1] stock prices
@@ -211,11 +250,20 @@ class HedgingEnvGARCH:
         
         greek_method = getattr(self.derivative, greek_name)
         
+        # Track running average if Asian
+        A_t = None
+        
         for t in range(N_plus_1):
             S_t = S_trajectory[:, t]
             h0_current = self.h_t.mean().item()
             
-            greek_t = greek_method(S=S_t, K=self.K, step_idx=t, N=self.N, h0=h0_current)
+            # Update running average for Asian options
+            if self.is_asian_hedged:
+                A_t = self._update_running_average(A_t, S_t, t, self.N)
+                greek_t = greek_method(S=S_t, K=self.K, step_idx=t, N=self.N, h0=h0_current, A=A_t)
+            else:
+                greek_t = greek_method(S=S_t, K=self.K, step_idx=t, N=self.N, h0=h0_current)
+            
             greek_trajectory[:, t] = greek_t
         
         return greek_trajectory
@@ -223,6 +271,7 @@ class HedgingEnvGARCH:
     def compute_hn_option_positions(self, S_trajectory, portfolio_greeks):
         """
         Compute optimal hedge positions using linear algebra for n Greeks with n instruments.
+        NOW SUPPORTS ASIAN HEDGING INSTRUMENTS.
         
         Solves the system:
             A @ x = b
@@ -252,6 +301,9 @@ class HedgingEnvGARCH:
         
         instrument_greeks = []
         
+        # Track running averages for Asian hedging instruments
+        A_hedging = [None] * len(self.hedging_derivatives)
+        
         for j, hedge_deriv in enumerate(self.hedging_derivatives):
             if hedge_deriv is None:
                 # Stock: delta=1, all other Greeks=0
@@ -265,18 +317,31 @@ class HedgingEnvGARCH:
                 greeks = {}
                 h0_mean = self.h_t.mean().item()
                 
+                # Check if this hedging instrument is Asian
+                is_asian_hedge = self.hedging_is_asian[j]
+                
                 for greek_name in ['delta', 'gamma', 'vega', 'theta']:
                     greek_traj = torch.zeros((M, N_plus_1), device=self.device)
                     greek_method = getattr(hedge_deriv, greek_name)
+                    
+                    # Reset running average for this instrument
+                    A_t = None
                     
                     for t in range(N_plus_1):
                         S_t = S_trajectory[:, t]
                         K_hedge = getattr(hedge_deriv, 'K', self.K)
                         N_hedge = getattr(hedge_deriv, 'N', self.N)
                         
-                        greek_traj[:, t] = greek_method(
-                            S=S_t, K=K_hedge, step_idx=t, N=N_hedge, h0=h0_mean
-                        )
+                        # Update running average if Asian
+                        if is_asian_hedge:
+                            A_t = self._update_running_average(A_t, S_t, t, N_hedge)
+                            greek_traj[:, t] = greek_method(
+                                S=S_t, K=K_hedge, step_idx=t, N=N_hedge, h0=h0_mean, A=A_t
+                            )
+                        else:
+                            greek_traj[:, t] = greek_method(
+                                S=S_t, K=K_hedge, step_idx=t, N=N_hedge, h0=h0_mean
+                            )
                     
                     greeks[greek_name] = greek_traj
             
@@ -314,6 +379,7 @@ class HedgingEnvGARCH:
     def simulate_trajectory_and_get_observations(self, policy_net):
         """
         Simulate trajectory using LSTM with proper hidden state management.
+        NOW TRACKS RUNNING AVERAGES FOR ASIAN OPTIONS.
         
         Returns:
             S_trajectory: [M, N+1] stock prices
@@ -330,18 +396,34 @@ class HedgingEnvGARCH:
         S_t = torch.full((self.M,), self.S0, dtype=torch.float32, device=self.device)
         h_t = self.h_t.clone()
         
+        # Initialize running averages at t=0
+        A_hedged = S_t.clone() if self.is_asian_hedged else None
+        A_hedging = [S_t.clone() if is_asian else None 
+                     for is_asian in self.hedging_is_asian[1:]]  # Skip stock (index 0)
+        
         S_trajectory.append(S_t)
         
         h0_current = h_t.mean().item()
-        V0 = self.derivative.price(S=S_t, K=self.K, step_idx=0, N=self.N, h0=h0_current)
+        
+        # Price hedged derivative at t=0
+        if self.is_asian_hedged:
+            V0 = self.derivative.price(S=S_t, K=self.K, step_idx=0, N=self.N, h0=h0_current, A=A_hedged)
+        else:
+            V0 = self.derivative.price(S=S_t, K=self.K, step_idx=0, N=self.N, h0=h0_current)
         V_trajectory.append(V0)
         
+        # Price hedging derivatives at t=0
         for i, hedge_deriv in enumerate(self.hedging_derivatives[1:]):
             K_hedge = getattr(hedge_deriv, 'K', self.K)
             N_hedge = getattr(hedge_deriv, 'N', self.N)
-            O0 = hedge_deriv.price(S=S_t, K=K_hedge, step_idx=0, N=N_hedge, h0=h0_current)
+            
+            if self.hedging_is_asian[i+1]:  # +1 because hedging_is_asian includes stock at index 0
+                O0 = hedge_deriv.price(S=S_t, K=K_hedge, step_idx=0, N=N_hedge, h0=h0_current, A=A_hedging[i])
+            else:
+                O0 = hedge_deriv.price(S=S_t, K=K_hedge, step_idx=0, N=N_hedge, h0=h0_current)
             O_trajectories[i].append(O0)
         
+        # Initial observation
         obs_t = torch.zeros((self.M, 1, 5), dtype=torch.float32, device=self.device)
         obs_t[:, 0, 0] = 0.0
         obs_t[:, 0, 1] = S_t / self.K
@@ -350,6 +432,7 @@ class HedgingEnvGARCH:
         obs_t[:, 0, 4] = self.side * V0
         obs_list.append(obs_t)
         
+        # Initial positions from policy
         lstm_out, hidden_state = policy_net.lstm(obs_t)
         x = lstm_out
         for fc in policy_net.fc_layers:
@@ -363,27 +446,48 @@ class HedgingEnvGARCH:
         positions_t = torch.stack(outputs, dim=-1)
         all_positions = [positions_t]
         
+        # Simulate forward through time
         for t in range(self.N):
+            # Evolve GARCH volatility
             sqrt_h = torch.sqrt(h_t)
             h_t = self.omega + self.beta * h_t + self.alpha * (self.Z[:, t] - self.gamma * sqrt_h) ** 2
             h_t = torch.clamp(h_t, min=1e-12)
             
+            # Evolve stock price
             r_t = (self.r + self.lambda_ * h_t - 0.5 * h_t) + torch.sqrt(h_t) * self.Z[:, t]
             S_t = S_t * torch.exp(r_t)
             
+            # Update running averages for timestep t+1
+            if self.is_asian_hedged:
+                A_hedged = self._update_running_average(A_hedged, S_t, t+1, self.N)
+            
+            for i in range(len(A_hedging)):
+                if self.hedging_is_asian[i+1]:  # +1 because hedging_is_asian includes stock at index 0
+                    A_hedging[i] = self._update_running_average(A_hedging[i], S_t, t+1, self.N)
+            
             h0_current = h_t.mean().item()
             
-            V_t = self.derivative.price(S=S_t, K=self.K, step_idx=t+1, N=self.N, h0=h0_current)
+            # Price hedged derivative at timestep t+1
+            if self.is_asian_hedged:
+                V_t = self.derivative.price(S=S_t, K=self.K, step_idx=t+1, N=self.N, h0=h0_current, A=A_hedged)
+            else:
+                V_t = self.derivative.price(S=S_t, K=self.K, step_idx=t+1, N=self.N, h0=h0_current)
             
+            # Price hedging derivatives at timestep t+1
             for i, hedge_deriv in enumerate(self.hedging_derivatives[1:]):
                 K_hedge = getattr(hedge_deriv, 'K', self.K)
                 N_hedge = getattr(hedge_deriv, 'N', self.N)
-                O_t = hedge_deriv.price(S=S_t, K=K_hedge, step_idx=t+1, N=N_hedge, h0=h0_current)
+                
+                if self.hedging_is_asian[i+1]:  # +1 because hedging_is_asian includes stock at index 0
+                    O_t = hedge_deriv.price(S=S_t, K=K_hedge, step_idx=t+1, N=N_hedge, h0=h0_current, A=A_hedging[i])
+                else:
+                    O_t = hedge_deriv.price(S=S_t, K=K_hedge, step_idx=t+1, N=N_hedge, h0=h0_current)
                 O_trajectories[i].append(O_t)
             
             S_trajectory.append(S_t)
             V_trajectory.append(V_t)
             
+            # Create new observation
             time_val = (t + 1) / self.N
             obs_new = torch.zeros((self.M, 1, 5), dtype=torch.float32, device=self.device)
             obs_new[:, 0, 0] = time_val
@@ -393,6 +497,7 @@ class HedgingEnvGARCH:
             obs_new[:, 0, 4] = self.side * V_t
             obs_list.append(obs_new)
             
+            # Get new positions from policy
             lstm_out, hidden_state = policy_net.lstm(obs_new, hidden_state)
             x = lstm_out
             for fc in policy_net.fc_layers:
@@ -422,6 +527,7 @@ class HedgingEnvGARCH:
     def simulate_full_trajectory(self, all_positions, O_trajectories):
         """
         Simulate full hedging trajectory with n instruments and instrument-specific costs.
+        NOW HANDLES ASIAN OPTIONS IN TERMINAL PAYOFF CALCULATION.
         
         Args:
             all_positions: [M, N+1, n_instruments] positions for all instruments
@@ -431,7 +537,15 @@ class HedgingEnvGARCH:
         positions_t = all_positions[:, 0]
         
         h0_current = self.h_t.mean().item()
-        V0 = self.derivative.price(S=S_t, K=self.K, step_idx=0, N=self.N, h0=h0_current)
+        
+        # Initialize running average for Asian hedged derivative
+        A_hedged = S_t.clone() if self.is_asian_hedged else None
+        
+        # Price hedged derivative at t=0
+        if self.is_asian_hedged:
+            V0 = self.derivative.price(S=S_t, K=self.K, step_idx=0, N=self.N, h0=h0_current, A=A_hedged)
+        else:
+            V0 = self.derivative.price(S=S_t, K=self.K, step_idx=0, N=self.N, h0=h0_current)
         
         # Initialize bank account: short derivative, hold hedge positions
         B_t = self.side * V0 - positions_t[:, 0] * S_t
@@ -460,6 +574,10 @@ class HedgingEnvGARCH:
             # Evolve stock price
             r_t = (self.r + self.lambda_ * h_t - 0.5 * h_t) + torch.sqrt(h_t) * self.Z[:, t]
             S_t = S_t * torch.exp(r_t)
+            
+            # Update running average for Asian at timestep t+1
+            if self.is_asian_hedged:
+                A_hedged = self._update_running_average(A_hedged, S_t, t+1, self.N)
             
             positions_new = all_positions[:, t+1]
             
@@ -493,15 +611,29 @@ class HedgingEnvGARCH:
                 position_trajs[i].append(positions_t[:, i])
         
         # Compute terminal payoff based on derivative type
-        if hasattr(self.derivative, 'option_type'):
-            opt_type = self.derivative.option_type.lower()
-            if opt_type == "call":
-                payoff = torch.clamp(S_t - self.K, min=0.0)
-            else:  # put
-                payoff = torch.clamp(self.K - S_t, min=0.0)
+        # CRITICAL: For Asian options, use running average A_hedged instead of spot S_t
+        if self.is_asian_hedged:
+            # Terminal payoff based on AVERAGE price
+            if hasattr(self.derivative, 'option_type'):
+                opt_type = self.derivative.option_type.lower()
+                if opt_type == "call":
+                    payoff = torch.clamp(A_hedged - self.K, min=0.0)
+                else:  # put
+                    payoff = torch.clamp(self.K - A_hedged, min=0.0)
+            else:
+                # Default to call
+                payoff = torch.clamp(A_hedged - self.K, min=0.0)
         else:
-            # Default to call if type not specified
-            payoff = torch.clamp(S_t - self.K, min=0.0)
+            # Standard option: use SPOT price
+            if hasattr(self.derivative, 'option_type'):
+                opt_type = self.derivative.option_type.lower()
+                if opt_type == "call":
+                    payoff = torch.clamp(S_t - self.K, min=0.0)
+                else:  # put
+                    payoff = torch.clamp(self.K - S_t, min=0.0)
+            else:
+                # Default to call
+                payoff = torch.clamp(S_t - self.K, min=0.0)
         
         payoff = payoff * self.contract_size
         
