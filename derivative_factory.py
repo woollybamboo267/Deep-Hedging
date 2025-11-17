@@ -15,6 +15,19 @@ from src.option_greek.barrier_wrapper import BarrierOptionWithVanillaFallback
 logger = logging.getLogger(__name__)
 
 
+from typing import Dict, Any, List
+import torch
+import logging
+from src.option_greek.vanilla import VanillaOption
+from src.option_greek.barrier import BarrierOption
+from src.option_greek.american import AmericanOption
+from src.option_greek.asian import AsianOption  # ADD THIS
+from src.option_greek.precompute import PrecomputationManager
+from src.option_greek.barrier_wrapper import BarrierOptionWithVanillaFallback
+
+logger = logging.getLogger(__name__)
+
+
 class DerivativeFactory:
     """Factory for creating derivative objects based on config."""
     
@@ -32,7 +45,7 @@ class DerivativeFactory:
                              Only required for vanilla and barrier options
         
         Returns:
-            VanillaOption, BarrierOptionWithVanillaFallback, or AmericanOption instance
+            VanillaOption, BarrierOptionWithVanillaFallback, AmericanOption, or AsianOption instance
         """
         hedged_cfg = config['hedged_option']
         deriv_type = hedged_cfg['type'].lower()
@@ -156,8 +169,31 @@ class DerivativeFactory:
             
             return american_option
         
+        # === ASIAN OPTION === [NEW]
+        elif deriv_type == 'asian':
+            logger.info(
+                f"Creating Asian hedged option ({hedged_cfg['option_type']}) "
+                f"with strike K={hedged_cfg['K']}"
+            )
+            
+            # Create Asian option (model-driven, no precomputation needed)
+            asian_option = AsianOption(
+                model_path=hedged_cfg['model_path'],
+                option_type=hedged_cfg['option_type'],
+                r_annual=config['simulation']['r'],
+                device=config['training']['device']
+            )
+            
+            asian_option.N = int(hedged_cfg['T'] * 252)
+            asian_option.K = hedged_cfg['K']
+            
+            logger.info(f"Created Asian option with maturity {asian_option.N} days")
+            
+            return asian_option
+        
         else:
             raise ValueError(f"Unknown derivative type: {deriv_type}")
+    
     
     # === HEDGING DERIVATIVES ===
     @staticmethod
