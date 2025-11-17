@@ -11,7 +11,7 @@ garch:
 hedged_option:
   K: 100
   T: 1.0
-  model_path: surrogates/discriminative_v5_american_put.pth
+  model_path: surrogates/american/discriminative_v5_american_put.pth
   option_type: put
   side: short
   type: american
