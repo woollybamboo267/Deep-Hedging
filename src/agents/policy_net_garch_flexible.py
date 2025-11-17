@@ -98,7 +98,7 @@ class HedgingEnvGARCH:
             'stock': getattr(self.sim, "TCP", 0.0001),
             'vanilla_option': getattr(self.sim, "TCP", 0.0001) * 10,
             'barrier_option': getattr(self.sim, "TCP", 0.0001) * 20,
-            'american_option': getattr(self.sim, "TCP", 0.0001) * 15,  # American options slightly cheaper than barriers
+            'american_option': getattr(self.sim, "TCP", 0.0001) * 15,
             'asian_option': getattr(self.sim, "TCP", 0.0001) * 15
         }
         
