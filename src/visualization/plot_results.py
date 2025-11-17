@@ -18,11 +18,6 @@ def compute_practitioner_benchmark(
     """Compute the practitioner benchmark hedge."""
     S_np = S_traj.cpu().numpy()
     
-    # Convert barrier_level to scalar if it's a tensor
-    barrier_level = env.derivative.barrier_level
-    if isinstance(barrier_level, torch.Tensor):
-        barrier_level = barrier_level.item()
-    
     # Determine Greeks to hedge
     if n_hedging_instruments == 1:
         greek_names = ['delta']
@@ -205,13 +200,20 @@ def plot_episode_results(
                  label='Stock Price', color=color_stock, linewidth=2)
         ax1.axhline(y=env.K, color='r', linestyle='--', label='Strike', alpha=0.7)
         
-        # Add barrier level if hedging a barrier option
+        # Add special features based on derivative type
         if hasattr(env.derivative, 'barrier_level'):
+            # Barrier option - add barrier level
             barrier_val = env.derivative.barrier_level
             if isinstance(barrier_val, torch.Tensor):
                 barrier_val = barrier_val.item()
             ax1.axhline(y=barrier_val, color='purple', 
                        linestyle=':', label='Barrier', alpha=0.7, linewidth=2)
+        
+        # For Asian options, you could add average price line if needed
+        # if derivative_type == 'AsianOption':
+        #     running_avg = S_traj[path_idx].cpu().detach().numpy().cumsum() / np.arange(1, len(time_steps) + 1)
+        #     ax1.plot(time_steps, running_avg, color='cyan', 
+        #              linestyle='-.', label='Running Avg', alpha=0.7, linewidth=2)
         
         ax1.set_xlabel("Time Step", fontsize=11)
         ax1.set_ylabel("Stock Price", fontsize=11, color=color_stock)
