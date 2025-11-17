@@ -6,6 +6,7 @@ and runs the training loop. It replaces the train_garch function with
 a more modular, configuration-driven approach.
 
 Supports vanilla European, barrier, American, and Asian options.
+Automatically detects and uses CUDA if available, otherwise falls back to CPU.
 
 Usage:
     python train.py --config cfgs/config_vanilla_2inst.yaml
@@ -31,6 +32,17 @@ from derivative_factory import setup_derivatives_from_precomputed
 
 
 logger = logging.getLogger(__name__)
+
+
+def auto_detect_device() -> str:
+    """Auto-detect device: use CUDA if available, otherwise CPU."""
+    if torch.cuda.is_available():
+        device_name = torch.cuda.get_device_name(0)
+        logging.info(f"CUDA is available! Detected GPU: {device_name}")
+        return "cuda"
+    else:
+        logging.info("CUDA not available. Using CPU.")
+        return "cpu"
 
 
 def setup_logging(config: Dict[str, Any]) -> None:
@@ -484,7 +496,21 @@ def main():
     
     config = load_config(args.config)
     
+    # ============================================================
+    # AUTO-DETECT DEVICE: Use CUDA if available, otherwise CPU
+    # This OVERRIDES whatever device is in the config file
+    # ============================================================
+    auto_device = auto_detect_device()
+    config["training"]["device"] = auto_device
+    config["precomputation"]["device"] = auto_device
+    
     setup_logging(config)
+    
+    logging.info("=" * 70)
+    logging.info(f"DEVICE CONFIGURATION: {auto_device.upper()}")
+    if auto_device == "cuda":
+        logging.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    logging.info("=" * 70)
     
     validate_config(config)
     
