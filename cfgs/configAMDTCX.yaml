@@ -16,16 +16,10 @@ hedged_option:
   side: short
   type: american
 instruments:
-  maturities:
-  - 252
-  - 378
-  n_hedging_instruments: 3
-  strikes:
-  - 110
-  - 90
-  types:
-  - put
-  - put
+  maturities: []
+  n_hedging_instruments: 1
+  strikes: []
+  types: []
 logging:
   level: INFO
   log_file: null
@@ -35,13 +29,13 @@ model:
   num_layers: 1
   obs_dim: 5
 output:
-  checkpoint_path: policy_net_am_dgv_TC.pth
-  model_save_path: policy_net_am_dgv_TC.pth
+  checkpoint_path: policy_net_american_1inst.pth
+  model_save_path: policy_net_american_1inst.pth
   plot_dpi: 150
-  plot_save_path: hedge_comparison_am_dgv_TC_ep{episode}.png
+  plot_save_path: hedge_comparison_american_1inst_ep{episode}.png
   sample_path_index: 1
 precomputation:
-  N_quad: 256
+  N_quad: 128
   device: cpu
   u_max: 500.0
 simulation:
@@ -50,7 +44,7 @@ simulation:
   S0: 100
   T: 1.0
   contract_size: 1
-  r: 0.04
+  r: 0.1342
 training:
   batch_size: 1000
   checkpoint_frequency: 25
