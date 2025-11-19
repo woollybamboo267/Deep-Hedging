@@ -505,10 +505,7 @@ class HedgingEnvGARCH:
             
             outputs = []
             for i, head in enumerate(policy_net.instrument_heads):
-                if i == 0:
-                    output = torch.tanh(head(x)).squeeze(-1)[:, 0]
-                else:
-                    output = head(x).squeeze(-1)[:, 0]
+                output = head(x).squeeze(-1)[:, 0]
                 outputs.append(output)
             
             positions_t = torch.stack(outputs, dim=-1)
