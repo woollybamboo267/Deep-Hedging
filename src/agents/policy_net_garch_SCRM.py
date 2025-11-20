@@ -661,13 +661,16 @@ def compute_loss_with_soft_constraint(terminal_error, trajectories, risk_measure
     
     where SC(θ) = P(max_{t∈{0,...,T}} {ξ_t^ϕθ} > V_0)
     
-    In practice, we use the accumulated violations as a penalty term.
+    Risk measures implemented:
+    - MSE: ρ(ξ_T^ϕ) = E[(ξ_T^ϕ)²]
+    - SMSE: ρ(ξ_T^ϕ) = E[(ξ_T^ϕ)² · 𝟙_{ξ_T^ϕ ≥ 0}]
+    - CVaR_α: ρ(ξ_T^ϕ) = E[ξ_T^ϕ | ξ_T^ϕ ≥ VaR_α(ξ_T^ϕ)]
     
     Args:
-        terminal_error: [M] terminal hedging errors
+        terminal_error: [M] terminal hedging errors (ξ_T^ϕθ)
         trajectories: Dict containing 'soft_constraint_violations' [M]
-        risk_measure: 'cvar', 'variance', 'mse', or 'mae'
-        alpha: CVaR confidence level (default: 0.95)
+        risk_measure: 'mse', 'smse', 'cvar', 'variance', or 'mae'
+        alpha: CVaR confidence level (default: 0.95, meaning we look at worst 5%)
         lambda_constraint: Weight for soft constraint penalty (default: 1.0)
     
     Returns:
@@ -678,27 +681,45 @@ def compute_loss_with_soft_constraint(terminal_error, trajectories, risk_measure
     M = terminal_error.shape[0]
     
     # Compute primary risk measure ρ(ξ_T^ϕθ)
-    if risk_measure == 'cvar':
-        # CVaR: Conditional Value-at-Risk
-        sorted_errors, _ = torch.sort(terminal_error, descending=True)
-        k = int(np.ceil(M * (1 - alpha)))
-        k = max(1, k)
-        risk_loss = sorted_errors[:k].mean()
-    
-    elif risk_measure == 'variance':
-        # Variance of terminal error
-        risk_loss = terminal_error.var()
-    
-    elif risk_measure == 'mse':
-        # Mean squared error
+    if risk_measure == 'mse':
+        # Mean Square Error: E[(ξ_T^ϕ)²]
         risk_loss = (terminal_error ** 2).mean()
     
+    elif risk_measure == 'smse':
+        # Semi Mean-Square Error: E[(ξ_T^ϕ)² · 𝟙_{ξ_T^ϕ ≥ 0}]
+        # Only penalizes positive errors (losses from hedger's perspective)
+        positive_mask = (terminal_error >= 0).float()
+        risk_loss = ((terminal_error ** 2) * positive_mask).mean()
+    
+    elif risk_measure == 'cvar':
+        # Conditional Value-at-Risk (CVaR_α):
+        # E[ξ_T^ϕ | ξ_T^ϕ ≥ VaR_α(ξ_T^ϕ)]
+        # 
+        # VaR_α is the α-quantile: min{c : P(ξ_T^ϕ ≤ c) ≥ α}
+        # CVaR_α is the expected value in the tail beyond VaR_α
+        #
+        # For α=0.95, we compute the mean of the worst 5% of errors
+        
+        # Sort errors in descending order (worst first)
+        sorted_errors, _ = torch.sort(terminal_error, descending=True)
+        
+        # Number of samples in the (1-α) tail (worst 5% for α=0.95)
+        n_tail = int(np.ceil(M * (1 - alpha)))
+        n_tail = max(1, n_tail)  # At least 1 sample
+        
+        # CVaR is the mean of the worst (1-α)% samples
+        risk_loss = sorted_errors[:n_tail].mean()
+    
+    elif risk_measure == 'variance':
+        # Variance of terminal error: Var(ξ_T^ϕ)
+        risk_loss = terminal_error.var()
+    
     elif risk_measure == 'mae':
-        # Mean absolute error
+        # Mean Absolute Error: E[|ξ_T^ϕ|]
         risk_loss = terminal_error.abs().mean()
     
     else:
-        raise ValueError(f"Unknown risk measure: {risk_measure}")
+        raise ValueError(f"Unknown risk measure: {risk_measure}. Choose from: 'mse', 'smse', 'cvar', 'variance', 'mae'")
     
     # Compute soft constraint penalty: SC(θ)
     # We use the accumulated violations normalized by number of paths
