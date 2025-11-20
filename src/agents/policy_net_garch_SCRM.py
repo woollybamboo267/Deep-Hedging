@@ -665,12 +665,13 @@ def compute_loss_with_soft_constraint(terminal_error, trajectories, risk_measure
     - MSE: ρ(ξ_T^ϕ) = E[(ξ_T^ϕ)²]
     - SMSE: ρ(ξ_T^ϕ) = E[(ξ_T^ϕ)² · 𝟙_{ξ_T^ϕ ≥ 0}]
     - CVaR_α: ρ(ξ_T^ϕ) = E[ξ_T^ϕ | ξ_T^ϕ ≥ VaR_α(ξ_T^ϕ)]
+    - VaR_α: ρ(ξ_T^ϕ) = VaR_α(ξ_T^ϕ) = inf{x : P(ξ_T^ϕ ≤ x) ≥ α}
     
     Args:
         terminal_error: [M] terminal hedging errors (ξ_T^ϕθ)
         trajectories: Dict containing 'soft_constraint_violations' [M]
-        risk_measure: 'mse', 'smse', 'cvar', 'variance', or 'mae'
-        alpha: CVaR confidence level (ONLY needed for 'cvar', e.g., 0.95 = worst 5%)
+        risk_measure: 'mse', 'smse', 'cvar', 'var', or 'mae'
+        alpha: Confidence level for CVaR or VaR (ONLY needed for 'cvar' or 'var', e.g., 0.95)
         lambda_constraint: Weight for soft constraint penalty (default: 0.0)
     
     Returns:
@@ -713,16 +714,27 @@ def compute_loss_with_soft_constraint(terminal_error, trajectories, risk_measure
         # CVaR is the mean of the worst (1-α)% samples
         risk_loss = sorted_errors[:n_tail].mean()
     
-    elif risk_measure == 'variance':
-        # Variance of terminal error: Var(ξ_T^ϕ)
-        risk_loss = terminal_error.var()
+    elif risk_measure == 'var':
+        # Value-at-Risk (VaR_α):
+        # VaR_α(ξ_T^ϕ) = inf{x : P(ξ_T^ϕ ≤ x) ≥ α}
+        # This is the α-quantile of the loss distribution
+        #
+        # For α=0.95, this is the 95th percentile of errors
+        # WARNING: VaR is NOT a convex or coherent risk measure
+        
+        if alpha is None:
+            raise ValueError("alpha parameter is required for VaR risk measure")
+        
+        # Compute the α-quantile (VaR)
+        # For α=0.95, this gives the value such that 95% of errors are below it
+        risk_loss = torch.quantile(terminal_error, alpha)
     
     elif risk_measure == 'mae':
         # Mean Absolute Error: E[|ξ_T^ϕ|]
         risk_loss = terminal_error.abs().mean()
     
     else:
-        raise ValueError(f"Unknown risk measure: {risk_measure}. Choose from: 'mse', 'smse', 'cvar', 'variance', 'mae'")
+        raise ValueError(f"Unknown risk measure: {risk_measure}. Choose from: 'mse', 'smse', 'cvar', 'var', 'mae'")
     
     # Compute soft constraint penalty: SC(θ)
     # We use the accumulated violations normalized by number of paths
