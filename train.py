@@ -175,19 +175,23 @@ def validate_config(config: Dict[str, Any]) -> None:
     # NEW: Validate risk measure configuration
     if "risk_measure" in config:
         risk_config = config["risk_measure"]
-        valid_risk_measures = ["mse", "smse", "cvar", "variance", "mae"]
+        valid_risk_measures = ["mse", "smse", "cvar", "var", "mae"]
         risk_type = risk_config.get("type", "mse")
         
         if risk_type not in valid_risk_measures:
             raise ValueError(f"Invalid risk_measure type: {risk_type}. Must be one of {valid_risk_measures}")
         
-        # CVaR requires alpha parameter
-        if risk_type == "cvar" and "alpha" not in risk_config:
-            raise ValueError("risk_measure type 'cvar' requires 'alpha' parameter")
+        # CVaR and VaR require alpha parameter
+        if risk_type in ["cvar", "var"] and "alpha" not in risk_config:
+            raise ValueError(f"risk_measure type '{risk_type}' requires 'alpha' parameter")
         
-        # Warn if alpha is provided for non-CVaR measures
-        if risk_type != "cvar" and "alpha" in risk_config:
-            logging.warning(f"alpha parameter is ignored for risk_measure type '{risk_type}' (only used for 'cvar')")
+        # Warn if alpha is provided for non-CVaR/VaR measures
+        if risk_type not in ["cvar", "var"] and "alpha" in risk_config:
+            logging.warning(f"alpha parameter is ignored for risk_measure type '{risk_type}' (only used for 'cvar' or 'var')")
+        
+        # Warning for VaR (non-convex)
+        if risk_type == "var":
+            logging.warning("VaR is NOT a convex or coherent risk measure. Consider using CVaR instead for better optimization properties.")
     
     # NEW: Validate soft constraint configuration
     if "soft_constraint" in config:
