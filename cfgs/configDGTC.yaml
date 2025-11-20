@@ -1,21 +1,17 @@
-# ==============================================================================
-# config_vanilla_2inst.yaml - Stock + 1 Option
-# ==============================================================================
 training:
   learning_rate: 0.0001
   batch_size: 1000
   num_epochs: 400
-  weight_decay: 0.00001
-  optimizer: "AdamW"
+  weight_decay: 1.0e-05
+  optimizer: AdamW
   episodes: 400
   seed: 78020349
   gamma: 0.9999
   entropy_coefficient: 0.5
-  device: "cpu"
+  device: cpu
   checkpoint_frequency: 25
   plot_frequency: 100
   gradient_clip_max_norm: 1.0
-
 garch:
   omega: 1.593749e-07
   alpha: 2.308475e-06
@@ -23,23 +19,24 @@ garch:
   gamma: 342.870019
   lambda: 0.420499
   sigma0: 0.127037
-
 instruments:
   n_hedging_instruments: 2
-  strikes: [100]
-  types: ["call"]
-  maturities: [504]  # FIXED: Only hedging instrument maturity
+  strikes:
+  - 100
+  types:
+  - call
+  maturities:
+  - 504
 transaction_costs:
-    stock: 0.0001
-    vanilla_option: 0.001
-    barrier_option: 0.002
+  stock: 0.0001
+  vanilla_option: 0.001
+  barrier_option: 0.002
 hedged_option:
-  type: "vanilla"
+  type: vanilla
   K: 100
-  T: 1.0  # ADDED: Hedged option maturity (252 days)
-  option_type: "call"
-  side: "short"
-
+  T: 1.0
+  option_type: call
+  side: short
 simulation:
   S0: 100
   r: 0.042
@@ -47,28 +44,28 @@ simulation:
   contract_size: 1
   M: 1000
   N: 252
-
 environment:
   dt_min: 1.0e-10
-
 precomputation:
   N_quad: 256
   u_max: 500.0
-  device: "cpu"
-
+  device: cpu
 model:
   obs_dim: 5
   hidden_size: 128
   num_layers: 1
   lstm_layers: 1
-
 logging:
-  level: "INFO"
+  level: INFO
   log_file: null
-
 output:
-  model_save_path: "policy_net_vanilla_2inst.pth"
-  checkpoint_path: "policy_net_vanilla_2inst.pth"
-  plot_save_path: "hedge_comparison_vanilla_2inst_ep{episode}.png"
+  model_save_path: policy_net_vanilla_2inst.pth
+  checkpoint_path: policy_net_vanilla_2inst.pth
+  plot_save_path: hedge_comparison_vanilla_2inst_ep{episode}.png
   plot_dpi: 150
   sample_path_index: 1
+risk_measure:
+  type: mse
+soft_constraint:
+  enabled: false
+  lambda: 0.0

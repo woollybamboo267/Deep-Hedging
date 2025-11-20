@@ -61,3 +61,8 @@ training:
   weight_decay: 1.0e-05
 transaction_costs:
   TC: true
+risk_measure:
+  type: mse
+soft_constraint:
+  enabled: false
+  lambda: 0.0
