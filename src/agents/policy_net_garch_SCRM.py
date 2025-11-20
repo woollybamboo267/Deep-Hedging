@@ -653,7 +653,7 @@ class HedgingEnvGARCH:
         return terminal_error, trajectories
 
 
-def compute_loss_with_soft_constraint(terminal_error, trajectories, risk_measure='cvar', alpha=0.95, lambda_constraint=1.0):
+def compute_loss_with_soft_constraint(terminal_error, trajectories, risk_measure='mse', alpha=None, lambda_constraint=0.0):
     """
     Compute loss function with soft error constraint.
     
@@ -670,8 +670,8 @@ def compute_loss_with_soft_constraint(terminal_error, trajectories, risk_measure
         terminal_error: [M] terminal hedging errors (ξ_T^ϕθ)
         trajectories: Dict containing 'soft_constraint_violations' [M]
         risk_measure: 'mse', 'smse', 'cvar', 'variance', or 'mae'
-        alpha: CVaR confidence level (default: 0.95, meaning we look at worst 5%)
-        lambda_constraint: Weight for soft constraint penalty (default: 1.0)
+        alpha: CVaR confidence level (ONLY needed for 'cvar', e.g., 0.95 = worst 5%)
+        lambda_constraint: Weight for soft constraint penalty (default: 0.0)
     
     Returns:
         total_loss: Combined loss (risk measure + soft constraint penalty)
@@ -699,6 +699,9 @@ def compute_loss_with_soft_constraint(terminal_error, trajectories, risk_measure
         # CVaR_α is the expected value in the tail beyond VaR_α
         #
         # For α=0.95, we compute the mean of the worst 5% of errors
+        
+        if alpha is None:
+            raise ValueError("alpha parameter is required for CVaR risk measure")
         
         # Sort errors in descending order (worst first)
         sorted_errors, _ = torch.sort(terminal_error, descending=True)
@@ -737,47 +740,114 @@ def compute_loss_with_soft_constraint(terminal_error, trajectories, risk_measure
     return total_loss, risk_loss, constraint_penalty
 
 
-# Example usage in training loop:
-"""
-def train_step(policy_net, env, optimizer, risk_measure='cvar', alpha=0.95, lambda_constraint=1.0):
-    '''
-    Single training step with soft constraint.
+def train_episode(
+    episode: int,
+    config: Dict[str, Any],
+    policy_net: PolicyNetGARCH,
+    optimizer: torch.optim.Optimizer,
+    hedged_derivative,
+    hedging_derivatives,
+    HedgingSim,
+    device: torch.device
+) -> Dict[str, Any]:
+    """Train for a single episode with optional soft constraint."""
     
-    Args:
-        policy_net: Policy network
-        env: HedgingEnvGARCH environment
-        optimizer: PyTorch optimizer
-        risk_measure: Risk measure to use
-        alpha: CVaR confidence level
-        lambda_constraint: Weight for soft constraint (higher = stronger enforcement)
-    '''
-    optimizer.zero_grad()
+    hedged_cfg = config["hedged_option"]
     
-    # Simulate trajectory
-    S_trajectory, V_trajectory, O_trajectories, obs_sequence, all_positions = \
+    # Get transaction costs from config
+    transaction_costs = get_transaction_costs(config)
+    
+    # Get risk measure and soft constraint configuration
+    risk_config = config.get("risk_measure", {"type": "mse"})
+    constraint_config = config.get("soft_constraint", {"enabled": False, "lambda": 0.0})
+    
+    risk_measure = risk_config.get("type", "mse")
+    alpha = risk_config.get("alpha", None)  # Only needed for CVaR
+    lambda_constraint = constraint_config.get("lambda", 0.0) if constraint_config.get("enabled", False) else 0.0
+    
+    sim = HedgingSim(
+        S0=config["simulation"]["S0"],
+        K=hedged_cfg["K"],
+        m=0.1,
+        r=config["simulation"]["r"],
+        sigma=config["garch"]["sigma0"],
+        T=config["simulation"]["T"],
+        option_type=hedged_cfg["option_type"],
+        position=hedged_cfg["side"],
+        M=config["simulation"]["M"],
+        N=config["simulation"]["N"],
+        TCP=transaction_costs.get('stock', 0.0001),
+        seed=episode
+    )
+    
+    env = HedgingEnvGARCH(
+        sim=sim,
+        derivative=hedged_derivative,
+        hedging_derivatives=hedging_derivatives,
+        garch_params=config["garch"],
+        n_hedging_instruments=config["instruments"]["n_hedging_instruments"],
+        dt_min=config["environment"]["dt_min"],
+        device=str(device),
+        transaction_costs=transaction_costs
+    )
+    
+    env.reset()
+    
+    S_traj, V_traj, O_traj, obs_sequence, RL_positions = \
         env.simulate_trajectory_and_get_observations(policy_net)
     
-    # Compute terminal error and trajectories (includes soft constraint tracking)
-    terminal_error, trajectories = env.simulate_full_trajectory(all_positions, O_trajectories)
+    terminal_errors, trajectories = env.simulate_full_trajectory(RL_positions, O_traj)
+    
+    optimizer.zero_grad()
     
     # Compute loss with soft constraint
+    from src.agents.policy_net_garch_flexible import compute_loss_with_soft_constraint
+    
     total_loss, risk_loss, constraint_penalty = compute_loss_with_soft_constraint(
-        terminal_error, trajectories, 
-        risk_measure=risk_measure, 
-        alpha=alpha, 
+        terminal_errors, 
+        trajectories,
+        risk_measure=risk_measure,
+        alpha=alpha,
         lambda_constraint=lambda_constraint
     )
     
-    # Backward pass
     total_loss.backward()
+    
+    torch.nn.utils.clip_grad_norm_(
+        policy_net.parameters(),
+        max_norm=config["training"]["gradient_clip_max_norm"]
+    )
+    
     optimizer.step()
     
+    if torch.isnan(total_loss) or torch.isinf(total_loss):
+        logging.error("Loss became NaN/Inf")
+        raise RuntimeError("Loss became NaN/Inf")
+    
+    final_reward = -float(total_loss.item())
+    
+    # Enhanced logging with constraint info
+    log_msg = (
+        f"Episode {episode} | Final Reward: {final_reward:.6f} | "
+        f"Total Loss: {total_loss.item():.6f} | Risk Loss: {risk_loss.item():.6f}"
+    )
+    
+    if lambda_constraint > 0:
+        avg_violation = trajectories['soft_constraint_violations'].mean().item()
+        log_msg += f" | Constraint Penalty: {constraint_penalty.item():.6f} | Avg Violation: {avg_violation:.6f}"
+    
+    logging.info(log_msg)
+    
     return {
-        'total_loss': total_loss.item(),
-        'risk_loss': risk_loss.item(),
-        'constraint_penalty': constraint_penalty.item(),
-        'terminal_error_mean': terminal_error.mean().item(),
-        'terminal_error_std': terminal_error.std().item(),
-        'avg_soft_violation': trajectories['soft_constraint_violations'].mean().item()
+        "episode": episode,
+        "loss": total_loss.item(),
+        "risk_loss": risk_loss.item(),
+        "constraint_penalty": constraint_penalty.item(),
+        "reward": final_reward,
+        "trajectories": trajectories,
+        "RL_positions": RL_positions,
+        "S_traj": S_traj,
+        "V_traj": V_traj,
+        "O_traj": O_traj,
+        "env": env
     }
-"""
