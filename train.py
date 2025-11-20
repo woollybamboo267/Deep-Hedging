@@ -8,6 +8,9 @@ a more modular, configuration-driven approach.
 Supports vanilla European, barrier, American, and Asian options.
 Automatically detects and uses CUDA if available, otherwise falls back to CPU.
 
+NEW: Supports configurable risk measures (MSE, SMSE, CVaR, Variance, MAE)
+     and soft error constraint tracking.
+
 Usage:
     python train.py --config cfgs/config_vanilla_2inst.yaml
     python train.py --config cfgs/config_barrier_2inst.yaml
@@ -25,7 +28,11 @@ import sys
 from pathlib import Path
 from typing import Dict, Any, Optional
 
-from src.agents.policy_net_garch_flexible import PolicyNetGARCH, HedgingEnvGARCH
+from src.agents.policy_net_garch_SCRM import (
+    PolicyNetGARCH, 
+    HedgingEnvGARCH,
+    compute_loss_with_soft_constraint
+)
 from src.option_greek.precompute import create_precomputation_manager_from_config
 from src.visualization.plot_results import compute_rl_metrics
 from derivative_factory import setup_derivatives_from_precomputed
@@ -113,7 +120,7 @@ def get_transaction_costs(config: Dict[str, Any]) -> Dict[str, float]:
 
 
 def validate_config(config: Dict[str, Any]) -> None:
-    """Validate configuration parameters."""
+    """Validate configuration parameters including risk measure and soft constraint."""
     n_inst = config["instruments"]["n_hedging_instruments"]
     
     if n_inst < 1 or n_inst > 4:
@@ -164,6 +171,31 @@ def validate_config(config: Dict[str, Any]) -> None:
     # Validate that American and Asian options have model_path if needed
     if deriv_type in ["american", "asian"] and "model_path" not in hedged_cfg:
         logging.warning(f"{deriv_type.capitalize()} option specified but no model_path provided in config")
+    
+    # NEW: Validate risk measure configuration
+    if "risk_measure" in config:
+        risk_config = config["risk_measure"]
+        valid_risk_measures = ["mse", "smse", "cvar", "variance", "mae"]
+        risk_type = risk_config.get("type", "mse")
+        
+        if risk_type not in valid_risk_measures:
+            raise ValueError(f"Invalid risk_measure type: {risk_type}. Must be one of {valid_risk_measures}")
+        
+        # CVaR requires alpha parameter
+        if risk_type == "cvar" and "alpha" not in risk_config:
+            raise ValueError("risk_measure type 'cvar' requires 'alpha' parameter")
+        
+        # Warn if alpha is provided for non-CVaR measures
+        if risk_type != "cvar" and "alpha" in risk_config:
+            logging.warning(f"alpha parameter is ignored for risk_measure type '{risk_type}' (only used for 'cvar')")
+    
+    # NEW: Validate soft constraint configuration
+    if "soft_constraint" in config:
+        constraint_config = config["soft_constraint"]
+        if "enabled" not in constraint_config:
+            logging.warning("soft_constraint section found but 'enabled' not specified, defaulting to false")
+        if "lambda" not in constraint_config:
+            logging.warning("soft_constraint section found but 'lambda' not specified, defaulting to 0.0")
     
     logging.info("Configuration validation passed")
 
@@ -227,12 +259,20 @@ def train_episode(
     HedgingSim,
     device: torch.device
 ) -> Dict[str, Any]:
-    """Train for a single episode."""
+    """Train for a single episode with configurable risk measure and soft constraint."""
     
     hedged_cfg = config["hedged_option"]
     
     # Get transaction costs from config
     transaction_costs = get_transaction_costs(config)
+    
+    # NEW: Get risk measure and soft constraint configuration
+    risk_config = config.get("risk_measure", {"type": "mse"})
+    constraint_config = config.get("soft_constraint", {"enabled": False, "lambda": 0.0})
+    
+    risk_measure = risk_config.get("type", "mse")
+    alpha = risk_config.get("alpha", None)  # Only needed for CVaR
+    lambda_constraint = constraint_config.get("lambda", 0.0) if constraint_config.get("enabled", False) else 0.0
     
     sim = HedgingSim(
         S0=config["simulation"]["S0"],
@@ -268,8 +308,17 @@ def train_episode(
     terminal_errors, trajectories = env.simulate_full_trajectory(RL_positions, O_traj)
     
     optimizer.zero_grad()
-    loss = torch.abs(terminal_errors).mean()
-    loss.backward()
+    
+    # NEW: Compute loss with configurable risk measure and soft constraint
+    total_loss, risk_loss, constraint_penalty = compute_loss_with_soft_constraint(
+        terminal_errors, 
+        trajectories,
+        risk_measure=risk_measure,
+        alpha=alpha,
+        lambda_constraint=lambda_constraint
+    )
+    
+    total_loss.backward()
     
     torch.nn.utils.clip_grad_norm_(
         policy_net.parameters(),
@@ -278,27 +327,46 @@ def train_episode(
     
     optimizer.step()
     
-    if torch.isnan(loss) or torch.isinf(loss):
+    if torch.isnan(total_loss) or torch.isinf(total_loss):
         logging.error("Loss became NaN/Inf")
         raise RuntimeError("Loss became NaN/Inf")
     
-    final_reward = -float(loss.item())
+    final_reward = -float(total_loss.item())
     
-    logging.info(
-        f"Episode {episode} | Final Reward: {final_reward:.6f} | "
-        f"Total Loss: {loss.item():.6f}"
+    # NEW: Enhanced logging with risk measure and constraint info
+    log_msg = (
+        f"Episode {episode} | "
+        f"Risk: {risk_measure.upper()} | "
+        f"Total Loss: {total_loss.item():.6f} | "
+        f"Risk Loss: {risk_loss.item():.6f}"
     )
+    
+    if lambda_constraint > 0:
+        avg_violation = trajectories['soft_constraint_violations'].mean().item()
+        log_msg += (
+            f" | Constraint Penalty: {constraint_penalty.item():.6f} "
+            f"(λ={lambda_constraint}) | "
+            f"Avg Violation: {avg_violation:.6f}"
+        )
+    
+    log_msg += f" | Final Reward: {final_reward:.6f}"
+    
+    logging.info(log_msg)
     
     return {
         "episode": episode,
-        "loss": loss.item(),
+        "loss": total_loss.item(),
+        "risk_loss": risk_loss.item(),
+        "constraint_penalty": constraint_penalty.item(),
         "reward": final_reward,
         "trajectories": trajectories,
         "RL_positions": RL_positions,
         "S_traj": S_traj,
         "V_traj": V_traj,
         "O_traj": O_traj,
-        "env": env
+        "env": env,
+        "risk_measure": risk_measure,
+        "lambda_constraint": lambda_constraint
     }
 
 
@@ -375,10 +443,33 @@ def run_inference(
         f"SMSE: {rl_metrics['smse']:.6f} | CVaR95: {rl_metrics['cvar_95']:.6f}"
     )
     
+    # NEW: Also compute and log the configured risk measure
+    risk_config = config.get("risk_measure", {"type": "mse"})
+    constraint_config = config.get("soft_constraint", {"enabled": False, "lambda": 0.0})
+    
+    risk_measure = risk_config.get("type", "mse")
+    alpha = risk_config.get("alpha", None)
+    lambda_constraint = constraint_config.get("lambda", 0.0) if constraint_config.get("enabled", False) else 0.0
+    
+    total_loss, risk_loss, constraint_penalty = compute_loss_with_soft_constraint(
+        terminal_errors,
+        trajectories,
+        risk_measure=risk_measure,
+        alpha=alpha,
+        lambda_constraint=lambda_constraint
+    )
+    
+    logging.info(
+        f"Configured Risk Measure ({risk_measure.upper()}): {risk_loss.item():.6f} | "
+        f"Constraint Penalty: {constraint_penalty.item():.6f}"
+    )
+    
     metrics = {
         "episode": 0,
-        "loss": float(torch.abs(terminal_errors).mean().item()),
-        "reward": -float(torch.abs(terminal_errors).mean().item()),
+        "loss": total_loss.item(),
+        "risk_loss": risk_loss.item(),
+        "constraint_penalty": constraint_penalty.item(),
+        "reward": -float(total_loss.item()),
         "trajectories": trajectories,
         "RL_positions": RL_positions,
         "S_traj": S_traj,
@@ -411,6 +502,20 @@ def train(
     
     device = torch.device(config["training"]["device"])
     logging.info(f"Using device: {device}")
+    
+    # NEW: Log risk measure and soft constraint configuration
+    risk_config = config.get("risk_measure", {"type": "mse"})
+    constraint_config = config.get("soft_constraint", {"enabled": False, "lambda": 0.0})
+    
+    logging.info("=" * 70)
+    logging.info("RISK MEASURE & SOFT CONSTRAINT CONFIGURATION")
+    logging.info(f"Risk Measure: {risk_config.get('type', 'mse').upper()}")
+    if risk_config.get('type') == 'cvar':
+        logging.info(f"CVaR Alpha: {risk_config.get('alpha', 0.95)}")
+    logging.info(f"Soft Constraint Enabled: {constraint_config.get('enabled', False)}")
+    if constraint_config.get('enabled', False):
+        logging.info(f"Constraint Lambda: {constraint_config.get('lambda', 0.0)}")
+    logging.info("=" * 70)
     
     policy_net = create_policy_network(config, device)
     
