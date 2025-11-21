@@ -758,7 +758,6 @@ def main():
         logging.info(f"Loading pretrained model from {args.load_model}")
         initial_model = create_policy_network(config, device)
         initial_model.load_state_dict(torch.load(args.load_model, map_location=device))
-        logging.info("Model loaded - will continue training from checkpoint")_dict(torch.load(args.load_model, map_location=device))
         logging.info("Model loaded - will continue training from checkpoint")
     
     policy_net = train(
