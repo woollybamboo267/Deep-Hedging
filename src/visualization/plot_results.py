@@ -360,9 +360,6 @@ def plot_episode_results(
         import os
         config_name = config.get("experiment_name")
         
-        if config_name is None:
-            # Try to get
-        
         # Build comprehensive title starting with config name
         greek_labels = {1: 'Delta', 2: 'Delta-Gamma', 3: 'Delta-Gamma-Vega', 4: 'Delta-Gamma-Vega-Theta'}
         hedged_option_type = config["hedged_option"]["type"].capitalize()
