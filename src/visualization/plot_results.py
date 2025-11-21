@@ -2,9 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 import logging
-from typing import Dict, Any, Tuple
-import time
-from tqdm import tqdm
+from typing import Dict, Any, Tuple, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -45,16 +43,28 @@ def compute_practitioner_benchmark(
     # Compute terminal hedge errors
     S_final = trajectories_hn['S'][:, -1]
     
-    # Compute payoff
+    # Compute payoff based on derivative type
     if hasattr(env.derivative, 'option_type'):
         opt_type = env.derivative.option_type.lower()
     else:
         opt_type = env.option_type.lower()
     
-    if opt_type == "call":
-        payoff = torch.clamp(S_final - env.K, min=0.0)
+    # Handle Asian option payoff
+    if hasattr(env, 'is_asian_hedged') and env.is_asian_hedged:
+        # For Asian options, need running average A
+        # Reconstruct it from trajectory
+        A_hedged = env._reconstruct_running_average(trajectories_hn['S'])
+        if opt_type == "call":
+            payoff = torch.clamp(A_hedged - env.K, min=0.0)
+        else:
+            payoff = torch.clamp(env.K - A_hedged, min=0.0)
     else:
-        payoff = torch.clamp(env.K - S_final, min=0.0)
+        # Standard European payoff
+        if opt_type == "call":
+            payoff = torch.clamp(S_final - env.K, min=0.0)
+        else:
+            payoff = torch.clamp(env.K - S_final, min=0.0)
+    
     payoff = payoff * env.contract_size
     
     terminal_value_hn = trajectories_hn['B'][:, -1] + HN_positions_all[:, -1, 0] * S_final
@@ -82,10 +92,20 @@ def compute_rl_metrics(
     else:
         opt_type = env.option_type.lower()
     
-    if opt_type == "call":
-        payoff = torch.clamp(S_final - env.K, min=0.0)
+    # Handle Asian option payoff
+    if hasattr(env, 'is_asian_hedged') and env.is_asian_hedged:
+        # For Asian options, need running average A
+        A_hedged = env._reconstruct_running_average(trajectories['S'])
+        if opt_type == "call":
+            payoff = torch.clamp(A_hedged - env.K, min=0.0)
+        else:
+            payoff = torch.clamp(env.K - A_hedged, min=0.0)
     else:
-        payoff = torch.clamp(env.K - S_final, min=0.0)
+        # Standard European payoff
+        if opt_type == "call":
+            payoff = torch.clamp(S_final - env.K, min=0.0)
+        else:
+            payoff = torch.clamp(env.K - S_final, min=0.0)
     
     payoff = payoff * env.contract_size
     
@@ -100,14 +120,55 @@ def compute_rl_metrics(
     mse_rl = float(np.mean(terminal_hedge_error_rl ** 2))
     smse_rl = mse_rl / (env.S0 ** 2)
     cvar_95_rl = float(np.mean(np.sort(terminal_hedge_error_rl ** 2)[-int(0.05 * env.M):]))
+    mae_rl = float(np.mean(np.abs(terminal_hedge_error_rl)))
     
     metrics = {
         'mse': mse_rl,
         'smse': smse_rl,
-        'cvar_95': cvar_95_rl
+        'cvar_95': cvar_95_rl,
+        'mae': mae_rl
     }
     
     return terminal_hedge_error_rl, metrics
+
+
+def compute_risk_measure_value(terminal_errors: np.ndarray, risk_measure: str, alpha: Optional[float] = None) -> float:
+    """
+    Compute the value of a specific risk measure on terminal errors.
+    
+    Args:
+        terminal_errors: Array of terminal hedging errors
+        risk_measure: 'mse', 'smse', 'cvar', 'var', or 'mae'
+        alpha: Confidence level for CVaR or VaR (e.g., 0.95)
+    
+    Returns:
+        Risk measure value
+    """
+    if risk_measure == 'mse':
+        return float(np.mean(terminal_errors ** 2))
+    
+    elif risk_measure == 'smse':
+        positive_mask = (terminal_errors >= 0)
+        return float(np.mean((terminal_errors ** 2) * positive_mask))
+    
+    elif risk_measure == 'cvar':
+        if alpha is None:
+            alpha = 0.95
+        sorted_errors = np.sort(terminal_errors)[::-1]  # Descending
+        n_tail = max(1, int(np.ceil(len(sorted_errors) * (1 - alpha))))
+        return float(np.mean(sorted_errors[:n_tail]))
+    
+    elif risk_measure == 'var':
+        if alpha is None:
+            alpha = 0.95
+        return float(np.quantile(terminal_errors, alpha))
+    
+    elif risk_measure == 'mae':
+        return float(np.mean(np.abs(terminal_errors)))
+    
+    else:
+        # Default to MSE
+        return float(np.mean(terminal_errors ** 2))
 
 
 def plot_episode_results(
@@ -115,7 +176,7 @@ def plot_episode_results(
     metrics: Dict[str, Any],
     config: Dict[str, Any]
 ) -> None:
-    """Create comprehensive visualization of episode results."""
+    """Create comprehensive visualization of episode results with full support for all models."""
     try:
         logger.info(f"Generating plots for episode {episode}")
         
@@ -126,6 +187,17 @@ def plot_episode_results(
         S_traj = metrics['S_traj']
         V_traj = metrics['V_traj']
         O_traj = metrics['O_traj']
+        
+        # Extract training configuration
+        risk_measure = metrics.get('risk_measure', 'mse')
+        lambda_constraint = metrics.get('lambda_constraint', 0.0)
+        risk_loss = metrics.get('risk_loss', 0.0)
+        constraint_penalty = metrics.get('constraint_penalty', 0.0)
+        total_loss = metrics.get('loss', 0.0)
+        
+        # Get risk measure alpha if applicable
+        risk_config = config.get("risk_measure", {})
+        alpha = risk_config.get("alpha", 0.95)
         
         n_inst = config["instruments"]["n_hedging_instruments"]
         path_idx = config["output"]["sample_path_index"]
@@ -145,13 +217,25 @@ def plot_episode_results(
         HN_positions_all, trajectories_hn, terminal_hedge_error_hn = \
             compute_practitioner_benchmark(env, S_traj, O_traj, n_inst)
         
-        # Compute HN metrics
+        # Compute HN metrics (standard)
         mse_hn = float(np.mean(terminal_hedge_error_hn ** 2))
         smse_hn = mse_hn / (env.S0 ** 2)
         cvar_95_hn = float(np.mean(np.sort(terminal_hedge_error_hn ** 2)[-int(0.05 * env.M):]))
+        mae_hn = float(np.mean(np.abs(terminal_hedge_error_hn)))
         
-        # Create figure with subplots
-        fig, axes = plt.subplots(3, 2, figsize=(14, 14))
+        # Compute the ACTUAL training objective for both strategies
+        rl_training_objective = compute_risk_measure_value(terminal_hedge_error_rl, risk_measure, alpha)
+        hn_training_objective = compute_risk_measure_value(terminal_hedge_error_hn, risk_measure, alpha)
+        
+        # Determine if soft constraints are active
+        has_soft_constraint = lambda_constraint > 0 and 'soft_constraint_violations' in trajectories
+        
+        # Create figure with appropriate number of subplots
+        if has_soft_constraint:
+            fig, axes = plt.subplots(4, 2, figsize=(14, 18))
+        else:
+            fig, axes = plt.subplots(3, 2, figsize=(14, 14))
+        
         time_steps = np.arange(env.N + 1)
         
         # Extract sample paths for plotting
@@ -269,17 +353,99 @@ def plot_episode_results(
         axes[2, 1].set_xlabel("Terminal Hedge Error", fontsize=11)
         axes[2, 1].set_ylabel("Frequency", fontsize=11)
         
+        # Build comprehensive title with training objective
         greek_labels = {1: 'Delta', 2: 'Delta-Gamma', 3: 'Delta-Gamma-Vega', 4: 'Delta-Gamma-Vega-Theta'}
         hedged_option_type = config["hedged_option"]["type"].capitalize()
         
-        title_text = (f"Episode {episode} - {n_inst} Instruments ({greek_labels[n_inst]}) - Hedging {hedged_option_type}\n"
-                    f"RL: MSE={rl_metrics['mse']:.4f} | SMSE={rl_metrics['smse']:.6f} | CVaR95={rl_metrics['cvar_95']:.4f}\n"
-                    f"Prac: MSE={mse_hn:.4f} | SMSE={smse_hn:.6f} | CVaR95={cvar_95_hn:.4f}")
-        axes[2, 1].set_title(title_text, fontsize=10)
+        risk_display_names = {
+            'mse': 'MSE',
+            'smse': 'SMSE',
+            'cvar': f'CVaR_{int(alpha*100)}',
+            'var': f'VaR_{int(alpha*100)}',
+            'mae': 'MAE'
+        }
+        
+        risk_display = risk_display_names.get(risk_measure, risk_measure.upper())
+        
+        title_text = (
+            f"Episode {episode} - {n_inst} Instruments ({greek_labels[n_inst]}) - Hedging {hedged_option_type}\n"
+            f"Training Objective: {risk_display}"
+        )
+        
+        if has_soft_constraint:
+            title_text += f" + λ·SC (λ={lambda_constraint:.4f})"
+        
+        title_text += "\n"
+        
+        # Show training objective values
+        title_text += f"RL {risk_display}={rl_training_objective:.4f} | Prac {risk_display}={hn_training_objective:.4f}"
+        
+        if has_soft_constraint:
+            avg_violation_rl = trajectories['soft_constraint_violations'].mean().cpu().item()
+            avg_violation_hn = trajectories_hn.get('soft_constraint_violations', torch.zeros(1)).mean().cpu().item() if 'soft_constraint_violations' in trajectories_hn else 0.0
+            title_text += f"\nRL Constr={avg_violation_rl:.4f} | Prac Constr={avg_violation_hn:.4f}"
+        
+        # Add standard metrics for reference
+        title_text += f"\nStandard Metrics - RL: MSE={rl_metrics['mse']:.4f} MAE={rl_metrics['mae']:.4f} | Prac: MSE={mse_hn:.4f} MAE={mae_hn:.4f}"
+        
+        axes[2, 1].set_title(title_text, fontsize=9)
         axes[2, 1].legend(fontsize=10)
         axes[2, 1].grid(True, alpha=0.3)
         
-        # Save plot - FIXED: only use episode parameter
+        # PLOT 7 & 8: Soft Constraint Visualizations (if enabled)
+        if has_soft_constraint:
+            violations_rl = trajectories['soft_constraint_violations'].cpu().numpy()
+            violations_hn = trajectories_hn.get('soft_constraint_violations', 
+                                                 torch.zeros_like(trajectories['soft_constraint_violations'])).cpu().numpy()
+            
+            # PLOT 7: Accumulated Constraint Violations Distribution
+            axes[3, 0].hist(violations_rl, bins=50, color="tab:blue", alpha=0.7,
+                           edgecolor='black', label='RL')
+            axes[3, 0].hist(violations_hn, bins=50, color="tab:orange", alpha=0.7,
+                           edgecolor='black', label='Practitioner')
+            axes[3, 0].axvline(x=0, color='r', linestyle='--', linewidth=2)
+            axes[3, 0].set_xlabel("Accumulated Constraint Violations", fontsize=11)
+            axes[3, 0].set_ylabel("Frequency", fontsize=11)
+            axes[3, 0].set_title("Soft Constraint Violations: ∑max(0, P_t - V_t)", fontsize=12)
+            axes[3, 0].legend(fontsize=10)
+            axes[3, 0].grid(True, alpha=0.3)
+            
+            # PLOT 8: Violation Statistics
+            axes[3, 1].axis('off')
+            
+            # Compute violation statistics
+            rl_violation_pct = (violations_rl > 0).sum() / len(violations_rl) * 100
+            hn_violation_pct = (violations_hn > 0).sum() / len(violations_hn) * 100
+            
+            rl_mean_violation = violations_rl.mean()
+            hn_mean_violation = violations_hn.mean()
+            
+            rl_max_violation = violations_rl.max()
+            hn_max_violation = violations_hn.max()
+            
+            stats_text = (
+                "Soft Constraint Statistics\n"
+                "─" * 40 + "\n\n"
+                f"Constraint Weight (λ): {lambda_constraint:.4f}\n"
+                f"Constraint Penalty: {constraint_penalty:.4f}\n\n"
+                "RL Strategy:\n"
+                f"  • Violation Rate: {rl_violation_pct:.1f}%\n"
+                f"  • Mean Violation: {rl_mean_violation:.4f}\n"
+                f"  • Max Violation: {rl_max_violation:.4f}\n\n"
+                "Practitioner Strategy:\n"
+                f"  • Violation Rate: {hn_violation_pct:.1f}%\n"
+                f"  • Mean Violation: {hn_mean_violation:.4f}\n"
+                f"  • Max Violation: {hn_max_violation:.4f}\n\n"
+                "Interpretation:\n"
+                f"  • Violations occur when P_t > V_t\n"
+                f"  • Penalty = λ × mean(violations)\n"
+                f"  • Lower is better"
+            )
+            
+            axes[3, 1].text(0.1, 0.5, stats_text, transform=axes[3, 1].transAxes,
+                           fontsize=10, verticalalignment='center', family='monospace')
+        
+        # Save plot
         fig.tight_layout()
         save_path = config["output"]["plot_save_path"].format(episode=episode)
         plt.savefig(save_path, dpi=config["output"]["plot_dpi"], bbox_inches='tight')
