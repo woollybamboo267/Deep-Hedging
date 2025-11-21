@@ -812,9 +812,7 @@ def train_episode(
     
     optimizer.zero_grad()
     
-    # Compute loss with soft constraint
-    from src.agents.policy_net_garch_flexible import compute_loss_with_soft_constraint
-    
+    # Compute loss with soft constraint    
     total_loss, risk_loss, constraint_penalty = compute_loss_with_soft_constraint(
         terminal_errors, 
         trajectories,
