@@ -382,10 +382,18 @@ def train_episode(
 def save_checkpoint(
     policy_net: PolicyNetGARCH,
     config: Dict[str, Any],
-    episode: int
+    episode: int,
+    config_name: str
 ) -> None:
-    """Save model checkpoint."""
-    checkpoint_path = config["output"]["checkpoint_path"]
+    """Save model checkpoint with config name in filename."""
+    checkpoint_dir = os.path.dirname(config["output"]["checkpoint_path"])
+    
+    # Create checkpoint filename with config name and episode number
+    checkpoint_filename = f"{config_name}_episode_{episode}.pth"
+    checkpoint_path = os.path.join(checkpoint_dir, checkpoint_filename)
+    
+    # Ensure directory exists
+    os.makedirs(checkpoint_dir, exist_ok=True)
     
     torch.save(policy_net.state_dict(), checkpoint_path)
     logging.info(f"Checkpoint saved at episode {episode}: {checkpoint_path}")
@@ -501,7 +509,8 @@ def train(
     hedged_derivative,
     hedging_derivatives,
     visualize: bool = True,
-    initial_model: Optional[PolicyNetGARCH] = None
+    initial_model: Optional[PolicyNetGARCH] = None,
+    config_name: str = "config"
 ) -> PolicyNetGARCH:
     """Main training loop."""
     
@@ -558,7 +567,7 @@ def train(
             )
             
             if episode % checkpoint_freq == 0:
-                save_checkpoint(policy_net, config, episode)
+                save_checkpoint(policy_net, config, episode, config_name)
             
             if visualize and episode % plot_freq == 0:
                 try:
@@ -571,7 +580,12 @@ def train(
             logging.exception(f"Error during episode {episode}: {e}")
             raise
     
-    final_path = config["output"]["model_save_path"]
+    # Save final model with config name
+    final_dir = os.path.dirname(config["output"]["model_save_path"])
+    final_filename = f"{config_name}_final.pth"
+    final_path = os.path.join(final_dir, final_filename)
+    
+    os.makedirs(final_dir, exist_ok=True)
     torch.save(policy_net.state_dict(), final_path)
     logging.info(f"Training finished. Model saved to {final_path}")
     
@@ -608,6 +622,9 @@ def main():
     
     args = parser.parse_args()
     
+    # Extract config name from the actual command-line argument
+    config_name = os.path.basename(args.config).replace('.yaml', '').replace('.yml', '')
+    
     config = load_config(args.config)
     
     # ============================================================
@@ -621,6 +638,7 @@ def main():
     setup_logging(config)
     
     logging.info("=" * 70)
+    logging.info(f"CONFIGURATION: {config_name}")
     logging.info(f"DEVICE CONFIGURATION: {auto_device.upper()}")
     if auto_device == "cuda":
         logging.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
@@ -713,7 +731,8 @@ def main():
         hedged_derivative=hedged_derivative,
         hedging_derivatives=hedging_derivatives,
         visualize=not args.no_visualize,
-        initial_model=initial_model
+        initial_model=initial_model,
+        config_name=config_name
     )
     
     logging.info("Training complete!")
