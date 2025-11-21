@@ -75,10 +75,19 @@ def load_config(config_path: str) -> Dict[str, Any]:
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     
-    # Add the config filename to the config dict for plot titles
-    config["config_name"] = os.path.basename(config_path).replace('.yaml', '')
+    # Extract config name without 'config' prefix and without extension
+    # e.g., 'configABCDEF.yaml' -> 'ABCDEF'
+    config_filename = os.path.basename(config_path)
+    config_name = config_filename.replace('.yaml', '').replace('.yml', '')
+    
+    # Remove 'config' prefix if present (case-insensitive)
+    if config_name.lower().startswith('config'):
+        config_name = config_name[6:]  # Remove first 6 characters ('config')
+    
+    config["config_name"] = config_name
     
     logging.info(f"Loaded configuration from {config_path}")
+    logging.info(f"Config name extracted: {config_name}")
     return config
 
 
@@ -386,14 +395,27 @@ def save_checkpoint(
     config_name: str
 ) -> None:
     """Save model checkpoint with config name in filename."""
-    checkpoint_dir = os.path.dirname(config["output"]["checkpoint_path"])
+    # Determine hedging instrument name based on n_hedging_instruments
+    n_inst = config["instruments"]["n_hedging_instruments"]
     
-    # Create checkpoint filename with config name and episode number
-    checkpoint_filename = f"{config_name}_episode_{episode}.pth"
-    checkpoint_path = os.path.join(checkpoint_dir, checkpoint_filename)
+    if n_inst == 1:
+        instrument_name = "stock_only"
+    elif n_inst == 2:
+        instrument_name = "2inst"
+    elif n_inst == 3:
+        instrument_name = "3inst"
+    elif n_inst == 4:
+        instrument_name = "4inst"
+    else:
+        instrument_name = f"{n_inst}inst"
     
-    # Ensure directory exists
+    # Create checkpoint directory: models/{instrument_name}/checkpoint
+    checkpoint_dir = os.path.join("models", instrument_name, "checkpoint")
     os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # Create checkpoint filename: {config_name}.pth
+    checkpoint_filename = f"{config_name}.pth"
+    checkpoint_path = os.path.join(checkpoint_dir, checkpoint_filename)
     
     torch.save(policy_net.state_dict(), checkpoint_path)
     logging.info(f"Checkpoint saved at episode {episode}: {checkpoint_path}")
@@ -580,9 +602,22 @@ def train(
             logging.exception(f"Error during episode {episode}: {e}")
             raise
     
-    # Save final model with config name
-    final_dir = os.path.dirname(config["output"]["model_save_path"])
-    final_filename = f"{config_name}_final.pth"
+    # Save final model with config name in models/{instrument_name}/checkpoint
+    n_inst = config["instruments"]["n_hedging_instruments"]
+    
+    if n_inst == 1:
+        instrument_name = "stock_only"
+    elif n_inst == 2:
+        instrument_name = "2inst"
+    elif n_inst == 3:
+        instrument_name = "3inst"
+    elif n_inst == 4:
+        instrument_name = "4inst"
+    else:
+        instrument_name = f"{n_inst}inst"
+    
+    final_dir = os.path.join("models", instrument_name, "checkpoint")
+    final_filename = f"{config_name}.pth"
     final_path = os.path.join(final_dir, final_filename)
     
     os.makedirs(final_dir, exist_ok=True)
@@ -622,10 +657,10 @@ def main():
     
     args = parser.parse_args()
     
-    # Extract config name from the actual command-line argument
-    config_name = os.path.basename(args.config).replace('.yaml', '').replace('.yml', '')
-    
     config = load_config(args.config)
+    
+    # Extract config name from the config dict (already processed in load_config)
+    config_name = config.get("config_name", "model")
     
     # ============================================================
     # AUTO-DETECT DEVICE: Use CUDA if available, otherwise CPU
@@ -723,6 +758,7 @@ def main():
         logging.info(f"Loading pretrained model from {args.load_model}")
         initial_model = create_policy_network(config, device)
         initial_model.load_state_dict(torch.load(args.load_model, map_location=device))
+        logging.info("Model loaded - will continue training from checkpoint")_dict(torch.load(args.load_model, map_location=device))
         logging.info("Model loaded - will continue training from checkpoint")
     
     policy_net = train(
