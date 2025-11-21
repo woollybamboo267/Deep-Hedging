@@ -25,6 +25,7 @@ import numpy as np
 import logging
 import argparse
 import sys
+import os
 from pathlib import Path
 from typing import Dict, Any, Optional
 
@@ -73,6 +74,10 @@ def load_config(config_path: str) -> Dict[str, Any]:
     """Load configuration from YAML file."""
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
+    
+    # Add the config filename to the config dict for plot titles
+    config["config_name"] = os.path.basename(config_path).replace('.yaml', '')
+    
     logging.info(f"Loaded configuration from {config_path}")
     return config
 
