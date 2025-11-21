@@ -353,7 +353,17 @@ def plot_episode_results(
         axes[2, 1].set_xlabel("Terminal Hedge Error", fontsize=11)
         axes[2, 1].set_ylabel("Frequency", fontsize=11)
         
-        # Build comprehensive title with training objective
+        # ============================================================
+        # MODIFIED: Use config name as the main title
+        # ============================================================
+        # Extract config name (priority: experiment_name > config_file > plot_save_path dirname)
+        import os
+        config_name = config.get("experiment_name")
+        
+        if config_name is None:
+            # Try to get
+        
+        # Build comprehensive title starting with config name
         greek_labels = {1: 'Delta', 2: 'Delta-Gamma', 3: 'Delta-Gamma-Vega', 4: 'Delta-Gamma-Vega-Theta'}
         hedged_option_type = config["hedged_option"]["type"].capitalize()
         
@@ -367,7 +377,9 @@ def plot_episode_results(
         
         risk_display = risk_display_names.get(risk_measure, risk_measure.upper())
         
-        title_text = (
+        # Start with config name as main title
+        title_text = f"{config_name}\n"
+        title_text += (
             f"Episode {episode} - {n_inst} Instruments ({greek_labels[n_inst]}) - Hedging {hedged_option_type}\n"
             f"Training Objective: {risk_display}"
         )
