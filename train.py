@@ -1,777 +1,738 @@
-"""
-Main training script for GARCH-based option hedging with RL.
-
-This script loads configuration from YAML, initializes all components,
-and runs the training loop. It replaces the train_garch function with
-a more modular, configuration-driven approach.
-
-Supports vanilla European, barrier, American, and Asian options.
-Automatically detects and uses CUDA if available, otherwise falls back to CPU.
-
-NEW: Supports configurable risk measures (MSE, SMSE, CVaR, Variance, MAE)
-     and soft error constraint tracking.
-
-Usage:
-    python train.py --config cfgs/config_vanilla_2inst.yaml
-    python train.py --config cfgs/config_barrier_2inst.yaml
-    python train.py --config cfgs/config_american_1inst.yaml
-    python train.py --config cfgs/config_asian_2inst.yaml
-    python train.py --config cfgs/config.yaml --load-model models/uniform/GARCHLSTMDG.pth --inference-only
-"""
-
-import yaml
-import torch
 import numpy as np
+import matplotlib.pyplot as plt
+import torch
 import logging
-import argparse
-import sys
 import os
-from pathlib import Path
-from typing import Dict, Any, Optional
-
-from src.agents.policy_net_garch_SCRM import (
-    PolicyNetGARCH, 
-    HedgingEnvGARCH,
-    compute_loss_with_soft_constraint
-)
-from src.option_greek.precompute import create_precomputation_manager_from_config
-from src.visualization.plot_results import compute_rl_metrics
-from derivative_factory import setup_derivatives_from_precomputed
-
+from typing import Dict, Any, Tuple, Optional
 
 logger = logging.getLogger(__name__)
 
 
-def auto_detect_device() -> str:
-    """Auto-detect device: use CUDA if available, otherwise CPU."""
-    if torch.cuda.is_available():
-        device_name = torch.cuda.get_device_name(0)
-        logging.info(f"CUDA is available! Detected GPU: {device_name}")
-        return "cuda"
-    else:
-        logging.info("CUDA not available. Using CPU.")
-        return "cpu"
-
-
-def setup_logging(config: Dict[str, Any]) -> None:
-    """Setup logging based on configuration."""
-    log_level = getattr(logging, config["logging"]["level"])
-    log_file = config["logging"].get("log_file")
-    
-    handlers = [logging.StreamHandler()]
-    if log_file:
-        handlers.append(logging.FileHandler(log_file))
-    
-    logging.basicConfig(
-        level=log_level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=handlers,
-        force=True
-    )
-
-
-def load_config(config_path: str) -> Dict[str, Any]:
-    """Load configuration from YAML file."""
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    
-    # Extract config name without 'config' prefix and without extension
-    # e.g., 'configABCDEF.yaml' -> 'ABCDEF'
-    config_filename = os.path.basename(config_path)
-    config_name = config_filename.replace('.yaml', '').replace('.yml', '')
-    
-    # Remove 'config' prefix if present (case-insensitive)
-    if config_name.lower().startswith('config'):
-        config_name = config_name[6:]  # Remove first 6 characters ('config')
-    
-    config["config_name"] = config_name
-    
-    logging.info(f"Loaded configuration from {config_path}")
-    logging.info(f"Config name extracted: {config_name}")
-    return config
-
-
-def get_transaction_costs(config: Dict[str, Any]) -> Dict[str, float]:
+def compute_practitioner_benchmark(
+    env: Any,
+    S_traj: torch.Tensor,
+    O_traj: Dict[int, torch.Tensor],
+    n_hedging_instruments: int
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], np.ndarray]:
     """
-    Get transaction costs from config.
+    Compute the practitioner benchmark hedge with stability controls.
     
-    Supports two formats:
-    1. Simple flag: transaction_costs: {TC: true/false}
-    2. Detailed: transaction_costs: {stock: 0.0001, vanilla_option: 0.001, ...}
+    Greeks are automatically clipped to prevent numerical explosions:
+    - Delta: ±5 × contract_size
+    - Gamma: ±10 × contract_size
+    - Vega: ±10 × contract_size
+    - Theta: ±10 × contract_size
+    
+    Args:
+        env: Trading environment
+        S_traj: Stock price trajectories
+        O_traj: Option price trajectories
+        n_hedging_instruments: Number of hedging instruments
+    
+    Returns:
+        Tuple of (positions, trajectories, terminal_hedge_errors)
     """
-    tc_config = config.get("transaction_costs", {})
+    S_np = S_traj.cpu().numpy()
     
-    # Check if using simple TC flag format
-    if "TC" in tc_config:
-        if tc_config["TC"]:
-            # Use default transaction costs
-            return {
-                'stock': 0.0001,
-                'vanilla_option': 0.001,
-                'barrier_option': 0.002,
-                'american_option': 0.0015,
-                'asian_option': 0.0015
-            }
-        else:
-            # All zero transaction costs
-            return {
-                'stock': 0.0,
-                'vanilla_option': 0.0,
-                'barrier_option': 0.0,
-                'american_option': 0.0,
-                'asian_option': 0.0
-            }
+    # Hardcoded clipping bounds (multiples of contract_size)
+    DELTA_CLIP = 1000
+    GAMMA_CLIP = 1000
+    VEGA_CLIP = 1000
+    THETA_CLIP = 1000
+    
+    # Determine Greeks to hedge
+    if n_hedging_instruments == 1:
+        greek_names = ['delta']
+    elif n_hedging_instruments == 2:
+        greek_names = ['delta', 'gamma']
+    elif n_hedging_instruments == 3:
+        greek_names = ['delta', 'gamma', 'vega']
+    elif n_hedging_instruments == 4:
+        greek_names = ['delta', 'gamma', 'vega', 'theta']
     else:
-        # Use detailed transaction costs with defaults for missing values
-        defaults = {
-            'stock': 0.0001,
-            'vanilla_option': 0.001,
-            'barrier_option': 0.002,
-            'american_option': 0.0015,
-            'asian_option': 0.0015
-        }
-        return {key: tc_config.get(key, defaults[key]) for key in defaults}
-
-
-def validate_config(config: Dict[str, Any]) -> None:
-    """Validate configuration parameters including risk measure and soft constraint."""
-    n_inst = config["instruments"]["n_hedging_instruments"]
+        raise ValueError(f"n_hedging_instruments must be 1-4, got {n_hedging_instruments}")
     
-    if n_inst < 1 or n_inst > 4:
-        raise ValueError(f"n_hedging_instruments must be 1-4, got {n_inst}")
-    
-    if n_inst > 1:
-        n_strikes = len(config["instruments"]["strikes"])
-        n_types = len(config["instruments"]["types"])
-        n_maturities = len(config["instruments"]["maturities"])
-        
-        if n_strikes != n_inst - 1:
-            raise ValueError(
-                f"strikes must have length {n_inst - 1} (excluding stock), got {n_strikes}"
-            )
-        
-        if n_types != n_inst - 1:
-            raise ValueError(
-                f"types must have length {n_inst - 1} (excluding stock), got {n_types}"
-            )
-        
-        if n_maturities != n_inst - 1:
-            raise ValueError(
-                f"maturities must have length {n_inst - 1} (excluding stock), got {n_maturities}"
-            )
-    
-    valid_types = ["call", "put"]
-    for opt_type in config["instruments"]["types"]:
-        if opt_type not in valid_types:
-            raise ValueError(f"Invalid option type: {opt_type}")
-    
-    hedged_cfg = config["hedged_option"]
-    deriv_type = hedged_cfg["type"].lower()
-    
-    # Extended validation for American and Asian options
-    if deriv_type not in ["vanilla", "barrier", "american", "asian"]:
-        raise ValueError(f"Invalid hedged_option type: {deriv_type}")
-    
-    if hedged_cfg["option_type"] not in valid_types:
-        raise ValueError(
-            f"Invalid hedged_option option_type: {hedged_cfg['option_type']}"
-        )
-    
-    if hedged_cfg["side"] not in ["long", "short"]:
-        raise ValueError(
-            f"Invalid hedged_option side: {hedged_cfg['side']}"
-        )
-    
-    # Validate that American and Asian options have model_path if needed
-    if deriv_type in ["american", "asian"] and "model_path" not in hedged_cfg:
-        logging.warning(f"{deriv_type.capitalize()} option specified but no model_path provided in config")
-    
-    # NEW: Validate risk measure configuration
-    if "risk_measure" in config:
-        risk_config = config["risk_measure"]
-        valid_risk_measures = ["mse", "smse", "cvar", "var", "mae"]
-        risk_type = risk_config.get("type", "mse")
-        
-        if risk_type not in valid_risk_measures:
-            raise ValueError(f"Invalid risk_measure type: {risk_type}. Must be one of {valid_risk_measures}")
-        
-        # CVaR and VaR require alpha parameter
-        if risk_type in ["cvar", "var"] and "alpha" not in risk_config:
-            raise ValueError(f"risk_measure type '{risk_type}' requires 'alpha' parameter")
-        
-        # Warn if alpha is provided for non-CVaR/VaR measures
-        if risk_type not in ["cvar", "var"] and "alpha" in risk_config:
-            logging.warning(f"alpha parameter is ignored for risk_measure type '{risk_type}' (only used for 'cvar' or 'var')")
-        
-        # Warning for VaR (non-convex)
-        if risk_type == "var":
-            logging.warning("VaR is NOT a convex or coherent risk measure. Consider using CVaR instead for better optimization properties.")
-    
-    # NEW: Validate soft constraint configuration
-    if "soft_constraint" in config:
-        constraint_config = config["soft_constraint"]
-        if "enabled" not in constraint_config:
-            logging.warning("soft_constraint section found but 'enabled' not specified, defaulting to false")
-        if "lambda" not in constraint_config:
-            logging.warning("soft_constraint section found but 'lambda' not specified, defaulting to 0.0")
-    
-    logging.info("Configuration validation passed")
-
-
-def create_policy_network(config: Dict[str, Any], device: torch.device) -> PolicyNetGARCH:
-    """Create and initialize policy network."""
-    model_config = config["model"]
-    
-    policy_net = PolicyNetGARCH(
-        obs_dim=model_config["obs_dim"],
-        hidden_size=model_config["hidden_size"],
-        n_hedging_instruments=config["instruments"]["n_hedging_instruments"],
-        num_layers=model_config["num_layers"]
-    ).to(device)
-    
-    logging.info(
-        f"Created policy network with {model_config['hidden_size']} hidden units, "
-        f"{model_config['num_layers']} FC layers"
-    )
-    
-    return policy_net
-
-
-def create_optimizer(
-    policy_net: PolicyNetGARCH,
-    config: Dict[str, Any]
-) -> torch.optim.Optimizer:
-    """Create optimizer for policy network."""
-    train_config = config["training"]
-    
-    if train_config["optimizer"] == "AdamW":
-        optimizer = torch.optim.AdamW(
-            policy_net.parameters(),
-            lr=train_config["learning_rate"],
-            weight_decay=train_config["weight_decay"]
-        )
-    elif train_config["optimizer"] == "Adam":
-        optimizer = torch.optim.Adam(
-            policy_net.parameters(),
-            lr=train_config["learning_rate"],
-            weight_decay=train_config["weight_decay"]
-        )
-    else:
-        raise ValueError(f"Unknown optimizer: {train_config['optimizer']}")
-    
-    logging.info(
-        f"Created {train_config['optimizer']} optimizer with "
-        f"lr={train_config['learning_rate']}, weight_decay={train_config['weight_decay']}"
-    )
-    
-    return optimizer
-
-
-def train_episode(
-    episode: int,
-    config: Dict[str, Any],
-    policy_net: PolicyNetGARCH,
-    optimizer: torch.optim.Optimizer,
-    hedged_derivative,
-    hedging_derivatives,
-    HedgingSim,
-    device: torch.device
-) -> Dict[str, Any]:
-    """Train for a single episode with configurable risk measure and soft constraint."""
-    
-    hedged_cfg = config["hedged_option"]
-    
-    # Get transaction costs from config
-    transaction_costs = get_transaction_costs(config)
-    
-    # NEW: Get risk measure and soft constraint configuration
-    risk_config = config.get("risk_measure", {"type": "mse"})
-    constraint_config = config.get("soft_constraint", {"enabled": False, "lambda": 0.0})
-    
-    risk_measure = risk_config.get("type", "mse")
-    alpha = risk_config.get("alpha", None)  # Only needed for CVaR
-    lambda_constraint = constraint_config.get("lambda", 0.0) if constraint_config.get("enabled", False) else 0.0
-    
-    sim = HedgingSim(
-        S0=config["simulation"]["S0"],
-        K=hedged_cfg["K"],
-        m=0.1,
-        r=config["simulation"]["r"],
-        sigma=config["garch"]["sigma0"],
-        T=config["simulation"]["T"],
-        option_type=hedged_cfg["option_type"],
-        position=hedged_cfg["side"],
-        M=config["simulation"]["M"],
-        N=config["simulation"]["N"],
-        TCP=transaction_costs.get('stock', 0.0001),
-        seed=episode
-    )
-    
-    env = HedgingEnvGARCH(
-        sim=sim,
-        derivative=hedged_derivative,
-        hedging_derivatives=hedging_derivatives,
-        garch_params=config["garch"],
-        n_hedging_instruments=config["instruments"]["n_hedging_instruments"],
-        dt_min=config["environment"]["dt_min"],
-        device=str(device),
-        transaction_costs=transaction_costs
-    )
-    
-    env.reset()
-    
-    S_traj, V_traj, O_traj, obs_sequence, RL_positions = \
-        env.simulate_trajectory_and_get_observations(policy_net)
-    
-    terminal_errors, trajectories = env.simulate_full_trajectory(RL_positions, O_traj)
-    
-    optimizer.zero_grad()
-    
-    # NEW: Compute loss with configurable risk measure and soft constraint
-    total_loss, risk_loss, constraint_penalty = compute_loss_with_soft_constraint(
-        terminal_errors, 
-        trajectories,
-        risk_measure=risk_measure,
-        alpha=alpha,
-        lambda_constraint=lambda_constraint
-    )
-    
-    total_loss.backward()
-    
-    torch.nn.utils.clip_grad_norm_(
-        policy_net.parameters(),
-        max_norm=config["training"]["gradient_clip_max_norm"]
-    )
-    
-    optimizer.step()
-    
-    if torch.isnan(total_loss) or torch.isinf(total_loss):
-        logging.error("Loss became NaN/Inf")
-        raise RuntimeError("Loss became NaN/Inf")
-    
-    final_reward = -float(total_loss.item())
-    
-    # NEW: Enhanced logging with risk measure and constraint info
-    log_msg = (
-        f"Episode {episode} | "
-        f"Risk: {risk_measure.upper()} | "
-        f"Total Loss: {total_loss.item():.6f} | "
-        f"Risk Loss: {risk_loss.item():.6f}"
-    )
-    
-    if lambda_constraint > 0:
-        avg_violation = trajectories['soft_constraint_violations'].mean().item()
-        log_msg += (
-            f" | Constraint Penalty: {constraint_penalty.item():.6f} "
-            f"(λ={lambda_constraint}) | "
-            f"Avg Violation: {avg_violation:.6f}"
-        )
-    
-    log_msg += f" | Final Reward: {final_reward:.6f}"
-    
-    logging.info(log_msg)
-    
-    return {
-        "episode": episode,
-        "loss": total_loss.item(),
-        "risk_loss": risk_loss.item(),
-        "constraint_penalty": constraint_penalty.item(),
-        "reward": final_reward,
-        "trajectories": trajectories,
-        "RL_positions": RL_positions,
-        "S_traj": S_traj,
-        "V_traj": V_traj,
-        "O_traj": O_traj,
-        "env": env,
-        "risk_measure": risk_measure,
-        "lambda_constraint": lambda_constraint
+    # Define clipping bounds for each Greek
+    clip_bounds = {
+        'delta': DELTA_CLIP * env.contract_size,
+        'gamma': GAMMA_CLIP * env.contract_size,
+        'vega': VEGA_CLIP * env.contract_size,
+        'theta': THETA_CLIP * env.contract_size
     }
-
-
-def save_checkpoint(
-    policy_net: PolicyNetGARCH,
-    config: Dict[str, Any],
-    episode: int,
-    config_name: str
-) -> None:
-    """Save model checkpoint with config name in filename."""
-    # Determine hedging instrument name based on n_hedging_instruments
-    n_inst = config["instruments"]["n_hedging_instruments"]
     
-    if n_inst == 1:
-        instrument_name = "stock_only"
-    elif n_inst == 2:
-        instrument_name = "2inst"
-    elif n_inst == 3:
-        instrument_name = "3inst"
-    elif n_inst == 4:
-        instrument_name = "4inst"
-    else:
-        instrument_name = f"{n_inst}inst"
+    # Compute portfolio Greeks with stability controls
+    portfolio_greeks = {}
+    instability_detected = False
     
-    # Create checkpoint directory: models/{instrument_name}/checkpoint
-    checkpoint_dir = os.path.join("models", instrument_name, "checkpoint")
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    # Create checkpoint filename: {config_name}.pth
-    checkpoint_filename = f"{config_name}.pth"
-    checkpoint_path = os.path.join(checkpoint_dir, checkpoint_filename)
-    
-    torch.save(policy_net.state_dict(), checkpoint_path)
-    logging.info(f"Checkpoint saved at episode {episode}: {checkpoint_path}")
-
-
-def run_inference(
-    config: Dict[str, Any],
-    policy_net: PolicyNetGARCH,
-    hedged_derivative,
-    hedging_derivatives,
-    HedgingSim,
-    device: torch.device
-) -> None:
-    """Run inference with a pretrained model and generate visualizations."""
-    logging.info("Starting inference with pretrained model...")
-    
-    policy_net.eval()
-    
-    hedged_cfg = config["hedged_option"]
-    
-    # Get transaction costs from config
-    transaction_costs = get_transaction_costs(config)
-    
-    sim = HedgingSim(
-        S0=config["simulation"]["S0"],
-        K=hedged_cfg["K"],
-        m=0.1,
-        r=config["simulation"]["r"],
-        sigma=config["garch"]["sigma0"],
-        T=config["simulation"]["T"],
-        option_type=hedged_cfg["option_type"],
-        position=hedged_cfg["side"],
-        M=config["simulation"]["M"],
-        N=config["simulation"]["N"],
-        TCP=transaction_costs.get('stock', 0.0001),
-        seed=config["training"]["seed"]
-    )
-    
-    env = HedgingEnvGARCH(
-        sim=sim,
-        derivative=hedged_derivative,
-        hedging_derivatives=hedging_derivatives,
-        garch_params=config["garch"],
-        n_hedging_instruments=config["instruments"]["n_hedging_instruments"],
-        dt_min=config["environment"]["dt_min"],
-        device=str(device),
-        transaction_costs=transaction_costs
-    )
-    
-    env.reset()
-    
-    with torch.no_grad():
-        S_traj, V_traj, O_traj, obs_sequence, RL_positions = \
-            env.simulate_trajectory_and_get_observations(policy_net)
+    for greek_name in greek_names:
+        greek_traj = env.compute_all_paths_greeks(S_traj, greek_name)
+        portfolio_greeks[greek_name] = -env.side * greek_traj
         
-        terminal_errors, trajectories = env.simulate_full_trajectory(RL_positions, O_traj)
+        # OPTION 2: Detect instabilities
+        # Check for NaN or Inf
+        has_nan = torch.isnan(portfolio_greeks[greek_name]).any()
+        has_inf = torch.isinf(portfolio_greeks[greek_name]).any()
+        
+        if has_nan or has_inf:
+            nan_count = torch.isnan(portfolio_greeks[greek_name]).sum().item()
+            inf_count = torch.isinf(portfolio_greeks[greek_name]).sum().item()
+            total_elements = portfolio_greeks[greek_name].numel()
+            
+            logger.warning(
+                f"[Practitioner Benchmark] {greek_name.upper()} contains "
+                f"{nan_count} NaN ({nan_count/total_elements*100:.2f}%) and "
+                f"{inf_count} Inf ({inf_count/total_elements*100:.2f}%) values"
+            )
+            
+            # Replace NaN/Inf with zeros
+            portfolio_greeks[greek_name] = torch.nan_to_num(
+                portfolio_greeks[greek_name], 
+                nan=0.0, 
+                posinf=0.0, 
+                neginf=0.0
+            )
+            instability_detected = True
+        
+        # Check for extreme values before clipping
+        threshold = clip_bounds[greek_name]
+        extreme_mask = torch.abs(portfolio_greeks[greek_name]) > threshold
+        
+        if extreme_mask.any():
+            n_extreme = extreme_mask.sum().item()
+            pct_extreme = n_extreme / portfolio_greeks[greek_name].numel() * 100
+            max_val = torch.abs(portfolio_greeks[greek_name]).max().item()
+            
+            logger.warning(
+                f"[Practitioner Benchmark] {greek_name.upper()} has {n_extreme} "
+                f"extreme values ({pct_extreme:.2f}% > {threshold:.2f}), "
+                f"max absolute value: {max_val:.2f}"
+            )
+            instability_detected = True
+        
+        # OPTION 1: Clip Greeks to reasonable bounds
+        original_mean = portfolio_greeks[greek_name].abs().mean().item()
+        
+        portfolio_greeks[greek_name] = torch.clamp(
+            portfolio_greeks[greek_name], 
+            -clip_bounds[greek_name], 
+            clip_bounds[greek_name]
+        )
+        
+        clipped_mean = portfolio_greeks[greek_name].abs().mean().item()
+        
+        # Log clipping impact
+        if abs(original_mean - clipped_mean) / (original_mean + 1e-8) > 0.01:
+            logger.info(
+                f"[Practitioner Benchmark] {greek_name.upper()} clipped: "
+                f"mean |value| changed from {original_mean:.4f} to {clipped_mean:.4f} "
+                f"(bounds: ±{clip_bounds[greek_name]:.2f})"
+            )
     
-    terminal_hedge_error_rl, rl_metrics = compute_rl_metrics(
-        env, RL_positions, trajectories, O_traj
-    )
+    if instability_detected:
+        logger.warning(
+            "[Practitioner Benchmark] Numerical instabilities detected and corrected. "
+            "This is common near expiry or at barriers for exotic derivatives."
+        )
     
-    logging.info(
-        f"Inference Results - MSE: {rl_metrics['mse']:.6f} | "
-        f"SMSE: {rl_metrics['smse']:.6f} | CVaR95: {rl_metrics['cvar_95']:.6f}"
-    )
+    # Solve for optimal hedge positions
+    HN_positions_all = env.compute_hn_option_positions(S_traj, portfolio_greeks)
     
-    # NEW: Also compute and log the configured risk measure
-    risk_config = config.get("risk_measure", {"type": "mse"})
-    constraint_config = config.get("soft_constraint", {"enabled": False, "lambda": 0.0})
+    # Additional stability check on positions
+    if torch.isnan(HN_positions_all).any() or torch.isinf(HN_positions_all).any():
+        logger.error(
+            "[Practitioner Benchmark] Hedge positions contain NaN/Inf after solving. "
+            "Replacing with zeros."
+        )
+        HN_positions_all = torch.nan_to_num(HN_positions_all, nan=0.0, posinf=0.0, neginf=0.0)
     
-    risk_measure = risk_config.get("type", "mse")
-    alpha = risk_config.get("alpha", None)
-    lambda_constraint = constraint_config.get("lambda", 0.0) if constraint_config.get("enabled", False) else 0.0
+    # Simulate hedge strategy
+    _, trajectories_hn = env.simulate_full_trajectory(HN_positions_all, O_traj)
     
-    total_loss, risk_loss, constraint_penalty = compute_loss_with_soft_constraint(
-        terminal_errors,
-        trajectories,
-        risk_measure=risk_measure,
-        alpha=alpha,
-        lambda_constraint=lambda_constraint
-    )
+    # Compute terminal hedge errors
+    S_final = trajectories_hn['S'][:, -1]
     
-    logging.info(
-        f"Configured Risk Measure ({risk_measure.upper()}): {risk_loss.item():.6f} | "
-        f"Constraint Penalty: {constraint_penalty.item():.6f}"
-    )
+    # Compute payoff based on derivative type
+    if hasattr(env.derivative, 'option_type'):
+        opt_type = env.derivative.option_type.lower()
+    else:
+        opt_type = env.option_type.lower()
+    
+    # Handle Asian option payoff
+    if hasattr(env, 'is_asian_hedged') and env.is_asian_hedged:
+        # For Asian options, need running average A
+        # Reconstruct it from trajectory
+        A_hedged = env._reconstruct_running_average(trajectories_hn['S'])
+        if opt_type == "call":
+            payoff = torch.clamp(A_hedged - env.K, min=0.0)
+        else:
+            payoff = torch.clamp(env.K - A_hedged, min=0.0)
+    else:
+        # Standard European payoff
+        if opt_type == "call":
+            payoff = torch.clamp(S_final - env.K, min=0.0)
+        else:
+            payoff = torch.clamp(env.K - S_final, min=0.0)
+    
+    payoff = payoff * env.contract_size
+    
+    terminal_value_hn = trajectories_hn['B'][:, -1] + HN_positions_all[:, -1, 0] * S_final
+    for i, maturity in enumerate(env.instrument_maturities[1:], start=1):
+        option_contrib = HN_positions_all[:, -1, i] * O_traj[i - 1][:, -1]
+        terminal_value_hn += option_contrib
+    
+    terminal_hedge_error_hn = (terminal_value_hn - env.side * payoff).cpu().detach().numpy()
+    
+    return HN_positions_all, trajectories_hn, terminal_hedge_error_hn
+
+
+def compute_rl_metrics(
+    env: Any,
+    RL_positions: torch.Tensor,
+    trajectories: Dict[str, torch.Tensor],
+    O_traj: Dict[int, torch.Tensor]
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    """Compute RL strategy metrics."""
+    S_final = trajectories['S'][:, -1]
+    
+    # Determine option type from derivative
+    if hasattr(env.derivative, 'option_type'):
+        opt_type = env.derivative.option_type.lower()
+    else:
+        opt_type = env.option_type.lower()
+    
+    # Handle Asian option payoff
+    if hasattr(env, 'is_asian_hedged') and env.is_asian_hedged:
+        # For Asian options, need running average A
+        A_hedged = env._reconstruct_running_average(trajectories['S'])
+        if opt_type == "call":
+            payoff = torch.clamp(A_hedged - env.K, min=0.0)
+        else:
+            payoff = torch.clamp(env.K - A_hedged, min=0.0)
+    else:
+        # Standard European payoff
+        if opt_type == "call":
+            payoff = torch.clamp(S_final - env.K, min=0.0)
+        else:
+            payoff = torch.clamp(env.K - S_final, min=0.0)
+    
+    payoff = payoff * env.contract_size
+    
+    # Compute terminal value
+    terminal_value_rl = trajectories['B'][:, -1] + RL_positions[:, -1, 0] * S_final
+    for i, maturity in enumerate(env.instrument_maturities[1:], start=1):
+        terminal_value_rl += RL_positions[:, -1, i] * O_traj[i - 1][:, -1]
+    
+    terminal_hedge_error_rl = (terminal_value_rl - env.side * payoff).cpu().detach().numpy()
+    
+    # Compute metrics
+    mse_rl = float(np.mean(terminal_hedge_error_rl ** 2))
+    smse_rl = mse_rl / (env.S0 ** 2)
+    cvar_95_rl = float(np.mean(np.sort(terminal_hedge_error_rl ** 2)[-int(0.05 * env.M):]))
+    mae_rl = float(np.mean(np.abs(terminal_hedge_error_rl)))
     
     metrics = {
-        "episode": 0,
-        "loss": total_loss.item(),
-        "risk_loss": risk_loss.item(),
-        "constraint_penalty": constraint_penalty.item(),
-        "reward": -float(total_loss.item()),
-        "trajectories": trajectories,
-        "RL_positions": RL_positions,
-        "S_traj": S_traj,
-        "V_traj": V_traj,
-        "O_traj": O_traj,
-        "env": env
+        'mse': mse_rl,
+        'smse': smse_rl,
+        'cvar_95': cvar_95_rl,
+        'mae': mae_rl
     }
     
+    return terminal_hedge_error_rl, metrics
+
+
+def compute_risk_measure_value(terminal_errors: np.ndarray, risk_measure: str, alpha: Optional[float] = None) -> float:
+    """
+    Compute the value of a specific risk measure on terminal errors.
+    
+    Args:
+        terminal_errors: Array of terminal hedging errors
+        risk_measure: 'mse', 'smse', 'cvar', 'var', or 'mae'
+        alpha: Confidence level for CVaR or VaR (e.g., 0.95)
+    
+    Returns:
+        Risk measure value
+    """
+    if risk_measure == 'mse':
+        return float(np.mean(terminal_errors ** 2))
+    
+    elif risk_measure == 'smse':
+        positive_mask = (terminal_errors >= 0)
+        return float(np.mean((terminal_errors ** 2) * positive_mask))
+    
+    elif risk_measure == 'cvar':
+        if alpha is None:
+            alpha = 0.95
+        sorted_errors = np.sort(terminal_errors)[::-1]  # Descending
+        n_tail = max(1, int(np.ceil(len(sorted_errors) * (1 - alpha))))
+        return float(np.mean(sorted_errors[:n_tail]))
+    
+    elif risk_measure == 'var':
+        if alpha is None:
+            alpha = 0.95
+        return float(np.quantile(terminal_errors, alpha))
+    
+    elif risk_measure == 'mae':
+        return float(np.mean(np.abs(terminal_errors)))
+    
+    else:
+        # Default to MSE
+        return float(np.mean(terminal_errors ** 2))
+
+
+def plot_episode_results(
+    episode: int,
+    metrics: Dict[str, Any],
+    config: Dict[str, Any]
+) -> None:
+    """Create comprehensive visualization of episode results with full support for all models."""
     try:
-        from src.visualization.plot_results import plot_episode_results
-        plot_episode_results(episode=0, metrics=metrics, config=config)
-        logging.info("Inference plots generated successfully")
-    except Exception as e:
-        logging.warning(f"Plot generation failed: {e}")
-
-
-def train(
-    config: Dict[str, Any],
-    HedgingSim,
-    hedged_derivative,
-    hedging_derivatives,
-    visualize: bool = True,
-    initial_model: Optional[PolicyNetGARCH] = None,
-    config_name: str = "config"
-) -> PolicyNetGARCH:
-    """Main training loop."""
-    
-    seed = config["training"]["seed"]
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    
-    device = torch.device(config["training"]["device"])
-    logging.info(f"Using device: {device}")
-    
-    # NEW: Log risk measure and soft constraint configuration
-    risk_config = config.get("risk_measure", {"type": "mse"})
-    constraint_config = config.get("soft_constraint", {"enabled": False, "lambda": 0.0})
-    
-    logging.info("=" * 70)
-    logging.info("RISK MEASURE & SOFT CONSTRAINT CONFIGURATION")
-    logging.info(f"Risk Measure: {risk_config.get('type', 'mse').upper()}")
-    if risk_config.get('type') == 'cvar':
-        logging.info(f"CVaR Alpha: {risk_config.get('alpha', 0.95)}")
-    logging.info(f"Soft Constraint Enabled: {constraint_config.get('enabled', False)}")
-    if constraint_config.get('enabled', False):
-        logging.info(f"Constraint Lambda: {constraint_config.get('lambda', 0.0)}")
-    logging.info("=" * 70)
-    
-    policy_net = create_policy_network(config, device)
-    
-    if initial_model is not None:
-        policy_net.load_state_dict(initial_model.state_dict())
-        logging.info("Initialized policy network from pretrained model")
-    
-    optimizer = create_optimizer(policy_net, config)
-    
-    n_episodes = config["training"]["episodes"]
-    checkpoint_freq = config["training"]["checkpoint_frequency"]
-    plot_freq = config["training"]["plot_frequency"]
-    
-    logging.info(
-        f"Starting training: {n_episodes} episodes, "
-        f"{config['instruments']['n_hedging_instruments']} instruments, "
-        f"device={device}"
-    )
-    
-    for episode in range(1, n_episodes + 1):
-        try:
-            metrics = train_episode(
-                episode=episode,
-                config=config,
-                policy_net=policy_net,
-                optimizer=optimizer,
-                hedged_derivative=hedged_derivative,
-                hedging_derivatives=hedging_derivatives,
-                HedgingSim=HedgingSim,
-                device=device
+        logger.info(f"Generating plots for episode {episode}")
+        
+        # Extract data from metrics
+        env = metrics['env']
+        RL_positions = metrics['RL_positions']
+        trajectories = metrics['trajectories']
+        S_traj = metrics['S_traj']
+        V_traj = metrics['V_traj']
+        O_traj = metrics['O_traj']
+        
+        # Extract training configuration
+        risk_measure = metrics.get('risk_measure', 'mse')
+        lambda_constraint = metrics.get('lambda_constraint', 0.0)
+        risk_loss = metrics.get('risk_loss', 0.0)
+        constraint_penalty = metrics.get('constraint_penalty', 0.0)
+        total_loss = metrics.get('loss', 0.0)
+        
+        # Get risk measure alpha if applicable
+        risk_config = config.get("risk_measure", {})
+        alpha = risk_config.get("alpha", 0.95)
+        
+        n_inst = config["instruments"]["n_hedging_instruments"]
+        path_idx = config["output"]["sample_path_index"]
+        
+        derivative_type = type(env.derivative).__name__
+        
+        # Convert O_traj to dict if it's a list
+        if isinstance(O_traj, list):
+            O_traj = {i: tensor for i, tensor in enumerate(O_traj)}
+        
+        # Compute RL metrics
+        terminal_hedge_error_rl, rl_metrics = compute_rl_metrics(
+            env, RL_positions, trajectories, O_traj
+        )
+        
+        # Compute practitioner benchmark with stability controls
+        logger.info("Computing practitioner benchmark with stability controls...")
+        HN_positions_all, trajectories_hn, terminal_hedge_error_hn = \
+            compute_practitioner_benchmark(env, S_traj, O_traj, n_inst)
+        
+        # Compute HN metrics (standard)
+        mse_hn = float(np.mean(terminal_hedge_error_hn ** 2))
+        smse_hn = mse_hn / (env.S0 ** 2)
+        cvar_95_hn = float(np.mean(np.sort(terminal_hedge_error_hn ** 2)[-int(0.05 * env.M):]))
+        mae_hn = float(np.mean(np.abs(terminal_hedge_error_hn)))
+        
+        # Compute the ACTUAL training objective for both strategies
+        rl_training_objective = compute_risk_measure_value(terminal_hedge_error_rl, risk_measure, alpha)
+        hn_training_objective = compute_risk_measure_value(terminal_hedge_error_hn, risk_measure, alpha)
+        
+        # Determine if soft constraints are active
+        has_soft_constraint = lambda_constraint > 0 and 'soft_constraint_violations' in trajectories
+        
+        # Create figure with appropriate number of subplots
+        if has_soft_constraint:
+            fig, axes = plt.subplots(4, 2, figsize=(14, 18))
+        else:
+            fig, axes = plt.subplots(3, 2, figsize=(14, 14))
+        
+        time_steps = np.arange(env.N + 1)
+        
+        # Extract sample paths for plotting
+        rl_positions_sample = RL_positions[path_idx].cpu().detach().numpy()
+        hn_positions_sample = HN_positions_all[path_idx].cpu().detach().numpy()
+        
+        # ============ GREEK DIAGNOSTICS ============
+        print("\n" + "="*80)
+        print(f"GREEK DIAGNOSTICS FOR PATH {path_idx}")
+        print("="*80)
+        
+        # Determine which Greeks to analyze
+        if n_inst == 1:
+            greek_names = ['delta']
+        elif n_inst == 2:
+            greek_names = ['delta', 'gamma']
+        elif n_inst == 3:
+            greek_names = ['delta', 'gamma', 'vega']
+        elif n_inst == 4:
+            greek_names = ['delta', 'gamma', 'vega', 'theta']
+        
+        # Compute portfolio Greeks (what we're trying to hedge)
+        print("\n--- PORTFOLIO GREEKS (Derivative being hedged) ---")
+        portfolio_greeks_diag = {}
+        for greek_name in greek_names:
+            greek_traj = env.compute_all_paths_greeks(S_traj, greek_name)
+            portfolio_greek = -env.side * greek_traj[path_idx].cpu().numpy()
+            portfolio_greeks_diag[greek_name] = portfolio_greek
+            
+            print(f"\n{greek_name.upper()}:")
+            print(f"  t=0:  {portfolio_greek[0]:12.6f}")
+            print(f"  t=1:  {portfolio_greek[1]:12.6f}")
+            if len(portfolio_greek) > 5:
+                print(f"  t=5:  {portfolio_greek[5]:12.6f}")
+            print(f"  Mean: {portfolio_greek.mean():12.6f}")
+            print(f"  Max:  {portfolio_greek.max():12.6f}")
+            print(f"  Min:  {portfolio_greek.min():12.6f}")
+        
+        # Compute hedging instrument Greeks (recompute them directly)
+        if n_inst >= 2:
+            print("\n--- HEDGING INSTRUMENT GREEKS (Used in matrix solve) ---")
+            
+            hedging_greeks = {}
+            h0_mean = env.h_t.mean().item()
+            
+            for i in range(1, n_inst):
+                opt_idx = i - 1
+                hedge_deriv = env.hedging_derivatives[i]
+                maturity = env.instrument_maturities[i]
+                opt_type = env.instrument_types[i]
+                strike = env.instrument_strikes[i]
+                
+                print(f"\nInstrument {i}: {maturity}d {opt_type.upper()} K={strike}")
+                
+                hedging_greeks[i] = {}
+                is_asian_hedge = env.hedging_is_asian[i]
+                
+                for greek_name in greek_names:
+                    # Compute Greek trajectory for this hedging instrument along the sample path
+                    greek_traj = torch.zeros((env.N + 1,), device=env.device)
+                    greek_method = getattr(hedge_deriv, greek_name)
+                    
+                    A_t = None
+                    
+                    for t in range(env.N + 1):
+                        S_t = S_traj[path_idx, t]
+                        K_hedge = getattr(hedge_deriv, 'K', env.K)
+                        N_hedge = getattr(hedge_deriv, 'N', env.N)
+                        
+                        if is_asian_hedge:
+                            # Update running average for Asian hedging instrument
+                            A_t = env._update_running_average(A_t, S_t, t, N_hedge)
+                            greek_val = greek_method(
+                                S=S_t.unsqueeze(0), K=K_hedge, step_idx=t, N=N_hedge, h0=h0_mean, A=A_t.unsqueeze(0)
+                            )[0]
+                        else:
+                            greek_val = greek_method(
+                                S=S_t.unsqueeze(0), K=K_hedge, step_idx=t, N=N_hedge, h0=h0_mean
+                            )[0]
+                        
+                        greek_traj[t] = greek_val
+                    
+                    hedging_greeks[i][greek_name] = greek_traj.cpu().numpy()
+                    
+                    print(f"  {greek_name.upper()}:")
+                    print(f"    t=0:  {greek_traj[0].item():12.6f}")
+                    print(f"    t=1:  {greek_traj[1].item():12.6f}")
+                    if len(greek_traj) > 5:
+                        print(f"    t=5:  {greek_traj[5].item():12.6f}")
+        
+        # Print the matrix condition at critical time points
+        if n_inst >= 2:
+            print("\n--- MATRIX ANALYSIS AT CRITICAL TIME POINTS ---")
+            
+            for t in [0, 1, 5] if env.N >= 5 else [0, 1]:
+                if t >= len(time_steps):
+                    continue
+                    
+                print(f"\n>>> Time t={t} <<<")
+                print(f"Stock Price: {S_traj[path_idx, t].item():.4f}")
+                
+                print("\nMatrix A (hedging instrument Greeks):")
+                print("         ", end="")
+                for i in range(1, n_inst):
+                    print(f"  Inst_{i:2d}    ", end="")
+                print()
+                
+                for greek_name in greek_names:
+                    print(f"{greek_name:8s}:", end="")
+                    for i in range(1, n_inst):
+                        if i in hedging_greeks and greek_name in hedging_greeks[i]:
+                            val = hedging_greeks[i][greek_name][t]
+                            print(f" {val:11.6f}", end="")
+                        else:
+                            print(f"     N/A    ", end="")
+                    print()
+                
+                print("\nVector b (portfolio Greeks to neutralize):")
+                for greek_name in greek_names:
+                    val = portfolio_greeks_diag[greek_name][t]
+                    print(f"  {greek_name:8s}: {val:12.6f}")
+                
+                print("\nSolution (hedge positions):")
+                print(f"  Stock:    {hn_positions_sample[t, 0]:12.6f}")
+                for i in range(1, n_inst):
+                    maturity = env.instrument_maturities[i]
+                    opt_type = env.instrument_types[i]
+                    strike = env.instrument_strikes[i]
+                    print(f"  Opt_{i}:    {hn_positions_sample[t, i]:12.6f}  ({maturity}d {opt_type} K={strike})")
+                
+                # Compute matrix condition number if possible
+                if n_inst >= 2 and all(i in hedging_greeks for i in range(1, n_inst)):
+                    try:
+                        A_matrix = []
+                        for greek_name in greek_names:
+                            row = [hedging_greeks[i][greek_name][t] for i in range(1, n_inst)]
+                            A_matrix.append(row)
+                        A_matrix = np.array(A_matrix)
+                        
+                        if A_matrix.shape[0] == A_matrix.shape[1]:
+                            cond = np.linalg.cond(A_matrix)
+                            det = np.linalg.det(A_matrix)
+                            print(f"\nMatrix Condition Number: {cond:.2e}")
+                            print(f"Matrix Determinant: {det:.2e}")
+                            
+                            if cond > 1e10:
+                                print("⚠️  WARNING: Matrix is nearly singular (ill-conditioned)!")
+                            if abs(det) < 1e-10:
+                                print("⚠️  WARNING: Matrix determinant near zero!")
+                    except:
+                        print("\n[Could not compute condition number]")
+        
+        print("\n" + "="*80)
+        print("END GREEK DIAGNOSTICS")
+        print("="*80 + "\n")
+        
+        # ============ END GREEK DIAGNOSTICS ============
+        
+        # PLOT 1: Stock Delta Comparison
+        axes[0, 0].plot(time_steps, rl_positions_sample[:, 0], label='RL Delta',
+                        linewidth=2, color='tab:blue')
+        axes[0, 0].plot(time_steps, hn_positions_sample[:, 0], label='Practitioner Delta',
+                        linewidth=2, linestyle='--', alpha=0.8, color='tab:orange')
+        axes[0, 0].set_xlabel("Time Step", fontsize=11)
+        axes[0, 0].set_ylabel("Delta", fontsize=11)
+        axes[0, 0].set_title(f"Stock Delta: Practitioner vs RL (Path {path_idx})", fontsize=12)
+        axes[0, 0].legend(fontsize=10)
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # PLOT 2: Option Positions Comparison
+        if n_inst >= 2:
+            for i in range(1, n_inst):
+                maturity = env.instrument_maturities[i]
+                opt_type = env.instrument_types[i]
+                strike = env.instrument_strikes[i]
+                label_suffix = f'{maturity}d {opt_type.upper()} K={strike}'
+                
+                axes[0, 1].plot(time_steps, rl_positions_sample[:, i],
+                              label=f'RL {label_suffix}', linewidth=2)
+                axes[0, 1].plot(time_steps, hn_positions_sample[:, i],
+                              label=f'Prac {label_suffix}', linewidth=2,
+                              linestyle='--', alpha=0.8)
+            axes[0, 1].axhline(y=0, color='k', linestyle='-', alpha=0.3)
+            axes[0, 1].set_xlabel("Time Step", fontsize=11)
+            axes[0, 1].set_ylabel("Option Contracts", fontsize=11)
+            axes[0, 1].set_title(f"Option Positions: Practitioner vs RL (Path {path_idx})", fontsize=12)
+            axes[0, 1].legend(fontsize=9)
+            axes[0, 1].grid(True, alpha=0.3)
+        else:
+            axes[0, 1].text(0.5, 0.5, 'No option positions\n(Delta hedge only)',
+                          ha='center', va='center', transform=axes[0, 1].transAxes)
+            axes[0, 1].set_title("Option Positions", fontsize=12)
+        
+        # PLOT 3: Stock Price Trajectory with Derivative Price
+        ax1 = axes[1, 0]
+        color_stock = 'tab:green'
+        ax1.plot(time_steps, S_traj[path_idx].cpu().detach().numpy(),
+                 label='Stock Price', color=color_stock, linewidth=2)
+        ax1.axhline(y=env.K, color='r', linestyle='--', label='Strike', alpha=0.7)
+        
+        # Add special features based on derivative type
+        if hasattr(env.derivative, 'barrier_level'):
+            barrier_val = env.derivative.barrier_level
+            if isinstance(barrier_val, torch.Tensor):
+                barrier_val = barrier_val.item()
+            ax1.axhline(y=barrier_val, color='purple', 
+                       linestyle=':', label='Barrier', alpha=0.7, linewidth=2)
+        
+        ax1.set_xlabel("Time Step", fontsize=11)
+        ax1.set_ylabel("Stock Price", fontsize=11, color=color_stock)
+        ax1.tick_params(axis='y', labelcolor=color_stock)
+        ax1.grid(True, alpha=0.3)
+        
+        # Plot derivative price on secondary y-axis
+        ax2 = ax1.twinx()
+        color_derivative = 'tab:blue'
+        ax2.plot(time_steps, V_traj[path_idx].cpu().detach().numpy(),
+                 label=f'{derivative_type} Price', color=color_derivative, 
+                 linewidth=2, alpha=0.8)
+        ax2.set_ylabel(f"{derivative_type} Price", fontsize=11, color=color_derivative)
+        ax2.tick_params(axis='y', labelcolor=color_derivative)
+        
+        # Combine legends
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=10, loc='best')
+        
+        ax1.set_title(f"Stock & {derivative_type} Price (Path {path_idx})", fontsize=12)
+        
+        # PLOT 4: Hedging Instrument Prices
+        if n_inst >= 2:
+            for i in range(1, n_inst):
+                opt_idx = i - 1
+                if opt_idx not in O_traj:
+                    continue
+                    
+                maturity = env.instrument_maturities[i]
+                opt_type = env.instrument_types[i]
+                strike = env.instrument_strikes[i]
+                
+                option_prices = O_traj[opt_idx][path_idx].cpu().detach().numpy()
+                axes[1, 1].plot(time_steps, option_prices,
+                              label=f'{maturity}d {opt_type.upper()} K={strike}', linewidth=2)
+        
+        axes[1, 1].set_xlabel("Time Step", fontsize=11)
+        axes[1, 1].set_ylabel("Option Price", fontsize=11)
+        axes[1, 1].set_title(f"Hedging Instrument Prices (Path {path_idx})", fontsize=12)
+        if n_inst >= 2:
+            axes[1, 1].legend(fontsize=10)
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        # PLOT 5: Position Difference (RL - Practitioner)
+        delta_diff = rl_positions_sample[:, 0] - hn_positions_sample[:, 0]
+        axes[2, 0].plot(time_steps, delta_diff, color='tab:red', linewidth=2)
+        axes[2, 0].axhline(y=0, color='k', linestyle='-', alpha=0.3)
+        axes[2, 0].set_xlabel("Time Step", fontsize=11)
+        axes[2, 0].set_ylabel("Delta Difference", fontsize=11)
+        axes[2, 0].set_title(f"RL Delta - Practitioner Delta (Path {path_idx})", fontsize=12)
+        axes[2, 0].grid(True, alpha=0.3)
+        
+        # PLOT 6: Terminal Error Distribution
+        axes[2, 1].hist(terminal_hedge_error_rl, bins=50, color="tab:blue", alpha=0.7,
+                        edgecolor='black', label='RL')
+        axes[2, 1].hist(terminal_hedge_error_hn, bins=50, color="tab:orange", alpha=0.7,
+                        edgecolor='black', label='Practitioner')
+        axes[2, 1].axvline(x=0, color='r', linestyle='--', linewidth=2)
+        axes[2, 1].set_xlabel("Terminal Hedge Error", fontsize=11)
+        axes[2, 1].set_ylabel("Frequency", fontsize=11)
+        
+        # Build comprehensive title starting with config name
+        config_name = config.get("config_name", "model")
+        
+        greek_labels = {1: 'Delta', 2: 'Delta-Gamma', 3: 'Delta-Gamma-Vega', 4: 'Delta-Gamma-Vega-Theta'}
+        hedged_option_type = config["hedged_option"]["type"].capitalize()
+        
+        risk_display_names = {
+            'mse': 'MSE',
+            'smse': 'SMSE',
+            'cvar': f'CVaR_{int(alpha*100)}',
+            'var': f'VaR_{int(alpha*100)}',
+            'mae': 'MAE'
+        }
+        
+        risk_display = risk_display_names.get(risk_measure, risk_measure.upper())
+        
+        # Start with config name as main title
+        title_text = f"{config_name}\n"
+        title_text += (
+            f"Episode {episode} - {n_inst} Instruments ({greek_labels[n_inst]}) - Hedging {hedged_option_type}\n"
+            f"Training Objective: {risk_display}"
+        )
+        
+        if has_soft_constraint:
+            title_text += f" + λ·SC (λ={lambda_constraint:.4f})"
+        
+        # Add stability info showing hardcoded clip bounds
+        title_text += f"\n[Greeks Clipped: Δ=±5·CS"
+        if n_inst >= 2:
+            title_text += f", Γ=±10·CS"
+        if n_inst >= 3:
+            title_text += f", ν=±10·CS"
+        if n_inst >= 4:
+            title_text += f", Θ=±10·CS"
+        title_text += "]"
+        
+        title_text += "\n"
+        
+        # Show training objective values
+        title_text += f"RL {risk_display}={rl_training_objective:.4f} | Prac {risk_display}={hn_training_objective:.4f}"
+        
+        if has_soft_constraint:
+            avg_violation_rl = trajectories['soft_constraint_violations'].mean().cpu().item()
+            avg_violation_hn = trajectories_hn.get('soft_constraint_violations', torch.zeros(1)).mean().cpu().item() if 'soft_constraint_violations' in trajectories_hn else 0.0
+            title_text += f"\nRL Constr={avg_violation_rl:.4f} | Prac Constr={avg_violation_hn:.4f}"
+        
+        axes[2, 1].set_title(title_text, fontsize=9)
+        axes[2, 1].legend(fontsize=10)
+        axes[2, 1].grid(True, alpha=0.3)
+        
+        # PLOT 7 & 8: Soft Constraint Visualizations (if enabled)
+        if has_soft_constraint:
+            violations_rl = trajectories['soft_constraint_violations'].cpu().numpy()
+            violations_hn = trajectories_hn.get('soft_constraint_violations', 
+                                                 torch.zeros_like(trajectories['soft_constraint_violations'])).cpu().numpy()
+            
+            # PLOT 7: Accumulated Constraint Violations Distribution
+            axes[3, 0].hist(violations_rl, bins=50, color="tab:blue", alpha=0.7,
+                           edgecolor='black', label='RL')
+            axes[3, 0].hist(violations_hn, bins=50, color="tab:orange", alpha=0.7,
+                           edgecolor='black', label='Practitioner')
+            axes[3, 0].axvline(x=0, color='r', linestyle='--', linewidth=2)
+            axes[3, 0].set_xlabel("Accumulated Constraint Violations", fontsize=11)
+            axes[3, 0].set_ylabel("Frequency", fontsize=11)
+            axes[3, 0].set_title("Soft Constraint Violations: ∑max(0, P_t - V_t)", fontsize=12)
+            axes[3, 0].legend(fontsize=10)
+            axes[3, 0].grid(True, alpha=0.3)
+            
+            # PLOT 8: Violation Statistics
+            axes[3, 1].axis('off')
+            
+            # Compute violation statistics
+            rl_violation_pct = (violations_rl > 0).sum() / len(violations_rl) * 100
+            hn_violation_pct = (violations_hn > 0).sum() / len(violations_hn) * 100
+            
+            rl_mean_violation = violations_rl.mean()
+            hn_mean_violation = violations_hn.mean()
+            
+            rl_max_violation = violations_rl.max()
+            hn_max_violation = violations_hn.max()
+            
+            stats_text = (
+                "Soft Constraint Statistics\n"
+                "─" * 40 + "\n\n"
+                f"Constraint Weight (λ): {lambda_constraint:.4f}\n"
+                f"Constraint Penalty: {constraint_penalty:.4f}\n\n"
+                "RL Strategy:\n"
+                f"  • Violation Rate: {rl_violation_pct:.1f}%\n"
+                f"  • Mean Violation: {rl_mean_violation:.4f}\n"
+                f"  • Max Violation: {rl_max_violation:.4f}\n\n"
+                "Practitioner Strategy:\n"
+                f"  • Violation Rate: {hn_violation_pct:.1f}%\n"
+                f"  • Mean Violation: {hn_mean_violation:.4f}\n"
+                f"  • Max Violation: {hn_max_violation:.4f}\n\n"
+                "Interpretation:\n"
+                f"  • Violations occur when P_t > V_t\n"
+                f"  • Penalty = λ × mean(violations)\n"
+                f"  • Lower is better"
             )
             
-            if episode % checkpoint_freq == 0:
-                save_checkpoint(policy_net, config, episode, config_name)
-            
-            if visualize and episode % plot_freq == 0:
-                try:
-                    from src.visualization.plot_results import plot_episode_results
-                    plot_episode_results(episode, metrics, config)
-                except Exception as e:
-                    logging.warning(f"Plotting failed: {e}")
+            axes[3, 1].text(0.1, 0.5, stats_text, transform=axes[3, 1].transAxes,
+                           fontsize=10, verticalalignment='center', family='monospace')
         
-        except Exception as e:
-            logging.exception(f"Error during episode {episode}: {e}")
-            raise
-    
-    # Save final model with config name in models/{instrument_name}/checkpoint
-    n_inst = config["instruments"]["n_hedging_instruments"]
-    
-    if n_inst == 1:
-        instrument_name = "stock_only"
-    elif n_inst == 2:
-        instrument_name = "2inst"
-    elif n_inst == 3:
-        instrument_name = "3inst"
-    elif n_inst == 4:
-        instrument_name = "4inst"
-    else:
-        instrument_name = f"{n_inst}inst"
-    
-    final_dir = os.path.join("models", instrument_name, "checkpoint")
-    final_filename = f"{config_name}.pth"
-    final_path = os.path.join(final_dir, final_filename)
-    
-    os.makedirs(final_dir, exist_ok=True)
-    torch.save(policy_net.state_dict(), final_path)
-    logging.info(f"Training finished. Model saved to {final_path}")
-    
-    return policy_net
-
-
-def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(
-        description="Train GARCH-based option hedging with RL (supports vanilla, barrier, American, and Asian options)"
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        required=True,
-        help="Path to configuration file"
-    )
-    parser.add_argument(
-        "--no-visualize",
-        action="store_true",
-        help="Disable visualization during training"
-    )
-    parser.add_argument(
-        "--load-model",
-        type=str,
-        default=None,
-        help="Path to pretrained model"
-    )
-    parser.add_argument(
-        "--inference-only",
-        action="store_true",
-        help="Run inference only without training"
-    )
-    
-    args = parser.parse_args()
-    
-    config = load_config(args.config)
-    
-    # Extract config name from the config dict (already processed in load_config)
-    config_name = config.get("config_name", "model")
-    
-    # ============================================================
-    # AUTO-DETECT DEVICE: Use CUDA if available, otherwise CPU
-    # This OVERRIDES whatever device is in the config file
-    # ============================================================
-    auto_device = auto_detect_device()
-    config["training"]["device"] = auto_device
-    config["precomputation"]["device"] = auto_device
-    
-    setup_logging(config)
-    
-    logging.info("=" * 70)
-    logging.info(f"CONFIGURATION: {config_name}")
-    logging.info(f"DEVICE CONFIGURATION: {auto_device.upper()}")
-    if auto_device == "cuda":
-        logging.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-    logging.info("=" * 70)
-    
-    validate_config(config)
-    
-    device = torch.device(config["training"]["device"])
-    logging.info(f"Using device: {device}")
-    
-    try:
-        from src.simulation.hedging_sim import HedgingSim
-    except ImportError:
-        logging.error("Could not import HedgingSim. Please adjust import path.")
-        sys.exit(1)
-    
-    hedged_type = config["hedged_option"]["type"].lower()
-    
-    logging.info("Starting precomputation...")
-    logging.info(f"Hedged derivative type: {hedged_type}")
-    
-    # Precomputation is needed for:
-    # 1. Vanilla options used as hedging instruments (specified in config["instruments"]["maturities"])
-    # 2. Vanilla option being hedged (if hedged_type == "vanilla")
-    # 3. Barrier option being hedged (needs vanilla fallback at same maturity)
-    # NOTE: American and Asian options do NOT need precomputation
-    
-    precomputation_manager = create_precomputation_manager_from_config(config)
-    
-    # Check if hedged derivative needs precomputation
-    needs_hedged_precompute = hedged_type in ["vanilla", "barrier"]
-    
-    if needs_hedged_precompute:
-        hedged_maturity_days = int(config["hedged_option"]["T"] * 252)
+        # Save plot using config name
+        fig.tight_layout()
         
-        # Check if this maturity is already in the list (from hedging instruments)
-        if hedged_maturity_days not in config["instruments"]["maturities"]:
-            if not hasattr(precomputation_manager, 'maturities'):
-                precomputation_manager.maturities = []
-            if hedged_maturity_days not in precomputation_manager.maturities:
-                precomputation_manager.maturities.append(hedged_maturity_days)
-                logging.info(
-                    f"{hedged_type.capitalize()} hedged derivative at maturity {hedged_maturity_days} days "
-                    f"requires precomputation - added to list"
-                )
-    
-    precomputed_data = precomputation_manager.precompute_all()
-    logging.info(f"Precomputation complete for maturities: {list(precomputed_data.keys())}")
-    
-    # Verify all needed maturities are precomputed
-    if needs_hedged_precompute:
-        hedged_maturity_days = int(config["hedged_option"]["T"] * 252)
-        if hedged_maturity_days not in precomputed_data:
-            logging.warning(f"Maturity {hedged_maturity_days} not in precomputed data, computing now...")
-            precomputation_manager.precompute_for_maturity(hedged_maturity_days)
-            precomputed_data[hedged_maturity_days] = precomputation_manager.get_precomputed_data(hedged_maturity_days)
-            logging.info(f"Precomputation complete for N={hedged_maturity_days}")
-    
-    hedged_derivative, hedging_derivatives = setup_derivatives_from_precomputed(
-        config, precomputed_data
-    )
-    
-    if args.inference_only and args.load_model:
-        logging.info(f"Loading pretrained model from {args.load_model}")
-        policy_net = create_policy_network(config, device)
-        policy_net.load_state_dict(torch.load(args.load_model, map_location=device))
-        logging.info("Model loaded successfully")
+        # Use config name instead of generic path
+        config_name = config.get("config_name", "model")
+        output_dir = os.path.dirname(config["output"]["plot_save_path"])
+        save_path = os.path.join(output_dir, f"{config_name}_episode_{episode}.png")
         
-        run_inference(
-            config=config,
-            policy_net=policy_net,
-            hedged_derivative=hedged_derivative,
-            hedging_derivatives=hedging_derivatives,
-            HedgingSim=HedgingSim,
-            device=device
-        )
-        logging.info("Inference complete!")
-        return
-    
-    initial_model = None
-    if args.load_model:
-        logging.info(f"Loading pretrained model from {args.load_model}")
-        initial_model = create_policy_network(config, device)
-        initial_model.load_state_dict(torch.load(args.load_model, map_location=device))
-        logging.info("Model loaded - will continue training from checkpoint")
-    
-    policy_net = train(
-        config=config,
-        HedgingSim=HedgingSim,
-        hedged_derivative=hedged_derivative,
-        hedging_derivatives=hedging_derivatives,
-        visualize=not args.no_visualize,
-        initial_model=initial_model,
-        config_name=config_name
-    )
-    
-    logging.info("Training complete!")
-
-
-if __name__ == "__main__":
-    main()
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        plt.savefig(save_path, dpi=config["output"]["plot_dpi"], bbox_inches='tight')
+        plt.close()
+        
+        logger.info(f"Plot saved to {save_path}")
+        
+    except Exception as e:
+        logger.error(f"Plotting failed: {type(e).__name__}: {str(e)}")
+        logger.error("Full traceback:", exc_info=True)
