@@ -33,6 +33,12 @@ def compute_practitioner_benchmark(
     """
     S_np = S_traj.cpu().numpy()
     
+    # Hardcoded clipping bounds (multiples of contract_size)
+    DELTA_CLIP = 5.0
+    GAMMA_CLIP = 10.0
+    VEGA_CLIP = 10.0
+    THETA_CLIP = 10.0
+    
     # Determine Greeks to hedge
     if n_hedging_instruments == 1:
         greek_names = ['delta']
@@ -47,10 +53,10 @@ def compute_practitioner_benchmark(
     
     # Define clipping bounds for each Greek
     clip_bounds = {
-        'delta': delta_clip * env.contract_size,
-        'gamma': gamma_clip * env.contract_size,
-        'vega': vega_clip * env.contract_size,
-        'theta': theta_clip * env.contract_size
+        'delta': DELTA_CLIP * env.contract_size,
+        'gamma': GAMMA_CLIP * env.contract_size,
+        'vega': VEGA_CLIP * env.contract_size,
+        'theta': THETA_CLIP * env.contract_size
     }
     
     # Compute portfolio Greeks with stability controls
@@ -62,67 +68,64 @@ def compute_practitioner_benchmark(
         portfolio_greeks[greek_name] = -env.side * greek_traj
         
         # OPTION 2: Detect instabilities
-        if detect_instability:
-            # Check for NaN or Inf
-            has_nan = torch.isnan(portfolio_greeks[greek_name]).any()
-            has_inf = torch.isinf(portfolio_greeks[greek_name]).any()
-            
-            if has_nan or has_inf:
-                nan_count = torch.isnan(portfolio_greeks[greek_name]).sum().item()
-                inf_count = torch.isinf(portfolio_greeks[greek_name]).sum().item()
-                total_elements = portfolio_greeks[greek_name].numel()
-                
-                logger.warning(
-                    f"[Practitioner Benchmark] {greek_name.upper()} contains "
-                    f"{nan_count} NaN ({nan_count/total_elements*100:.2f}%) and "
-                    f"{inf_count} Inf ({inf_count/total_elements*100:.2f}%) values"
-                )
-                
-                # Replace NaN/Inf with zeros
-                portfolio_greeks[greek_name] = torch.nan_to_num(
-                    portfolio_greeks[greek_name], 
-                    nan=0.0, 
-                    posinf=0.0, 
-                    neginf=0.0
-                )
-                instability_detected = True
-            
-            # Check for extreme values before clipping
-            threshold = clip_bounds[greek_name]
-            extreme_mask = torch.abs(portfolio_greeks[greek_name]) > threshold
-            
-            if extreme_mask.any():
-                n_extreme = extreme_mask.sum().item()
-                pct_extreme = n_extreme / portfolio_greeks[greek_name].numel() * 100
-                max_val = torch.abs(portfolio_greeks[greek_name]).max().item()
-                
-                logger.warning(
-                    f"[Practitioner Benchmark] {greek_name.upper()} has {n_extreme} "
-                    f"extreme values ({pct_extreme:.2f}% > {threshold:.2f}), "
-                    f"max absolute value: {max_val:.2f}"
-                )
-                instability_detected = True
+        # Check for NaN or Inf
+        has_nan = torch.isnan(portfolio_greeks[greek_name]).any()
+        has_inf = torch.isinf(portfolio_greeks[greek_name]).any()
         
-        # OPTION 1: Clip Greeks to reasonable bounds
-        if clip_greeks:
-            clip_bound = clip_bounds[greek_name]
-            original_mean = portfolio_greeks[greek_name].abs().mean().item()
+        if has_nan or has_inf:
+            nan_count = torch.isnan(portfolio_greeks[greek_name]).sum().item()
+            inf_count = torch.isinf(portfolio_greeks[greek_name]).sum().item()
+            total_elements = portfolio_greeks[greek_name].numel()
             
-            portfolio_greeks[greek_name] = torch.clamp(
-                portfolio_greeks[greek_name], 
-                -clip_bound, 
-                clip_bound
+            logger.warning(
+                f"[Practitioner Benchmark] {greek_name.upper()} contains "
+                f"{nan_count} NaN ({nan_count/total_elements*100:.2f}%) and "
+                f"{inf_count} Inf ({inf_count/total_elements*100:.2f}%) values"
             )
             
-            clipped_mean = portfolio_greeks[greek_name].abs().mean().item()
+            # Replace NaN/Inf with zeros
+            portfolio_greeks[greek_name] = torch.nan_to_num(
+                portfolio_greeks[greek_name], 
+                nan=0.0, 
+                posinf=0.0, 
+                neginf=0.0
+            )
+            instability_detected = True
+        
+        # Check for extreme values before clipping
+        threshold = clip_bounds[greek_name]
+        extreme_mask = torch.abs(portfolio_greeks[greek_name]) > threshold
+        
+        if extreme_mask.any():
+            n_extreme = extreme_mask.sum().item()
+            pct_extreme = n_extreme / portfolio_greeks[greek_name].numel() * 100
+            max_val = torch.abs(portfolio_greeks[greek_name]).max().item()
             
-            # Log clipping impact
-            if detect_instability and abs(original_mean - clipped_mean) / (original_mean + 1e-8) > 0.01:
-                logger.info(
-                    f"[Practitioner Benchmark] {greek_name.upper()} clipped: "
-                    f"mean |value| changed from {original_mean:.4f} to {clipped_mean:.4f} "
-                    f"(bounds: ±{clip_bound:.2f})"
-                )
+            logger.warning(
+                f"[Practitioner Benchmark] {greek_name.upper()} has {n_extreme} "
+                f"extreme values ({pct_extreme:.2f}% > {threshold:.2f}), "
+                f"max absolute value: {max_val:.2f}"
+            )
+            instability_detected = True
+        
+        # OPTION 1: Clip Greeks to reasonable bounds
+        original_mean = portfolio_greeks[greek_name].abs().mean().item()
+        
+        portfolio_greeks[greek_name] = torch.clamp(
+            portfolio_greeks[greek_name], 
+            -clip_bounds[greek_name], 
+            clip_bounds[greek_name]
+        )
+        
+        clipped_mean = portfolio_greeks[greek_name].abs().mean().item()
+        
+        # Log clipping impact
+        if abs(original_mean - clipped_mean) / (original_mean + 1e-8) > 0.01:
+            logger.info(
+                f"[Practitioner Benchmark] {greek_name.upper()} clipped: "
+                f"mean |value| changed from {original_mean:.4f} to {clipped_mean:.4f} "
+                f"(bounds: ±{clip_bounds[greek_name]:.2f})"
+            )
     
     if instability_detected:
         logger.warning(
@@ -134,13 +137,12 @@ def compute_practitioner_benchmark(
     HN_positions_all = env.compute_hn_option_positions(S_traj, portfolio_greeks)
     
     # Additional stability check on positions
-    if detect_instability:
-        if torch.isnan(HN_positions_all).any() or torch.isinf(HN_positions_all).any():
-            logger.error(
-                "[Practitioner Benchmark] Hedge positions contain NaN/Inf after solving. "
-                "Replacing with zeros."
-            )
-            HN_positions_all = torch.nan_to_num(HN_positions_all, nan=0.0, posinf=0.0, neginf=0.0)
+    if torch.isnan(HN_positions_all).any() or torch.isinf(HN_positions_all).any():
+        logger.error(
+            "[Practitioner Benchmark] Hedge positions contain NaN/Inf after solving. "
+            "Replacing with zeros."
+        )
+        HN_positions_all = torch.nan_to_num(HN_positions_all, nan=0.0, posinf=0.0, neginf=0.0)
     
     # Simulate hedge strategy
     _, trajectories_hn = env.simulate_full_trajectory(HN_positions_all, O_traj)
@@ -275,6 +277,7 @@ def compute_risk_measure_value(terminal_errors: np.ndarray, risk_measure: str, a
         # Default to MSE
         return float(np.mean(terminal_errors ** 2))
 
+
 def plot_episode_results(
     episode: int,
     metrics: Dict[str, Any],
@@ -317,12 +320,11 @@ def plot_episode_results(
             env, RL_positions, trajectories, O_traj
         )
         
-        # Get benchmark configuration
         # Compute practitioner benchmark with stability controls
         logger.info("Computing practitioner benchmark with stability controls...")
         HN_positions_all, trajectories_hn, terminal_hedge_error_hn = \
             compute_practitioner_benchmark(env, S_traj, O_traj, n_inst)
-                
+        
         # Compute HN metrics (standard)
         mse_hn = float(np.mean(terminal_hedge_error_hn ** 2))
         smse_hn = mse_hn / (env.S0 ** 2)
@@ -486,16 +488,15 @@ def plot_episode_results(
         if has_soft_constraint:
             title_text += f" + λ·SC (λ={lambda_constraint:.4f})"
         
-        # Add stability info if clipping was used
-        if clip_greeks:
-            title_text += f"\n[Greeks Clipped: Δ=±{delta_clip}·CS"
-            if n_inst >= 2:
-                title_text += f", Γ=±{gamma_clip}·CS"
-            if n_inst >= 3:
-                title_text += f", ν=±{vega_clip}·CS"
-            if n_inst >= 4:
-                title_text += f", Θ=±{theta_clip}·CS"
-            title_text += "]"
+        # Add stability info showing hardcoded clip bounds
+        title_text += f"\n[Greeks Clipped: Δ=±5·CS"
+        if n_inst >= 2:
+            title_text += f", Γ=±10·CS"
+        if n_inst >= 3:
+            title_text += f", ν=±10·CS"
+        if n_inst >= 4:
+            title_text += f", Θ=±10·CS"
+        title_text += "]"
         
         title_text += "\n"
         
@@ -507,8 +508,9 @@ def plot_episode_results(
             avg_violation_hn = trajectories_hn.get('soft_constraint_violations', torch.zeros(1)).mean().cpu().item() if 'soft_constraint_violations' in trajectories_hn else 0.0
             title_text += f"\nRL Constr={avg_violation_rl:.4f} | Prac Constr={avg_violation_hn:.4f}"
         
-        # Add standard metrics for reference
-        title_text += f"\nStandard Metrics - RL: MSE={rl_metrics['mse']:.4f} MAE={rl_metrics['mae']:.4f} | Prac: MSE={mse_hn:.4f} MAE={mae_hn:.4f}"
+        # Only show standard metrics if they differ from the training objective
+        if risk_measure not in ['mse', 'mae']:
+            title_text += f"\nReference Metrics - RL: MSE={rl_metrics['mse']:.4f} MAE={rl_metrics['mae']:.4f} | Prac: MSE={mse_hn:.4f} MAE={mae_hn:.4f}"
         
         axes[2, 1].set_title(title_text, fontsize=9)
         axes[2, 1].legend(fontsize=10)
