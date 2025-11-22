@@ -382,18 +382,16 @@ def plot_episode_results(
             print(f"  Max:  {portfolio_greek.max():12.6f}")
             print(f"  Min:  {portfolio_greek.min():12.6f}")
         
-        # Compute hedging instrument Greeks (used to neutralize portfolio Greeks)
+        # Compute hedging instrument Greeks (recompute them directly)
         if n_inst >= 2:
             print("\n--- HEDGING INSTRUMENT GREEKS (Used in matrix solve) ---")
             
-            # We need to reconstruct what the matrix looks like
-            # The matrix is built in compute_hn_option_positions
-            # For each time step, we have a system: A @ positions = portfolio_greeks
-            # where A[i,j] is the j-th Greek of the i-th hedging instrument
-            
             hedging_greeks = {}
+            h0_mean = env.h_t.mean().item()
+            
             for i in range(1, n_inst):
                 opt_idx = i - 1
+                hedge_deriv = env.hedging_derivatives[i]
                 maturity = env.instrument_maturities[i]
                 opt_type = env.instrument_types[i]
                 strike = env.instrument_strikes[i]
@@ -401,27 +399,40 @@ def plot_episode_results(
                 print(f"\nInstrument {i}: {maturity}d {opt_type.upper()} K={strike}")
                 
                 hedging_greeks[i] = {}
+                is_asian_hedge = env.hedging_is_asian[i]
+                
                 for greek_name in greek_names:
-                    # Compute Greek of hedging instrument using the same methods
-                    # We need to get the Greeks of the hedging options, not the derivative
-                    # This requires accessing the hedging option's Greeks
+                    # Compute Greek trajectory for this hedging instrument along the sample path
+                    greek_traj = torch.zeros((env.N + 1,), device=env.device)
+                    greek_method = getattr(hedge_deriv, greek_name)
                     
-                    # Try to get from environment if method exists
-                    if hasattr(env, 'hedging_greeks') and opt_idx in env.hedging_greeks:
-                        inst_greek = env.hedging_greeks[opt_idx][greek_name][path_idx].cpu().numpy()
-                    else:
-                        # Alternative: compute directly if we have the method
-                        # This depends on your implementation
-                        print(f"  {greek_name.upper()}: [Unable to compute - method not available]")
-                        continue
+                    A_t = None
                     
-                    hedging_greeks[i][greek_name] = inst_greek
+                    for t in range(env.N + 1):
+                        S_t = S_traj[path_idx, t]
+                        K_hedge = getattr(hedge_deriv, 'K', env.K)
+                        N_hedge = getattr(hedge_deriv, 'N', env.N)
+                        
+                        if is_asian_hedge:
+                            # Update running average for Asian hedging instrument
+                            A_t = env._update_running_average(A_t, S_t, t, N_hedge)
+                            greek_val = greek_method(
+                                S=S_t.unsqueeze(0), K=K_hedge, step_idx=t, N=N_hedge, h0=h0_mean, A=A_t.unsqueeze(0)
+                            )[0]
+                        else:
+                            greek_val = greek_method(
+                                S=S_t.unsqueeze(0), K=K_hedge, step_idx=t, N=N_hedge, h0=h0_mean
+                            )[0]
+                        
+                        greek_traj[t] = greek_val
+                    
+                    hedging_greeks[i][greek_name] = greek_traj.cpu().numpy()
                     
                     print(f"  {greek_name.upper()}:")
-                    print(f"    t=0:  {inst_greek[0]:12.6f}")
-                    print(f"    t=1:  {inst_greek[1]:12.6f}")
-                    if len(inst_greek) > 5:
-                        print(f"    t=5:  {inst_greek[5]:12.6f}")
+                    print(f"    t=0:  {greek_traj[0].item():12.6f}")
+                    print(f"    t=1:  {greek_traj[1].item():12.6f}")
+                    if len(greek_traj) > 5:
+                        print(f"    t=5:  {greek_traj[5].item():12.6f}")
         
         # Print the matrix condition at critical time points
         if n_inst >= 2:
