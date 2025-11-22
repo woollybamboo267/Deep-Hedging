@@ -34,10 +34,10 @@ def compute_practitioner_benchmark(
     S_np = S_traj.cpu().numpy()
     
     # Hardcoded clipping bounds (multiples of contract_size)
-    DELTA_CLIP = 5.0
-    GAMMA_CLIP = 10.0
-    VEGA_CLIP = 10.0
-    THETA_CLIP = 10.0
+    DELTA_CLIP = 1000
+    GAMMA_CLIP = 1000
+    VEGA_CLIP = 1000
+    THETA_CLIP = 1000
     
     # Determine Greeks to hedge
     if n_hedging_instruments == 1:
