@@ -350,6 +350,147 @@ def plot_episode_results(
         rl_positions_sample = RL_positions[path_idx].cpu().detach().numpy()
         hn_positions_sample = HN_positions_all[path_idx].cpu().detach().numpy()
         
+        # ============ GREEK DIAGNOSTICS ============
+        print("\n" + "="*80)
+        print(f"GREEK DIAGNOSTICS FOR PATH {path_idx}")
+        print("="*80)
+        
+        # Determine which Greeks to analyze
+        if n_inst == 1:
+            greek_names = ['delta']
+        elif n_inst == 2:
+            greek_names = ['delta', 'gamma']
+        elif n_inst == 3:
+            greek_names = ['delta', 'gamma', 'vega']
+        elif n_inst == 4:
+            greek_names = ['delta', 'gamma', 'vega', 'theta']
+        
+        # Compute portfolio Greeks (what we're trying to hedge)
+        print("\n--- PORTFOLIO GREEKS (Derivative being hedged) ---")
+        portfolio_greeks_diag = {}
+        for greek_name in greek_names:
+            greek_traj = env.compute_all_paths_greeks(S_traj, greek_name)
+            portfolio_greek = -env.side * greek_traj[path_idx].cpu().numpy()
+            portfolio_greeks_diag[greek_name] = portfolio_greek
+            
+            print(f"\n{greek_name.upper()}:")
+            print(f"  t=0:  {portfolio_greek[0]:12.6f}")
+            print(f"  t=1:  {portfolio_greek[1]:12.6f}")
+            if len(portfolio_greek) > 5:
+                print(f"  t=5:  {portfolio_greek[5]:12.6f}")
+            print(f"  Mean: {portfolio_greek.mean():12.6f}")
+            print(f"  Max:  {portfolio_greek.max():12.6f}")
+            print(f"  Min:  {portfolio_greek.min():12.6f}")
+        
+        # Compute hedging instrument Greeks (used to neutralize portfolio Greeks)
+        if n_inst >= 2:
+            print("\n--- HEDGING INSTRUMENT GREEKS (Used in matrix solve) ---")
+            
+            # We need to reconstruct what the matrix looks like
+            # The matrix is built in compute_hn_option_positions
+            # For each time step, we have a system: A @ positions = portfolio_greeks
+            # where A[i,j] is the j-th Greek of the i-th hedging instrument
+            
+            hedging_greeks = {}
+            for i in range(1, n_inst):
+                opt_idx = i - 1
+                maturity = env.instrument_maturities[i]
+                opt_type = env.instrument_types[i]
+                strike = env.instrument_strikes[i]
+                
+                print(f"\nInstrument {i}: {maturity}d {opt_type.upper()} K={strike}")
+                
+                hedging_greeks[i] = {}
+                for greek_name in greek_names:
+                    # Compute Greek of hedging instrument using the same methods
+                    # We need to get the Greeks of the hedging options, not the derivative
+                    # This requires accessing the hedging option's Greeks
+                    
+                    # Try to get from environment if method exists
+                    if hasattr(env, 'hedging_greeks') and opt_idx in env.hedging_greeks:
+                        inst_greek = env.hedging_greeks[opt_idx][greek_name][path_idx].cpu().numpy()
+                    else:
+                        # Alternative: compute directly if we have the method
+                        # This depends on your implementation
+                        print(f"  {greek_name.upper()}: [Unable to compute - method not available]")
+                        continue
+                    
+                    hedging_greeks[i][greek_name] = inst_greek
+                    
+                    print(f"  {greek_name.upper()}:")
+                    print(f"    t=0:  {inst_greek[0]:12.6f}")
+                    print(f"    t=1:  {inst_greek[1]:12.6f}")
+                    if len(inst_greek) > 5:
+                        print(f"    t=5:  {inst_greek[5]:12.6f}")
+        
+        # Print the matrix condition at critical time points
+        if n_inst >= 2:
+            print("\n--- MATRIX ANALYSIS AT CRITICAL TIME POINTS ---")
+            
+            for t in [0, 1, 5] if env.N >= 5 else [0, 1]:
+                if t >= len(time_steps):
+                    continue
+                    
+                print(f"\n>>> Time t={t} <<<")
+                print(f"Stock Price: {S_traj[path_idx, t].item():.4f}")
+                
+                print("\nMatrix A (hedging instrument Greeks):")
+                print("         ", end="")
+                for i in range(1, n_inst):
+                    print(f"  Inst_{i:2d}    ", end="")
+                print()
+                
+                for greek_name in greek_names:
+                    print(f"{greek_name:8s}:", end="")
+                    for i in range(1, n_inst):
+                        if i in hedging_greeks and greek_name in hedging_greeks[i]:
+                            val = hedging_greeks[i][greek_name][t]
+                            print(f" {val:11.6f}", end="")
+                        else:
+                            print(f"     N/A    ", end="")
+                    print()
+                
+                print("\nVector b (portfolio Greeks to neutralize):")
+                for greek_name in greek_names:
+                    val = portfolio_greeks_diag[greek_name][t]
+                    print(f"  {greek_name:8s}: {val:12.6f}")
+                
+                print("\nSolution (hedge positions):")
+                print(f"  Stock:    {hn_positions_sample[t, 0]:12.6f}")
+                for i in range(1, n_inst):
+                    maturity = env.instrument_maturities[i]
+                    opt_type = env.instrument_types[i]
+                    strike = env.instrument_strikes[i]
+                    print(f"  Opt_{i}:    {hn_positions_sample[t, i]:12.6f}  ({maturity}d {opt_type} K={strike})")
+                
+                # Compute matrix condition number if possible
+                if n_inst >= 2 and all(i in hedging_greeks for i in range(1, n_inst)):
+                    try:
+                        A_matrix = []
+                        for greek_name in greek_names:
+                            row = [hedging_greeks[i][greek_name][t] for i in range(1, n_inst)]
+                            A_matrix.append(row)
+                        A_matrix = np.array(A_matrix)
+                        
+                        if A_matrix.shape[0] == A_matrix.shape[1]:
+                            cond = np.linalg.cond(A_matrix)
+                            det = np.linalg.det(A_matrix)
+                            print(f"\nMatrix Condition Number: {cond:.2e}")
+                            print(f"Matrix Determinant: {det:.2e}")
+                            
+                            if cond > 1e10:
+                                print("⚠️  WARNING: Matrix is nearly singular (ill-conditioned)!")
+                            if abs(det) < 1e-10:
+                                print("⚠️  WARNING: Matrix determinant near zero!")
+                    except:
+                        print("\n[Could not compute condition number]")
+        
+        print("\n" + "="*80)
+        print("END GREEK DIAGNOSTICS")
+        print("="*80 + "\n")
+        
+        # ============ END GREEK DIAGNOSTICS ============
+        
         # PLOT 1: Stock Delta Comparison
         axes[0, 0].plot(time_steps, rl_positions_sample[:, 0], label='RL Delta',
                         linewidth=2, color='tab:blue')
