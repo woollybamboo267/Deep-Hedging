@@ -13,7 +13,24 @@ def compute_practitioner_benchmark(
     O_traj: Dict[int, torch.Tensor],
     n_hedging_instruments: int
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], np.ndarray]:
-    """Compute the practitioner benchmark hedge."""
+    """
+    Compute the practitioner benchmark hedge with stability controls.
+    
+    Greeks are automatically clipped to prevent numerical explosions:
+    - Delta: ±5 × contract_size
+    - Gamma: ±10 × contract_size
+    - Vega: ±10 × contract_size
+    - Theta: ±10 × contract_size
+    
+    Args:
+        env: Trading environment
+        S_traj: Stock price trajectories
+        O_traj: Option price trajectories
+        n_hedging_instruments: Number of hedging instruments
+    
+    Returns:
+        Tuple of (positions, trajectories, terminal_hedge_errors)
+    """
     S_np = S_traj.cpu().numpy()
     
     # Determine Greeks to hedge
@@ -28,14 +45,102 @@ def compute_practitioner_benchmark(
     else:
         raise ValueError(f"n_hedging_instruments must be 1-4, got {n_hedging_instruments}")
     
-    # Compute portfolio Greeks
+    # Define clipping bounds for each Greek
+    clip_bounds = {
+        'delta': delta_clip * env.contract_size,
+        'gamma': gamma_clip * env.contract_size,
+        'vega': vega_clip * env.contract_size,
+        'theta': theta_clip * env.contract_size
+    }
+    
+    # Compute portfolio Greeks with stability controls
     portfolio_greeks = {}
+    instability_detected = False
+    
     for greek_name in greek_names:
         greek_traj = env.compute_all_paths_greeks(S_traj, greek_name)
         portfolio_greeks[greek_name] = -env.side * greek_traj
+        
+        # OPTION 2: Detect instabilities
+        if detect_instability:
+            # Check for NaN or Inf
+            has_nan = torch.isnan(portfolio_greeks[greek_name]).any()
+            has_inf = torch.isinf(portfolio_greeks[greek_name]).any()
+            
+            if has_nan or has_inf:
+                nan_count = torch.isnan(portfolio_greeks[greek_name]).sum().item()
+                inf_count = torch.isinf(portfolio_greeks[greek_name]).sum().item()
+                total_elements = portfolio_greeks[greek_name].numel()
+                
+                logger.warning(
+                    f"[Practitioner Benchmark] {greek_name.upper()} contains "
+                    f"{nan_count} NaN ({nan_count/total_elements*100:.2f}%) and "
+                    f"{inf_count} Inf ({inf_count/total_elements*100:.2f}%) values"
+                )
+                
+                # Replace NaN/Inf with zeros
+                portfolio_greeks[greek_name] = torch.nan_to_num(
+                    portfolio_greeks[greek_name], 
+                    nan=0.0, 
+                    posinf=0.0, 
+                    neginf=0.0
+                )
+                instability_detected = True
+            
+            # Check for extreme values before clipping
+            threshold = clip_bounds[greek_name]
+            extreme_mask = torch.abs(portfolio_greeks[greek_name]) > threshold
+            
+            if extreme_mask.any():
+                n_extreme = extreme_mask.sum().item()
+                pct_extreme = n_extreme / portfolio_greeks[greek_name].numel() * 100
+                max_val = torch.abs(portfolio_greeks[greek_name]).max().item()
+                
+                logger.warning(
+                    f"[Practitioner Benchmark] {greek_name.upper()} has {n_extreme} "
+                    f"extreme values ({pct_extreme:.2f}% > {threshold:.2f}), "
+                    f"max absolute value: {max_val:.2f}"
+                )
+                instability_detected = True
+        
+        # OPTION 1: Clip Greeks to reasonable bounds
+        if clip_greeks:
+            clip_bound = clip_bounds[greek_name]
+            original_mean = portfolio_greeks[greek_name].abs().mean().item()
+            
+            portfolio_greeks[greek_name] = torch.clamp(
+                portfolio_greeks[greek_name], 
+                -clip_bound, 
+                clip_bound
+            )
+            
+            clipped_mean = portfolio_greeks[greek_name].abs().mean().item()
+            
+            # Log clipping impact
+            if detect_instability and abs(original_mean - clipped_mean) / (original_mean + 1e-8) > 0.01:
+                logger.info(
+                    f"[Practitioner Benchmark] {greek_name.upper()} clipped: "
+                    f"mean |value| changed from {original_mean:.4f} to {clipped_mean:.4f} "
+                    f"(bounds: ±{clip_bound:.2f})"
+                )
+    
+    if instability_detected:
+        logger.warning(
+            "[Practitioner Benchmark] Numerical instabilities detected and corrected. "
+            "This is common near expiry or at barriers for exotic derivatives."
+        )
     
     # Solve for optimal hedge positions
     HN_positions_all = env.compute_hn_option_positions(S_traj, portfolio_greeks)
+    
+    # Additional stability check on positions
+    if detect_instability:
+        if torch.isnan(HN_positions_all).any() or torch.isinf(HN_positions_all).any():
+            logger.error(
+                "[Practitioner Benchmark] Hedge positions contain NaN/Inf after solving. "
+                "Replacing with zeros."
+            )
+            HN_positions_all = torch.nan_to_num(HN_positions_all, nan=0.0, posinf=0.0, neginf=0.0)
     
     # Simulate hedge strategy
     _, trajectories_hn = env.simulate_full_trajectory(HN_positions_all, O_traj)
@@ -213,9 +318,27 @@ def plot_episode_results(
             env, RL_positions, trajectories, O_traj
         )
         
-        # Compute practitioner benchmark
+        # Get benchmark configuration
+        benchmark_config = config.get("practitioner_benchmark", {})
+        clip_greeks = benchmark_config.get("clip_greeks", True)
+        delta_clip = benchmark_config.get("delta_clip", 5.0)
+        gamma_clip = benchmark_config.get("gamma_clip", 10.0)
+        vega_clip = benchmark_config.get("vega_clip", 10.0)
+        theta_clip = benchmark_config.get("theta_clip", 10.0)
+        detect_instability = benchmark_config.get("detect_instability", True)
+        
+        # Compute practitioner benchmark with stability controls
+        logger.info("Computing practitioner benchmark with stability controls...")
         HN_positions_all, trajectories_hn, terminal_hedge_error_hn = \
-            compute_practitioner_benchmark(env, S_traj, O_traj, n_inst)
+            compute_practitioner_benchmark(
+                env, S_traj, O_traj, n_inst,
+                clip_greeks=clip_greeks,
+                delta_clip=delta_clip,
+                gamma_clip=gamma_clip,
+                vega_clip=vega_clip,
+                theta_clip=theta_clip,
+                detect_instability=detect_instability
+            )
         
         # Compute HN metrics (standard)
         mse_hn = float(np.mean(terminal_hedge_error_hn ** 2))
@@ -353,14 +476,10 @@ def plot_episode_results(
         axes[2, 1].set_xlabel("Terminal Hedge Error", fontsize=11)
         axes[2, 1].set_ylabel("Frequency", fontsize=11)
         
-        # ============================================================
-        # MODIFIED: Use config name as the main title
-        # ============================================================
-        # Extract config name (priority: experiment_name > config_file > plot_save_path dirname)
+        # Build comprehensive title starting with config name
         import os
         config_name = config.get("experiment_name")
         
-        # Build comprehensive title starting with config name
         greek_labels = {1: 'Delta', 2: 'Delta-Gamma', 3: 'Delta-Gamma-Vega', 4: 'Delta-Gamma-Vega-Theta'}
         hedged_option_type = config["hedged_option"]["type"].capitalize()
         
@@ -383,6 +502,17 @@ def plot_episode_results(
         
         if has_soft_constraint:
             title_text += f" + λ·SC (λ={lambda_constraint:.4f})"
+        
+        # Add stability info if clipping was used
+        if clip_greeks:
+            title_text += f"\n[Greeks Clipped: Δ=±{delta_clip}·CS"
+            if n_inst >= 2:
+                title_text += f", Γ=±{gamma_clip}·CS"
+            if n_inst >= 3:
+                title_text += f", ν=±{vega_clip}·CS"
+            if n_inst >= 4:
+                title_text += f", Θ=±{theta_clip}·CS"
+            title_text += "]"
         
         title_text += "\n"
         
