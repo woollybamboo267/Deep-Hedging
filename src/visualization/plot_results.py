@@ -275,7 +275,6 @@ def compute_risk_measure_value(terminal_errors: np.ndarray, risk_measure: str, a
         # Default to MSE
         return float(np.mean(terminal_errors ** 2))
 
-
 def plot_episode_results(
     episode: int,
     metrics: Dict[str, Any],
@@ -319,27 +318,11 @@ def plot_episode_results(
         )
         
         # Get benchmark configuration
-        benchmark_config = config.get("practitioner_benchmark", {})
-        clip_greeks = benchmark_config.get("clip_greeks", True)
-        delta_clip = benchmark_config.get("delta_clip", 5.0)
-        gamma_clip = benchmark_config.get("gamma_clip", 10.0)
-        vega_clip = benchmark_config.get("vega_clip", 10.0)
-        theta_clip = benchmark_config.get("theta_clip", 10.0)
-        detect_instability = benchmark_config.get("detect_instability", True)
-        
         # Compute practitioner benchmark with stability controls
         logger.info("Computing practitioner benchmark with stability controls...")
         HN_positions_all, trajectories_hn, terminal_hedge_error_hn = \
-            compute_practitioner_benchmark(
-                env, S_traj, O_traj, n_inst,
-                clip_greeks=clip_greeks,
-                delta_clip=delta_clip,
-                gamma_clip=gamma_clip,
-                vega_clip=vega_clip,
-                theta_clip=theta_clip,
-                detect_instability=detect_instability
-            )
-        
+            compute_practitioner_benchmark(env, S_traj, O_traj, n_inst)
+                
         # Compute HN metrics (standard)
         mse_hn = float(np.mean(terminal_hedge_error_hn ** 2))
         smse_hn = mse_hn / (env.S0 ** 2)
