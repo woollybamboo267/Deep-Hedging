@@ -328,9 +328,18 @@ def compute_risk_measure_value(terminal_errors: np.ndarray, risk_measure: str, a
 def plot_episode_results(
     episode: int,
     metrics: Dict[str, Any],
-    config: Dict[str, Any]
+    config: Dict[str, Any],
+    use_clipped_practitioner_errors: bool = True
 ) -> None:
-    """Create comprehensive visualization of episode results with full support for all models."""
+    """
+    Create comprehensive visualization of episode results with full support for all models.
+    
+    Args:
+        episode: Episode number
+        metrics: Dictionary containing trajectories and positions
+        config: Configuration dictionary
+        use_clipped_practitioner_errors: If True, recalculate practitioner errors using clipped positions
+    """
     try:
         logger.info(f"Generating plots for episode {episode}")
         
@@ -372,6 +381,60 @@ def plot_episode_results(
         HN_positions_all, trajectories_hn, terminal_hedge_error_hn = \
             compute_practitioner_benchmark(env, S_traj, O_traj, n_inst)
         
+        # Apply outlier clipping to ALL practitioner positions if enabled
+        if use_clipped_practitioner_errors:
+            logger.info("Applying outlier clipping to practitioner positions (z > 3.0 std)...")
+            HN_positions_all_np = HN_positions_all.cpu().detach().numpy()
+            HN_positions_clipped = np.zeros_like(HN_positions_all_np)
+            
+            n_paths = HN_positions_all_np.shape[0]
+            total_clipped = 0
+            
+            for path_idx in range(n_paths):
+                clipped_path = clip_outliers_to_last_valid(HN_positions_all_np[path_idx], n_std=3.0)
+                HN_positions_clipped[path_idx] = clipped_path
+                
+                # Count how many positions were clipped
+                total_clipped += np.sum(np.abs(clipped_path - HN_positions_all_np[path_idx]) > 1e-10)
+            
+            logger.info(f"Clipped {total_clipped} outlier positions across {n_paths} paths")
+            
+            # Convert back to tensor
+            HN_positions_all = torch.from_numpy(HN_positions_clipped).to(HN_positions_all.device).float()
+            
+            # Recalculate trajectories and terminal errors with clipped positions
+            _, trajectories_hn = env.simulate_full_trajectory(HN_positions_all, O_traj)
+            
+            # Recompute terminal hedge errors
+            S_final = trajectories_hn['S'][:, -1]
+            
+            if hasattr(env.derivative, 'option_type'):
+                opt_type = env.derivative.option_type.lower()
+            else:
+                opt_type = env.option_type.lower()
+            
+            if hasattr(env, 'is_asian_hedged') and env.is_asian_hedged:
+                A_hedged = env._reconstruct_running_average(trajectories_hn['S'])
+                if opt_type == "call":
+                    payoff = torch.clamp(A_hedged - env.K, min=0.0)
+                else:
+                    payoff = torch.clamp(env.K - A_hedged, min=0.0)
+            else:
+                if opt_type == "call":
+                    payoff = torch.clamp(S_final - env.K, min=0.0)
+                else:
+                    payoff = torch.clamp(env.K - S_final, min=0.0)
+            
+            payoff = payoff * env.contract_size
+            
+            terminal_value_hn = trajectories_hn['B'][:, -1] + HN_positions_all[:, -1, 0] * S_final
+            for i, maturity in enumerate(env.instrument_maturities[1:], start=1):
+                terminal_value_hn += HN_positions_all[:, -1, i] * O_traj[i - 1][:, -1]
+            
+            terminal_hedge_error_hn = (terminal_value_hn - env.side * payoff).cpu().detach().numpy()
+            
+            logger.info("Practitioner errors recalculated with clipped positions")
+        
         # Compute HN metrics (standard)
         mse_hn = float(np.mean(terminal_hedge_error_hn ** 2))
         smse_hn = mse_hn / (env.S0 ** 2)
@@ -395,12 +458,14 @@ def plot_episode_results(
         
         time_steps = np.arange(env.N + 1)
         
-        # Extract sample paths for plotting and apply outlier clipping
+        # Extract sample paths for plotting (apply clipping for visualization only)
         rl_positions_sample = RL_positions[path_idx].cpu().detach().numpy()
         hn_positions_sample = HN_positions_all[path_idx].cpu().detach().numpy()
         
-        # Apply outlier clipping to practitioner positions
-        hn_positions_sample = clip_outliers_to_last_valid(hn_positions_sample, n_std=3.0)
+        # Note: If use_clipped_practitioner_errors=True, HN_positions_all is already clipped
+        # If False, we still clip just for visualization
+        if not use_clipped_practitioner_errors:
+            hn_positions_sample = clip_outliers_to_last_valid(hn_positions_sample, n_std=3.0)
         
         # PLOT 1: Stock Delta Comparison (spans 2 columns)
         ax1 = fig.add_subplot(gs[0, :2])
@@ -534,6 +599,9 @@ def plot_episode_results(
         
         if has_soft_constraint:
             title_text += f" + λ·SC (λ={lambda_constraint:.4f})"
+        
+        if use_clipped_practitioner_errors:
+            title_text += " [Prac: Clipped Positions]"
         
         title_text += "\n"
         title_text += f"RL {risk_display}={rl_training_objective:.4f} | Prac {risk_display}={hn_training_objective:.4f}"
