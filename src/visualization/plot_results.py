@@ -350,158 +350,6 @@ def plot_episode_results(
         rl_positions_sample = RL_positions[path_idx].cpu().detach().numpy()
         hn_positions_sample = HN_positions_all[path_idx].cpu().detach().numpy()
         
-        # ============ GREEK DIAGNOSTICS ============
-        print("\n" + "="*80)
-        print(f"GREEK DIAGNOSTICS FOR PATH {path_idx}")
-        print("="*80)
-        
-        # Determine which Greeks to analyze
-        if n_inst == 1:
-            greek_names = ['delta']
-        elif n_inst == 2:
-            greek_names = ['delta', 'gamma']
-        elif n_inst == 3:
-            greek_names = ['delta', 'gamma', 'vega']
-        elif n_inst == 4:
-            greek_names = ['delta', 'gamma', 'vega', 'theta']
-        
-        # Compute portfolio Greeks (what we're trying to hedge)
-        print("\n--- PORTFOLIO GREEKS (Derivative being hedged) ---")
-        portfolio_greeks_diag = {}
-        for greek_name in greek_names:
-            greek_traj = env.compute_all_paths_greeks(S_traj, greek_name)
-            portfolio_greek = -env.side * greek_traj[path_idx].cpu().numpy()
-            portfolio_greeks_diag[greek_name] = portfolio_greek
-            
-            print(f"\n{greek_name.upper()}:")
-            print(f"  t=0:  {portfolio_greek[0]:12.6f}")
-            print(f"  t=1:  {portfolio_greek[1]:12.6f}")
-            if len(portfolio_greek) > 5:
-                print(f"  t=5:  {portfolio_greek[5]:12.6f}")
-            print(f"  Mean: {portfolio_greek.mean():12.6f}")
-            print(f"  Max:  {portfolio_greek.max():12.6f}")
-            print(f"  Min:  {portfolio_greek.min():12.6f}")
-        
-        # Compute hedging instrument Greeks (recompute them directly)
-        if n_inst >= 2:
-            print("\n--- HEDGING INSTRUMENT GREEKS (Used in matrix solve) ---")
-            
-            hedging_greeks = {}
-            h0_mean = env.h_t.mean().item()
-            
-            for i in range(1, n_inst):
-                opt_idx = i - 1
-                hedge_deriv = env.hedging_derivatives[i]
-                maturity = env.instrument_maturities[i]
-                opt_type = env.instrument_types[i]
-                strike = env.instrument_strikes[i]
-                
-                print(f"\nInstrument {i}: {maturity}d {opt_type.upper()} K={strike}")
-                
-                hedging_greeks[i] = {}
-                is_asian_hedge = env.hedging_is_asian[i]
-                
-                for greek_name in greek_names:
-                    # Compute Greek trajectory for this hedging instrument along the sample path
-                    greek_traj = torch.zeros((env.N + 1,), device=env.device)
-                    greek_method = getattr(hedge_deriv, greek_name)
-                    
-                    A_t = None
-                    
-                    for t in range(env.N + 1):
-                        S_t = S_traj[path_idx, t]
-                        K_hedge = getattr(hedge_deriv, 'K', env.K)
-                        N_hedge = getattr(hedge_deriv, 'N', env.N)
-                        
-                        if is_asian_hedge:
-                            # Update running average for Asian hedging instrument
-                            A_t = env._update_running_average(A_t, S_t, t, N_hedge)
-                            greek_val = greek_method(
-                                S=S_t.unsqueeze(0), K=K_hedge, step_idx=t, N=N_hedge, h0=h0_mean, A=A_t.unsqueeze(0)
-                            )[0]
-                        else:
-                            greek_val = greek_method(
-                                S=S_t.unsqueeze(0), K=K_hedge, step_idx=t, N=N_hedge, h0=h0_mean
-                            )[0]
-                        
-                        greek_traj[t] = greek_val
-                    
-                    hedging_greeks[i][greek_name] = greek_traj.cpu().numpy()
-                    
-                    print(f"  {greek_name.upper()}:")
-                    print(f"    t=0:  {greek_traj[0].item():12.6f}")
-                    print(f"    t=1:  {greek_traj[1].item():12.6f}")
-                    if len(greek_traj) > 5:
-                        print(f"    t=5:  {greek_traj[5].item():12.6f}")
-        
-        # Print the matrix condition at critical time points
-        if n_inst >= 2:
-            print("\n--- MATRIX ANALYSIS AT CRITICAL TIME POINTS ---")
-            
-            for t in [0, 1, 5] if env.N >= 5 else [0, 1]:
-                if t >= len(time_steps):
-                    continue
-                    
-                print(f"\n>>> Time t={t} <<<")
-                print(f"Stock Price: {S_traj[path_idx, t].item():.4f}")
-                
-                print("\nMatrix A (hedging instrument Greeks):")
-                print("         ", end="")
-                for i in range(1, n_inst):
-                    print(f"  Inst_{i:2d}    ", end="")
-                print()
-                
-                for greek_name in greek_names:
-                    print(f"{greek_name:8s}:", end="")
-                    for i in range(1, n_inst):
-                        if i in hedging_greeks and greek_name in hedging_greeks[i]:
-                            val = hedging_greeks[i][greek_name][t]
-                            print(f" {val:11.6f}", end="")
-                        else:
-                            print(f"     N/A    ", end="")
-                    print()
-                
-                print("\nVector b (portfolio Greeks to neutralize):")
-                for greek_name in greek_names:
-                    val = portfolio_greeks_diag[greek_name][t]
-                    print(f"  {greek_name:8s}: {val:12.6f}")
-                
-                print("\nSolution (hedge positions):")
-                print(f"  Stock:    {hn_positions_sample[t, 0]:12.6f}")
-                for i in range(1, n_inst):
-                    maturity = env.instrument_maturities[i]
-                    opt_type = env.instrument_types[i]
-                    strike = env.instrument_strikes[i]
-                    print(f"  Opt_{i}:    {hn_positions_sample[t, i]:12.6f}  ({maturity}d {opt_type} K={strike})")
-                
-                # Compute matrix condition number if possible
-                if n_inst >= 2 and all(i in hedging_greeks for i in range(1, n_inst)):
-                    try:
-                        A_matrix = []
-                        for greek_name in greek_names:
-                            row = [hedging_greeks[i][greek_name][t] for i in range(1, n_inst)]
-                            A_matrix.append(row)
-                        A_matrix = np.array(A_matrix)
-                        
-                        if A_matrix.shape[0] == A_matrix.shape[1]:
-                            cond = np.linalg.cond(A_matrix)
-                            det = np.linalg.det(A_matrix)
-                            print(f"\nMatrix Condition Number: {cond:.2e}")
-                            print(f"Matrix Determinant: {det:.2e}")
-                            
-                            if cond > 1e10:
-                                print("⚠️  WARNING: Matrix is nearly singular (ill-conditioned)!")
-                            if abs(det) < 1e-10:
-                                print("⚠️  WARNING: Matrix determinant near zero!")
-                    except:
-                        print("\n[Could not compute condition number]")
-        
-        print("\n" + "="*80)
-        print("END GREEK DIAGNOSTICS")
-        print("="*80 + "\n")
-        
-        # ============ END GREEK DIAGNOSTICS ============
-        
         # PLOT 1: Stock Delta Comparison
         axes[0, 0].plot(time_steps, rl_positions_sample[:, 0], label='RL Delta',
                         linewidth=2, color='tab:blue')
@@ -614,8 +462,7 @@ def plot_episode_results(
         axes[2, 1].set_ylabel("Frequency", fontsize=11)
         
         # Build comprehensive title starting with config name
-        import os
-        config_name = config.get("experiment_name")
+        config_name = config.get("config_name", "model")
         
         greek_labels = {1: 'Delta', 2: 'Delta-Gamma', 3: 'Delta-Gamma-Vega', 4: 'Delta-Gamma-Vega-Theta'}
         hedged_option_type = config["hedged_option"]["type"].capitalize()
@@ -631,38 +478,24 @@ def plot_episode_results(
         risk_display = risk_display_names.get(risk_measure, risk_measure.upper())
         
         # Start with config name as main title
-        title_text = f"{config_name}\n"
+        title_text = f"{config_name} | Episode {episode}\n"
         title_text += (
-            f"Episode {episode} - {n_inst} Instruments ({greek_labels[n_inst]}) - Hedging {hedged_option_type}\n"
+            f"{n_inst} Instruments ({greek_labels[n_inst]}) - Hedging {hedged_option_type}\n"
             f"Training Objective: {risk_display}"
         )
         
         if has_soft_constraint:
             title_text += f" + λ·SC (λ={lambda_constraint:.4f})"
         
-        # Add stability info showing hardcoded clip bounds
-        title_text += f"\n[Greeks Clipped: Δ=±5·CS"
-        if n_inst >= 2:
-            title_text += f", Γ=±10·CS"
-        if n_inst >= 3:
-            title_text += f", ν=±10·CS"
-        if n_inst >= 4:
-            title_text += f", Θ=±10·CS"
-        title_text += "]"
-        
         title_text += "\n"
         
-        # Show training objective values
+        # Show ONLY the training objective values (the risk measure being optimized)
         title_text += f"RL {risk_display}={rl_training_objective:.4f} | Prac {risk_display}={hn_training_objective:.4f}"
         
         if has_soft_constraint:
             avg_violation_rl = trajectories['soft_constraint_violations'].mean().cpu().item()
             avg_violation_hn = trajectories_hn.get('soft_constraint_violations', torch.zeros(1)).mean().cpu().item() if 'soft_constraint_violations' in trajectories_hn else 0.0
-            title_text += f"\nRL Constr={avg_violation_rl:.4f} | Prac Constr={avg_violation_hn:.4f}"
-        
-        # Only show standard metrics if they differ from the training objective
-        if risk_measure not in ['mse', 'mae']:
-            title_text += f"\nReference Metrics - RL: MSE={rl_metrics['mse']:.4f} MAE={rl_metrics['mae']:.4f} | Prac: MSE={mse_hn:.4f} MAE={mae_hn:.4f}"
+            title_text += f" | RL Constr={avg_violation_rl:.4f} | Prac Constr={avg_violation_hn:.4f}"
         
         axes[2, 1].set_title(title_text, fontsize=9)
         axes[2, 1].legend(fontsize=10)
@@ -721,9 +554,12 @@ def plot_episode_results(
             axes[3, 1].text(0.1, 0.5, stats_text, transform=axes[3, 1].transAxes,
                            fontsize=10, verticalalignment='center', family='monospace')
         
-        # Save plot
+        # Save plot using config name directly
         fig.tight_layout()
-        save_path = config["output"]["plot_save_path"].format(episode=episode)
+        
+        config_name = config.get("config_name", "model")
+        save_path = f"{config_name}.png"
+        
         plt.savefig(save_path, dpi=config["output"]["plot_dpi"], bbox_inches='tight')
         plt.close()
         
