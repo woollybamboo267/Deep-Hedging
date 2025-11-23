@@ -1,8 +1,9 @@
-
 import torch
 import numpy as np
 from numpy.polynomial.legendre import leggauss
 import logging
+import pickle
+from pathlib import Path
 from typing import Dict, Any, Optional
 """
 Precomputation module for Heston-Nandi option pricing.
@@ -11,12 +12,6 @@ This module handles the precomputation of characteristic function coefficients
 for the Heston-Nandi GARCH option pricing model. These coefficients are used
 for efficient option pricing, delta, gamma, and vega calculations.
 """
-
-import torch
-import numpy as np
-from numpy.polynomial.legendre import leggauss
-import logging
-from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -177,8 +172,8 @@ class PrecomputationManager:
     """
     Manages precomputation for multiple instrument maturities.
     
-    This class coordinates the precomputation of coefficients for all
-    required maturities based on the hedging instruments configuration.
+    This class loads precomputed coefficients from disk (precomputed_cache/)
+    instead of computing them on the fly.
     """
     
     def __init__(
@@ -188,7 +183,8 @@ class PrecomputationManager:
         maturities: list,
         N_quad: int = 128,
         u_max: float = 100.0,
-        device: str = "cpu"
+        device: str = "cpu",
+        cache_dir: str = "precomputed_cache"
     ):
         """
         Initialize the precomputation manager.
@@ -196,10 +192,11 @@ class PrecomputationManager:
         Args:
             garch_params: GARCH model parameters
             r_annual: Annual risk-free rate
-            maturities: List of maturities in days to precompute
-            N_quad: Number of quadrature points
-            u_max: Maximum integration range
+            maturities: List of maturities in days to load
+            N_quad: Number of quadrature points (must match precomputed data)
+            u_max: Maximum integration range (must match precomputed data)
             device: Computation device
+            cache_dir: Directory containing precomputed data files
         """
         self.garch_params = garch_params
         self.r_annual = r_annual
@@ -208,42 +205,90 @@ class PrecomputationManager:
         self.N_quad = N_quad
         self.u_max = u_max
         self.device = device
-        
-        self.precomputer = HestonNandiPrecomputer(
-            garch_params=garch_params,
-            r_daily=self.r_daily,
-            N_quad=N_quad,
-            u_max=u_max,
-            device=device
-        )
+        self.cache_dir = Path(cache_dir)
         
         self.precomputed_data = {}
+        
+        # Validate cache directory exists
+        if not self.cache_dir.exists():
+            raise FileNotFoundError(
+                f"Cache directory not found: {self.cache_dir}\n"
+                f"Please run precompute_all_maturities.py first to generate the cache."
+            )
         
         logger.info(
             f"Initialized PrecomputationManager for maturities: {self.maturities}"
         )
+        logger.info(f"Loading from cache directory: {self.cache_dir}")
+    
+    def _load_from_disk(self, maturity: int) -> Dict[str, Any]:
+        """
+        Load precomputed data for a specific maturity from disk.
+        
+        Args:
+            maturity: Maturity in days
+            
+        Returns:
+            Dictionary containing precomputed coefficients and metadata
+        """
+        filename = self.cache_dir / f"precomputed_N{maturity:04d}.pkl"
+        
+        if not filename.exists():
+            raise FileNotFoundError(
+                f"Precomputed data not found: {filename}\n"
+                f"Available range: N0001.pkl to N0504.pkl\n"
+                f"Please run: python precompute_all_maturities.py --min-maturity {maturity} --max-maturity {maturity}"
+            )
+        
+        with open(filename, 'rb') as f:
+            data = pickle.load(f)
+        
+        logger.info(f"Loaded precomputed data for N={maturity} from {filename}")
+        
+        # Move tensors to the correct device
+        if 'coefficients' in data:
+            data['coefficients'] = data['coefficients'].to(self.device)
+        if 'u_nodes' in data:
+            data['u_nodes'] = data['u_nodes'].to(self.device)
+        if 'w_nodes' in data:
+            data['w_nodes'] = data['w_nodes'].to(self.device)
+        
+        # Validate parameters match
+        if data.get('N') != maturity:
+            logger.warning(
+                f"Maturity mismatch: requested {maturity}, file contains {data.get('N')}"
+            )
+        
+        return data
     
     def precompute_all(self) -> Dict[int, Dict[str, Any]]:
         """
-        Precompute coefficients for all required maturities.
+        Load precomputed coefficients for all required maturities from disk.
         
         Returns:
             Dictionary mapping maturity (in days) to precomputed data
         """
-        logger.info("Starting precomputation for all maturities...")
+        logger.info("Loading precomputed data for all maturities...")
         
         for maturity in self.maturities:
-            logger.info(f"Precomputing for maturity: {maturity} days")
-            self.precomputed_data[maturity] = self.precomputer.precompute_coefficients(
-                N=maturity
-            )
+            try:
+                logger.info(f"Loading maturity: {maturity} days")
+                self.precomputed_data[maturity] = self._load_from_disk(maturity)
+            except FileNotFoundError as e:
+                logger.error(str(e))
+                raise
+            except Exception as e:
+                logger.error(f"Failed to load maturity {maturity}: {e}")
+                raise
         
-        logger.info("Precomputation complete for all maturities")
+        logger.info(f"Successfully loaded precomputed data for {len(self.precomputed_data)} maturities")
         return self.precomputed_data
     
     def get_precomputed_data(self, maturity: int) -> Optional[Dict[str, Any]]:
         """
         Get precomputed data for a specific maturity.
+        
+        If not already loaded, attempts to load from disk.
         
         Args:
             maturity: Maturity in days
@@ -252,9 +297,27 @@ class PrecomputationManager:
             Precomputed data dictionary or None if not found
         """
         if maturity not in self.precomputed_data:
-            logger.warning(f"No precomputed data found for maturity {maturity}")
-            return None
+            logger.info(f"Maturity {maturity} not in cache, loading from disk...")
+            try:
+                self.precomputed_data[maturity] = self._load_from_disk(maturity)
+            except FileNotFoundError:
+                logger.warning(f"No precomputed data found for maturity {maturity}")
+                return None
+        
         return self.precomputed_data[maturity]
+    
+    def precompute_for_maturity(self, maturity: int) -> None:
+        """
+        Load precomputed data for a specific maturity (convenience method).
+        
+        Args:
+            maturity: Maturity in days
+        """
+        if maturity not in self.maturities:
+            self.maturities.append(maturity)
+            self.maturities = sorted(self.maturities)
+        
+        self.precomputed_data[maturity] = self._load_from_disk(maturity)
 
 
 def create_precomputation_manager_from_config(
@@ -273,13 +336,17 @@ def create_precomputation_manager_from_config(
     Returns:
         Configured PrecomputationManager instance
     """
+    # Get cache directory from config or use default
+    cache_dir = config.get("precomputation", {}).get("cache_dir", "precomputed_cache")
+    
     manager = PrecomputationManager(
         garch_params=config["garch"],
         r_annual=config["simulation"]["r"],
         maturities=config["instruments"]["maturities"],
         N_quad=config["precomputation"]["N_quad"],
         u_max=config["precomputation"]["u_max"],
-        device=config["precomputation"]["device"]
+        device=config["precomputation"]["device"],
+        cache_dir=cache_dir
     )
     
     return manager
