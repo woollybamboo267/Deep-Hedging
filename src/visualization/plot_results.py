@@ -2,6 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 import logging
+import os
 from typing import Dict, Any, Tuple, Optional
 
 logger = logging.getLogger(__name__)
@@ -184,6 +185,52 @@ def compute_practitioner_benchmark(
     return HN_positions_all, trajectories_hn, terminal_hedge_error_hn
 
 
+def clip_outliers_to_last_valid(positions: np.ndarray, n_std: float = 3.0) -> np.ndarray:
+    """
+    Clip extreme outliers in position trajectories by replacing them with the last valid value.
+    
+    Args:
+        positions: Array of shape (n_timesteps, n_instruments)
+        n_std: Number of standard deviations beyond which to clip (default 3.0)
+    
+    Returns:
+        Clipped positions array
+    """
+    clipped = positions.copy()
+    n_timesteps, n_instruments = positions.shape
+    
+    for inst_idx in range(n_instruments):
+        pos = positions[:, inst_idx]
+        
+        # Compute statistics
+        mean = np.mean(pos)
+        std = np.std(pos)
+        
+        if std < 1e-10:  # Avoid division by zero
+            continue
+        
+        # Identify outliers
+        z_scores = np.abs((pos - mean) / std)
+        outlier_mask = z_scores > n_std
+        
+        if not outlier_mask.any():
+            continue
+        
+        # Replace outliers with last valid value
+        last_valid = pos[0]
+        for t in range(n_timesteps):
+            if outlier_mask[t]:
+                clipped[t, inst_idx] = last_valid
+                logger.info(
+                    f"Clipped outlier at t={t}, instrument {inst_idx}: "
+                    f"{pos[t]:.4f} -> {last_valid:.4f} (z-score: {z_scores[t]:.2f})"
+                )
+            else:
+                last_valid = pos[t]
+    
+    return clipped
+
+
 def compute_rl_metrics(
     env: Any,
     RL_positions: torch.Tensor,
@@ -340,28 +387,35 @@ def plot_episode_results(
         
         # Create figure with appropriate number of subplots
         if has_soft_constraint:
-            fig, axes = plt.subplots(4, 2, figsize=(14, 18))
+            fig = plt.figure(figsize=(16, 18))
+            gs = fig.add_gridspec(4, 3, hspace=0.3, wspace=0.3)
         else:
-            fig, axes = plt.subplots(3, 2, figsize=(14, 14))
+            fig = plt.figure(figsize=(16, 14))
+            gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
         
         time_steps = np.arange(env.N + 1)
         
-        # Extract sample paths for plotting
+        # Extract sample paths for plotting and apply outlier clipping
         rl_positions_sample = RL_positions[path_idx].cpu().detach().numpy()
         hn_positions_sample = HN_positions_all[path_idx].cpu().detach().numpy()
         
-        # PLOT 1: Stock Delta Comparison
-        axes[0, 0].plot(time_steps, rl_positions_sample[:, 0], label='RL Delta',
-                        linewidth=2, color='tab:blue')
-        axes[0, 0].plot(time_steps, hn_positions_sample[:, 0], label='Practitioner Delta',
-                        linewidth=2, linestyle='--', alpha=0.8, color='tab:orange')
-        axes[0, 0].set_xlabel("Time Step", fontsize=11)
-        axes[0, 0].set_ylabel("Delta", fontsize=11)
-        axes[0, 0].set_title(f"Stock Delta: Practitioner vs RL (Path {path_idx})", fontsize=12)
-        axes[0, 0].legend(fontsize=10)
-        axes[0, 0].grid(True, alpha=0.3)
+        # Apply outlier clipping to practitioner positions
+        hn_positions_sample = clip_outliers_to_last_valid(hn_positions_sample, n_std=3.0)
         
-        # PLOT 2: Option Positions Comparison
+        # PLOT 1: Stock Delta Comparison (spans 2 columns)
+        ax1 = fig.add_subplot(gs[0, :2])
+        ax1.plot(time_steps, rl_positions_sample[:, 0], label='RL Delta',
+                 linewidth=2, color='tab:blue')
+        ax1.plot(time_steps, hn_positions_sample[:, 0], label='Practitioner Delta',
+                 linewidth=2, linestyle='--', alpha=0.8, color='tab:orange')
+        ax1.set_xlabel("Time Step", fontsize=11)
+        ax1.set_ylabel("Delta", fontsize=11)
+        ax1.set_title(f"Stock Delta: Practitioner vs RL (Path {path_idx})", fontsize=12)
+        ax1.legend(fontsize=10)
+        ax1.grid(True, alpha=0.3)
+        
+        # PLOT 2: Option Positions Comparison (right column, row 1)
+        ax2 = fig.add_subplot(gs[0, 2])
         if n_inst >= 2:
             for i in range(1, n_inst):
                 maturity = env.instrument_maturities[i]
@@ -369,59 +423,53 @@ def plot_episode_results(
                 strike = env.instrument_strikes[i]
                 label_suffix = f'{maturity}d {opt_type.upper()} K={strike}'
                 
-                axes[0, 1].plot(time_steps, rl_positions_sample[:, i],
-                              label=f'RL {label_suffix}', linewidth=2)
-                axes[0, 1].plot(time_steps, hn_positions_sample[:, i],
-                              label=f'Prac {label_suffix}', linewidth=2,
-                              linestyle='--', alpha=0.8)
-            axes[0, 1].axhline(y=0, color='k', linestyle='-', alpha=0.3)
-            axes[0, 1].set_xlabel("Time Step", fontsize=11)
-            axes[0, 1].set_ylabel("Option Contracts", fontsize=11)
-            axes[0, 1].set_title(f"Option Positions: Practitioner vs RL (Path {path_idx})", fontsize=12)
-            axes[0, 1].legend(fontsize=9)
-            axes[0, 1].grid(True, alpha=0.3)
+                ax2.plot(time_steps, rl_positions_sample[:, i],
+                        label=f'RL {label_suffix}', linewidth=2)
+                ax2.plot(time_steps, hn_positions_sample[:, i],
+                        label=f'Prac {label_suffix}', linewidth=2,
+                        linestyle='--', alpha=0.8)
+            ax2.axhline(y=0, color='k', linestyle='-', alpha=0.3)
+            ax2.set_xlabel("Time Step", fontsize=11)
+            ax2.set_ylabel("Option Contracts", fontsize=11)
+            ax2.set_title(f"Option Positions (Path {path_idx})", fontsize=12)
+            ax2.legend(fontsize=8)
+            ax2.grid(True, alpha=0.3)
         else:
-            axes[0, 1].text(0.5, 0.5, 'No option positions\n(Delta hedge only)',
-                          ha='center', va='center', transform=axes[0, 1].transAxes)
-            axes[0, 1].set_title("Option Positions", fontsize=12)
+            ax2.text(0.5, 0.5, 'No option positions\n(Delta hedge only)',
+                    ha='center', va='center', transform=ax2.transAxes)
+            ax2.set_title("Option Positions", fontsize=12)
         
-        # PLOT 3: Stock Price Trajectory with Derivative Price
-        ax1 = axes[1, 0]
+        # PLOT 3: Stock Price Trajectory (left, row 2)
+        ax3 = fig.add_subplot(gs[1, 0])
         color_stock = 'tab:green'
-        ax1.plot(time_steps, S_traj[path_idx].cpu().detach().numpy(),
-                 label='Stock Price', color=color_stock, linewidth=2)
-        ax1.axhline(y=env.K, color='r', linestyle='--', label='Strike', alpha=0.7)
+        ax3.plot(time_steps, S_traj[path_idx].cpu().detach().numpy(),
+                label='Stock Price', color=color_stock, linewidth=2)
+        ax3.axhline(y=env.K, color='r', linestyle='--', label='Strike', alpha=0.7)
         
-        # Add special features based on derivative type
         if hasattr(env.derivative, 'barrier_level'):
             barrier_val = env.derivative.barrier_level
             if isinstance(barrier_val, torch.Tensor):
                 barrier_val = barrier_val.item()
-            ax1.axhline(y=barrier_val, color='purple', 
+            ax3.axhline(y=barrier_val, color='purple', 
                        linestyle=':', label='Barrier', alpha=0.7, linewidth=2)
         
-        ax1.set_xlabel("Time Step", fontsize=11)
-        ax1.set_ylabel("Stock Price", fontsize=11, color=color_stock)
-        ax1.tick_params(axis='y', labelcolor=color_stock)
-        ax1.grid(True, alpha=0.3)
+        ax3.set_xlabel("Time Step", fontsize=11)
+        ax3.set_ylabel("Stock Price", fontsize=11)
+        ax3.set_title(f"Stock Price (Path {path_idx})", fontsize=12)
+        ax3.legend(fontsize=10)
+        ax3.grid(True, alpha=0.3)
         
-        # Plot derivative price on secondary y-axis
-        ax2 = ax1.twinx()
-        color_derivative = 'tab:blue'
-        ax2.plot(time_steps, V_traj[path_idx].cpu().detach().numpy(),
-                 label=f'{derivative_type} Price', color=color_derivative, 
-                 linewidth=2, alpha=0.8)
-        ax2.set_ylabel(f"{derivative_type} Price", fontsize=11, color=color_derivative)
-        ax2.tick_params(axis='y', labelcolor=color_derivative)
+        # PLOT 4: Derivative Price (middle, row 2)
+        ax4 = fig.add_subplot(gs[1, 1])
+        ax4.plot(time_steps, V_traj[path_idx].cpu().detach().numpy(),
+                label=f'{derivative_type} Price', color='tab:blue', linewidth=2)
+        ax4.set_xlabel("Time Step", fontsize=11)
+        ax4.set_ylabel(f"{derivative_type} Price", fontsize=11)
+        ax4.set_title(f"{derivative_type} Price (Path {path_idx})", fontsize=12)
+        ax4.grid(True, alpha=0.3)
         
-        # Combine legends
-        lines1, labels1 = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=10, loc='best')
-        
-        ax1.set_title(f"Stock & {derivative_type} Price (Path {path_idx})", fontsize=12)
-        
-        # PLOT 4: Hedging Instrument Prices
+        # PLOT 5: Hedging Instrument Prices (right, row 2)
+        ax5 = fig.add_subplot(gs[1, 2])
         if n_inst >= 2:
             for i in range(1, n_inst):
                 opt_idx = i - 1
@@ -433,37 +481,38 @@ def plot_episode_results(
                 strike = env.instrument_strikes[i]
                 
                 option_prices = O_traj[opt_idx][path_idx].cpu().detach().numpy()
-                axes[1, 1].plot(time_steps, option_prices,
-                              label=f'{maturity}d {opt_type.upper()} K={strike}', linewidth=2)
+                ax5.plot(time_steps, option_prices,
+                        label=f'{maturity}d {opt_type.upper()} K={strike}', linewidth=2)
         
-        axes[1, 1].set_xlabel("Time Step", fontsize=11)
-        axes[1, 1].set_ylabel("Option Price", fontsize=11)
-        axes[1, 1].set_title(f"Hedging Instrument Prices (Path {path_idx})", fontsize=12)
+        ax5.set_xlabel("Time Step", fontsize=11)
+        ax5.set_ylabel("Option Price", fontsize=11)
+        ax5.set_title(f"Hedging Instrument Prices (Path {path_idx})", fontsize=12)
         if n_inst >= 2:
-            axes[1, 1].legend(fontsize=10)
-        axes[1, 1].grid(True, alpha=0.3)
+            ax5.legend(fontsize=9)
+        ax5.grid(True, alpha=0.3)
         
-        # PLOT 5: Position Difference (RL - Practitioner)
+        # PLOT 6: Position Difference (left, row 3)
+        ax6 = fig.add_subplot(gs[2, 0])
         delta_diff = rl_positions_sample[:, 0] - hn_positions_sample[:, 0]
-        axes[2, 0].plot(time_steps, delta_diff, color='tab:red', linewidth=2)
-        axes[2, 0].axhline(y=0, color='k', linestyle='-', alpha=0.3)
-        axes[2, 0].set_xlabel("Time Step", fontsize=11)
-        axes[2, 0].set_ylabel("Delta Difference", fontsize=11)
-        axes[2, 0].set_title(f"RL Delta - Practitioner Delta (Path {path_idx})", fontsize=12)
-        axes[2, 0].grid(True, alpha=0.3)
+        ax6.plot(time_steps, delta_diff, color='tab:red', linewidth=2)
+        ax6.axhline(y=0, color='k', linestyle='-', alpha=0.3)
+        ax6.set_xlabel("Time Step", fontsize=11)
+        ax6.set_ylabel("Delta Difference", fontsize=11)
+        ax6.set_title(f"RL - Practitioner Delta (Path {path_idx})", fontsize=12)
+        ax6.grid(True, alpha=0.3)
         
-        # PLOT 6: Terminal Error Distribution
-        axes[2, 1].hist(terminal_hedge_error_rl, bins=50, color="tab:blue", alpha=0.7,
-                        edgecolor='black', label='RL')
-        axes[2, 1].hist(terminal_hedge_error_hn, bins=50, color="tab:orange", alpha=0.7,
-                        edgecolor='black', label='Practitioner')
-        axes[2, 1].axvline(x=0, color='r', linestyle='--', linewidth=2)
-        axes[2, 1].set_xlabel("Terminal Hedge Error", fontsize=11)
-        axes[2, 1].set_ylabel("Frequency", fontsize=11)
+        # PLOT 7: Terminal Error Distribution (middle+right, row 3, spans 2 columns)
+        ax7 = fig.add_subplot(gs[2, 1:])
+        ax7.hist(terminal_hedge_error_rl, bins=50, color="tab:blue", alpha=0.7,
+                edgecolor='black', label='RL')
+        ax7.hist(terminal_hedge_error_hn, bins=50, color="tab:orange", alpha=0.7,
+                edgecolor='black', label='Practitioner')
+        ax7.axvline(x=0, color='r', linestyle='--', linewidth=2)
+        ax7.set_xlabel("Terminal Hedge Error", fontsize=11)
+        ax7.set_ylabel("Frequency", fontsize=11)
         
-        # Build comprehensive title starting with config name
+        # Build title
         config_name = config.get("config_name", "model")
-        
         greek_labels = {1: 'Delta', 2: 'Delta-Gamma', 3: 'Delta-Gamma-Vega', 4: 'Delta-Gamma-Vega-Theta'}
         hedged_option_type = config["hedged_option"]["type"].capitalize()
         
@@ -477,7 +526,6 @@ def plot_episode_results(
         
         risk_display = risk_display_names.get(risk_measure, risk_measure.upper())
         
-        # Start with config name as main title
         title_text = f"{config_name} | Episode {episode}\n"
         title_text += (
             f"{n_inst} Instruments ({greek_labels[n_inst]}) - Hedging {hedged_option_type}\n"
@@ -488,41 +536,36 @@ def plot_episode_results(
             title_text += f" + λ·SC (λ={lambda_constraint:.4f})"
         
         title_text += "\n"
-        
-        # Show ONLY the training objective values (the risk measure being optimized)
         title_text += f"RL {risk_display}={rl_training_objective:.4f} | Prac {risk_display}={hn_training_objective:.4f}"
         
-        if has_soft_constraint:
-            avg_violation_rl = trajectories['soft_constraint_violations'].mean().cpu().item()
-            avg_violation_hn = trajectories_hn.get('soft_constraint_violations', torch.zeros(1)).mean().cpu().item() if 'soft_constraint_violations' in trajectories_hn else 0.0
-            title_text += f" | RL Constr={avg_violation_rl:.4f} | Prac Constr={avg_violation_hn:.4f}"
+        ax7.set_title(title_text, fontsize=10)
+        ax7.legend(fontsize=10)
+        ax7.grid(True, alpha=0.3)
         
-        axes[2, 1].set_title(title_text, fontsize=9)
-        axes[2, 1].legend(fontsize=10)
-        axes[2, 1].grid(True, alpha=0.3)
-        
-        # PLOT 7 & 8: Soft Constraint Visualizations (if enabled)
+        # PLOT 8 & 9: Soft Constraint Visualizations (if enabled)
         if has_soft_constraint:
             violations_rl = trajectories['soft_constraint_violations'].cpu().numpy()
             violations_hn = trajectories_hn.get('soft_constraint_violations', 
                                                  torch.zeros_like(trajectories['soft_constraint_violations'])).cpu().numpy()
             
-            # PLOT 7: Accumulated Constraint Violations Distribution
-            axes[3, 0].hist(violations_rl, bins=50, color="tab:blue", alpha=0.7,
-                           edgecolor='black', label='RL')
-            axes[3, 0].hist(violations_hn, bins=50, color="tab:orange", alpha=0.7,
-                           edgecolor='black', label='Practitioner')
-            axes[3, 0].axvline(x=0, color='r', linestyle='--', linewidth=2)
-            axes[3, 0].set_xlabel("Accumulated Constraint Violations", fontsize=11)
-            axes[3, 0].set_ylabel("Frequency", fontsize=11)
-            axes[3, 0].set_title("Soft Constraint Violations: ∑max(0, P_t - V_t)", fontsize=12)
-            axes[3, 0].legend(fontsize=10)
-            axes[3, 0].grid(True, alpha=0.3)
+            # PLOT 8: Constraint Violations Distribution (left, row 4)
+            ax8 = fig.add_subplot(gs[3, :2])
+            ax8.hist(violations_rl, bins=50, color="tab:blue", alpha=0.7,
+                    edgecolor='black', label='RL')
+            ax8.hist(violations_hn, bins=50, color="tab:orange", alpha=0.7,
+                    edgecolor='black', label='Practitioner')
+            ax8.axvline(x=0, color='r', linestyle='--', linewidth=2)
+            ax8.set_xlabel("Accumulated Constraint Violations", fontsize=11)
+            ax8.set_ylabel("Frequency", fontsize=11)
+            ax8.set_title("Soft Constraint Violations: ∑max(0, P_t - V_t)", fontsize=12)
+            ax8.legend(fontsize=10)
+            ax8.grid(True, alpha=0.3)
             
-            # PLOT 8: Violation Statistics
-            axes[3, 1].axis('off')
+            # PLOT 9: Statistics Table (right, row 4)
+            ax9 = fig.add_subplot(gs[3, 2])
+            ax9.axis('off')
             
-            # Compute violation statistics
+            # Compute statistics
             rl_violation_pct = (violations_rl > 0).sum() / len(violations_rl) * 100
             hn_violation_pct = (violations_hn > 0).sum() / len(violations_hn) * 100
             
@@ -532,33 +575,42 @@ def plot_episode_results(
             rl_max_violation = violations_rl.max()
             hn_max_violation = violations_hn.max()
             
-            stats_text = (
-                "Soft Constraint Statistics\n"
-                "─" * 40 + "\n\n"
-                f"Constraint Weight (λ): {lambda_constraint:.4f}\n"
-                f"Constraint Penalty: {constraint_penalty:.4f}\n\n"
-                "RL Strategy:\n"
-                f"  • Violation Rate: {rl_violation_pct:.1f}%\n"
-                f"  • Mean Violation: {rl_mean_violation:.4f}\n"
-                f"  • Max Violation: {rl_max_violation:.4f}\n\n"
-                "Practitioner Strategy:\n"
-                f"  • Violation Rate: {hn_violation_pct:.1f}%\n"
-                f"  • Mean Violation: {hn_mean_violation:.4f}\n"
-                f"  • Max Violation: {hn_max_violation:.4f}\n\n"
-                "Interpretation:\n"
-                f"  • Violations occur when P_t > V_t\n"
-                f"  • Penalty = λ × mean(violations)\n"
-                f"  • Lower is better"
-            )
+            # Create table
+            table_data = [
+                ['Metric', 'RL', 'Practitioner'],
+                ['Violation Rate', f'{rl_violation_pct:.1f}%', f'{hn_violation_pct:.1f}%'],
+                ['Mean Violation', f'{rl_mean_violation:.4f}', f'{hn_mean_violation:.4f}'],
+                ['Max Violation', f'{rl_max_violation:.4f}', f'{hn_max_violation:.4f}'],
+                ['Penalty Weight (λ)', f'{lambda_constraint:.4f}', '—'],
+                ['Constraint Penalty', f'{constraint_penalty:.4f}', '—']
+            ]
             
-            axes[3, 1].text(0.1, 0.5, stats_text, transform=axes[3, 1].transAxes,
-                           fontsize=10, verticalalignment='center', family='monospace')
+            table = ax9.table(cellText=table_data, cellLoc='left', loc='center',
+                            colWidths=[0.4, 0.3, 0.3])
+            table.auto_set_font_size(False)
+            table.set_fontsize(9)
+            table.scale(1, 2)
+            
+            # Style header row
+            for i in range(3):
+                table[(0, i)].set_facecolor('#4CAF50')
+                table[(0, i)].set_text_props(weight='bold', color='white')
+            
+            # Alternate row colors
+            for i in range(1, len(table_data)):
+                for j in range(3):
+                    if i % 2 == 0:
+                        table[(i, j)].set_facecolor('#f0f0f0')
+            
+            ax9.set_title("Soft Constraint Statistics", fontsize=12, weight='bold', pad=20)
         
-        # Save plot using config name directly
-        fig.tight_layout()
-        
+        # Save plot using config name
         config_name = config.get("config_name", "model")
-        save_path = f"{config_name}.png"
+        output_dir = os.path.dirname(config["output"]["plot_save_path"])
+        save_path = os.path.join(output_dir, f"{config_name}_episode_{episode}.png")
+        
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
         
         plt.savefig(save_path, dpi=config["output"]["plot_dpi"], bbox_inches='tight')
         plt.close()
