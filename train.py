@@ -136,9 +136,8 @@ def get_transaction_costs(config: Dict[str, Any]) -> Dict[str, float]:
 def validate_config(config: Dict[str, Any]) -> None:
     """Validate configuration parameters including risk measure and soft constraint."""
     n_inst = config["instruments"]["n_hedging_instruments"]
-    
-    if n_inst < 1 or n_inst > 4:
-        raise ValueError(f"n_hedging_instruments must be 1-4, got {n_inst}")
+    if n_inst < 1 or n_inst > 30:
+        raise ValueError(f"n_hedging_instruments must be 1-30, got {n_inst}")
     
     if n_inst > 1:
         n_strikes = len(config["instruments"]["strikes"])
@@ -149,12 +148,10 @@ def validate_config(config: Dict[str, Any]) -> None:
             raise ValueError(
                 f"strikes must have length {n_inst - 1} (excluding stock), got {n_strikes}"
             )
-        
         if n_types != n_inst - 1:
             raise ValueError(
                 f"types must have length {n_inst - 1} (excluding stock), got {n_types}"
             )
-        
         if n_maturities != n_inst - 1:
             raise ValueError(
                 f"maturities must have length {n_inst - 1} (excluding stock), got {n_maturities}"
@@ -216,7 +213,6 @@ def validate_config(config: Dict[str, Any]) -> None:
             logging.warning("soft_constraint section found but 'lambda' not specified, defaulting to 0.0")
     
     logging.info("Configuration validation passed")
-
 
 def create_policy_network(config: Dict[str, Any], device: torch.device) -> PolicyNetGARCH:
     """Create and initialize policy network."""
