@@ -503,6 +503,60 @@ def run_inference(
         f"Constraint Penalty: {constraint_penalty.item():.6f}"
     )
     
+    # ============================================================
+    # CONSTRUCT PROPER SAVE PATH
+    # ============================================================
+    # Get config name (without 'config' prefix and without extension)
+    config_name = config.get("config_name", "model")
+    
+    # Determine derivative type from config name prefix
+    if config_name.startswith('AM'):
+        derivative_folder = "american"
+    elif config_name.startswith('B'):
+        derivative_folder = "barrier"
+    elif config_name.startswith('D'):
+        derivative_folder = "vanilla"
+    else:
+        # Fallback: use the hedged_option type from config
+        derivative_folder = config["hedged_option"]["type"].lower()
+    
+    # Determine instrument folder name
+    n_inst = config["instruments"]["n_hedging_instruments"]
+    if n_inst == 1:
+        instrument_folder = "1inst"
+    elif n_inst == 2:
+        instrument_folder = "2inst"
+    elif n_inst == 3:
+        instrument_folder = "3inst"
+    elif n_inst == 4:
+        instrument_folder = "4inst"
+    else:
+        instrument_folder = f"{n_inst}inst"
+    
+    # Determine TC folder based on config name ending
+    # Config names ending in 'X' → NoTC
+    # Config names NOT ending in 'X' → TC
+    if config_name.endswith('X'):
+        tc_folder = "NoTC"
+    else:
+        tc_folder = "TC"
+    
+    # Get risk measure folder name
+    risk_measure_folder = risk_measure.upper()
+    
+    # Construct path: visual_results/{derivative}/{instrument}/{tc}/{risk_measure}/{config_name}.png
+    save_dir = os.path.join("visual_results", derivative_folder, instrument_folder, tc_folder, risk_measure_folder)
+    os.makedirs(save_dir, exist_ok=True)
+    
+    save_path = os.path.join(save_dir, f"{config_name}.png")
+    
+    logging.info(f"Plot will be saved to: {save_path}")
+    
+    # Override the config's plot_save_path with our constructed path
+    if "output" not in config:
+        config["output"] = {}
+    config["output"]["plot_save_path"] = save_path
+    
     metrics = {
         "episode": 0,
         "loss": total_loss.item(),
@@ -522,9 +576,11 @@ def run_inference(
     try:
         from src.visualization.plot_results import plot_episode_results
         plot_episode_results(episode=0, metrics=metrics, config=config)
-        logging.info("Inference plots generated successfully")
+        logging.info(f"Inference plots saved to: {save_path}")
     except Exception as e:
         logging.warning(f"Plot generation failed: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 def train(
