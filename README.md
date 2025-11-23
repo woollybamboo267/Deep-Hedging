@@ -60,22 +60,21 @@ Deep-Hedging/
 ## Configuration
 
 Configuration files are provided in the `cfgs/` directory. The naming convention indicates the hedging strategy:
-
+- **A** prefix indicates american options (absence indicates European options)
 - **B** prefix indicates barrier options (absence indicates European options)
+- **FG** = Floating Grid
 - **D** = Delta hedging
 - **G** = Gamma hedging
 - **V** = Vega hedging
 - **T** = Theta hedging
 - **TC** suffix = Transaction costs included
-- **X** suffix = Extended configuration variant
-
+- **TCX** suffix = Transaction costs excluded
 Examples:
 - `configDTC.yaml` — European option, Delta hedging, Transaction costs
 - `configDGVTC.yaml` — European option, Delta-Gamma-Vega hedging, Transaction costs
 - `configBDGTC.yaml` — Barrier option, Delta-Gamma hedging, Transaction costs
 
 ## Example Visualization
-
 
 ### Delta Hedging
 ![Delta Hedging Results](visual-results/european/TC/D.png)
