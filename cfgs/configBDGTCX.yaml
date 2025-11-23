@@ -71,5 +71,5 @@ transaction_costs:
 risk_measure:
   type: mse
 soft_constraint:
-  enabled: false
-  lambda: 0.0
+  enabled: true
+  lambda: 1.0
