@@ -672,13 +672,14 @@ def plot_episode_results(
             
             ax9.set_title("Soft Constraint Statistics", fontsize=12, weight='bold', pad=20)
         
-        # Save plot using config name
-        config_name = config.get("config_name", "model")
-        output_dir = os.path.dirname(config["output"]["plot_save_path"])
-        save_path = os.path.join(output_dir, f"{config_name}_episode_{episode}.png")
+        # Save plot - use the path provided in config
+        # The path should already be constructed properly by train.py
+        save_path = config["output"]["plot_save_path"]
         
-        # Create output directory if it doesn't exist
-        os.makedirs(output_dir, exist_ok=True)
+        # Ensure parent directory exists
+        save_dir = os.path.dirname(save_path)
+        if save_dir:  # Only create if there's actually a directory path
+            os.makedirs(save_dir, exist_ok=True)
         
         plt.savefig(save_path, dpi=config["output"]["plot_dpi"], bbox_inches='tight')
         plt.close()
