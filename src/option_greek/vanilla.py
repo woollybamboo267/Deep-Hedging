@@ -52,14 +52,10 @@ class VanillaOption(DerivativeBase):
         Returns:
             Option price tensor with same shape as S
         """
-        logger.info(f"VanillaOption.price called: N={N}, step_idx={step_idx}")
-        logger.info(f"self.precomp_manager type: {type(self.precomp_manager)}")
     
         precomputed_data = self.precomp_manager.get_precomputed_data(N)
         if precomputed_data is None:
             raise ValueError(f"No precomputed data available for maturity N={N}")
-        logger.info(f"precomputed_data result: {precomputed_data is not None}")
-
         return price_option_precomputed(
             S, K, step_idx, self.r_daily, N,
             self.option_type, precomputed_data
