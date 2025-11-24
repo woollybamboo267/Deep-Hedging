@@ -823,17 +823,20 @@ def main():
     
     if needs_hedged_precompute:
         hedged_maturity_days = int(config["hedged_option"]["T"] * 252)
-        
-        # Check if this maturity is already in the list (from hedging instruments)
-        if hedged_maturity_days not in config["instruments"]["maturities"]:
-            if not hasattr(precomputation_manager, 'maturities'):
-                precomputation_manager.maturities = []
-            if hedged_maturity_days not in precomputation_manager.maturities:
-                precomputation_manager.maturities.append(hedged_maturity_days)
-                logging.info(
-                    f"{hedged_type.capitalize()} hedged derivative at maturity {hedged_maturity_days} days "
-                    f"requires precomputation - added to list"
-                )
+     
+         # Ensure manager has a maturities list
+        if not hasattr(precomputation_manager, "maturities") or precomputation_manager.maturities is None:
+            precomputation_manager.maturities = []
+     
+         # Add only if not already present
+        if hedged_maturity_days not in precomputation_manager.maturities:
+            precomputation_manager.maturities.append(hedged_maturity_days)
+     
+            logging.info(
+                f"{hedged_type.capitalize()} hedged derivative at maturity "
+                f"{hedged_maturity_days} days requires precomputation — added to list"
+            )
+
     
     precomputed_data = precomputation_manager.precompute_all()
     logging.info(f"Precomputation complete for maturities: {list(precomputed_data.keys())}")
