@@ -251,9 +251,8 @@ def create_policy_network(config: Dict[str, Any], device: torch.device) -> Polic
         obs_dim=model_config["obs_dim"],
         hidden_size=model_config["hidden_size"],
         n_hedging_instruments=config["instruments"]["n_hedging_instruments"],
-        num_layers=model_config["num_layers"]
+        num_layers=model_config["num_layers"]  # <-- CURRENT CODE (WRONG)
     ).to(device)
-    
     logging.info(
         f"Created policy network with {model_config['hidden_size']} hidden units, "
         f"{model_config['num_layers']} FC layers"
