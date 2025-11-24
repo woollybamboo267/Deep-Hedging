@@ -135,32 +135,61 @@ def get_transaction_costs(config: Dict[str, Any]) -> Dict[str, float]:
 
 def validate_config(config: Dict[str, Any]) -> None:
     """Validate configuration parameters including risk measure and soft constraint."""
-    n_inst = config["instruments"]["n_hedging_instruments"]
-    if n_inst < 1 or n_inst > 31:
-        raise ValueError(f"n_hedging_instruments must be 1-30, got {n_inst}")
+    # Check for mode
+    mode = config["instruments"].get("mode", "static")
     
-    if n_inst > 1:
-        n_strikes = len(config["instruments"]["strikes"])
-        n_types = len(config["instruments"]["types"])
-        n_maturities = len(config["instruments"]["maturities"])
+    if mode == "floating_grid":
+        # Floating grid validation
+        grid_config = config["instruments"].get("floating_grid", {})
+        if not grid_config.get("enabled", False):
+            raise ValueError("floating_grid mode selected but floating_grid.enabled is not true")
         
-        if n_strikes != n_inst - 1:
+        moneyness_levels = grid_config.get("moneyness_levels", [])
+        maturity_days = grid_config.get("maturity_days", [])
+        
+        if not moneyness_levels or not maturity_days:
+            raise ValueError("floating_grid requires moneyness_levels and maturity_days")
+        
+        grid_size = len(moneyness_levels) * len(maturity_days)
+        expected_n_inst = 1 + grid_size  # 1 stock + grid_size options
+        actual_n_inst = config["instruments"]["n_hedging_instruments"]
+        
+        if expected_n_inst != actual_n_inst:
             raise ValueError(
-                f"strikes must have length {n_inst - 1} (excluding stock), got {n_strikes}"
+                f"Floating grid expects n_hedging_instruments={expected_n_inst} "
+                f"(1 stock + {grid_size} options), got {actual_n_inst}"
             )
-        if n_types != n_inst - 1:
-            raise ValueError(
-                f"types must have length {n_inst - 1} (excluding stock), got {n_types}"
-            )
-        if n_maturities != n_inst - 1:
-            raise ValueError(
-                f"maturities must have length {n_inst - 1} (excluding stock), got {n_maturities}"
-            )
+        
+        logging.info(f"Floating grid mode validated: {len(moneyness_levels)} moneyness × {len(maturity_days)} maturities = {grid_size} options")
     
-    valid_types = ["call", "put"]
-    for opt_type in config["instruments"]["types"]:
-        if opt_type not in valid_types:
-            raise ValueError(f"Invalid option type: {opt_type}")
+    else:
+        # Static mode validation
+        n_inst = config["instruments"]["n_hedging_instruments"]
+        if n_inst < 1 or n_inst > 31:
+            raise ValueError(f"n_hedging_instruments must be 1-31, got {n_inst}")
+        
+        if n_inst > 1:
+            n_strikes = len(config["instruments"]["strikes"])
+            n_types = len(config["instruments"]["types"])
+            n_maturities = len(config["instruments"]["maturities"])
+            
+            if n_strikes != n_inst - 1:
+                raise ValueError(
+                    f"strikes must have length {n_inst - 1} (excluding stock), got {n_strikes}"
+                )
+            if n_types != n_inst - 1:
+                raise ValueError(
+                    f"types must have length {n_inst - 1} (excluding stock), got {n_types}"
+                )
+            if n_maturities != n_inst - 1:
+                raise ValueError(
+                    f"maturities must have length {n_inst - 1} (excluding stock), got {n_maturities}"
+                )
+        
+        valid_types = ["call", "put"]
+        for opt_type in config["instruments"]["types"]:
+            if opt_type not in valid_types:
+                raise ValueError(f"Invalid option type: {opt_type}")
     
     hedged_cfg = config["hedged_option"]
     deriv_type = hedged_cfg["type"].lower()
@@ -169,7 +198,7 @@ def validate_config(config: Dict[str, Any]) -> None:
     if deriv_type not in ["vanilla", "barrier", "american", "asian"]:
         raise ValueError(f"Invalid hedged_option type: {deriv_type}")
     
-    if hedged_cfg["option_type"] not in valid_types:
+    if hedged_cfg["option_type"] not in ["call", "put"]:
         raise ValueError(
             f"Invalid hedged_option option_type: {hedged_cfg['option_type']}"
         )
