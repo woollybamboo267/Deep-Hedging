@@ -21,7 +21,7 @@ hedged_option:
 
 instruments:
   mode: "floating_grid"  # or "static" for backward compatibility
-  n_hedging_instruments: 31  # 1 stock + 30 options (5 moneyness × 6 maturities)
+  n_hedging_instruments: 43  # 1 stock + 30 options (5 moneyness × 6 maturities)
   
   floating_grid:
     enabled: true
@@ -39,7 +39,7 @@ model:
   hidden_size: 128
   lstm_layers: 1
   num_layers: 1
-  obs_dim: 9  # Changed from 5 to 9 for floating grid
+  obs_dim: 5  # Changed from 5 to 9 for floating grid
 
 output:
   checkpoint_path: policy_net_floating_grid.pth
