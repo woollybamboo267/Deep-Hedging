@@ -121,20 +121,18 @@ class FloatingGridManager:
         )
 
     def create_derivative(self, S_current: float, bucket_idx: int, current_step: int, total_steps: int):
-        """Create a VanillaOption for the chosen bucket."""
         moneyness, maturity_days = self.get_bucket_params(bucket_idx)
         K = moneyness * S_current
         
-        # Create VanillaOption properly
         deriv = self.derivative_class(
             precomputation_manager=self.precomputation_manager,
             garch_params=self.garch_params,
             option_type=self.option_type
         )
         
-        # Store K and N as attributes (they're used in .price() calls, not __init__)
         deriv.K = K
         deriv.N = maturity_days
+        deriv.created_at_step = current_step  # ← ADD THIS LINE
         
         return deriv
     def get_bucket_params(self, bucket_idx: int) -> Tuple[float, int]:
@@ -175,17 +173,16 @@ class PositionLedger:
         for path_idx in range(self.M):
             qty = float(quantity[path_idx])
             if abs(qty) > 1e-6:
-                self.positions[path_idx].append(
-                    {
-                        "derivative": derivative,
-                        "quantity": qty,
-                        "bucket_idx": bucket_idx,
-                        "opened_at": current_step,
-                        "expiry_step": current_step + derivative.N,
-                        "strike": derivative.K,
-                        "opening_spot": float(S_current[path_idx]),
-                    }
-                )
+                self.positions[path_idx].append({
+                    "derivative": derivative,
+                    "quantity": qty,
+                    "bucket_idx": bucket_idx,
+                    "created_at_step": current_step,  # ← ADD THIS
+                    "expiry_step": current_step + derivative.N,
+                    "strike": derivative.K,
+                    "original_maturity_N": derivative.N,  # ← ADD THIS
+                    "opening_spot": float(S_current[path_idx]),
+                })
 
     def remove_expired(self, current_step: int):
         """Remove positions whose expiry_step <= current_step (they've expired)."""
@@ -228,7 +225,14 @@ class PositionLedger:
             for pos in self.positions[path_idx]:
                 if pos["expiry_step"] > current_step:
                     S_path = S_current[path_idx].unsqueeze(0)  # shape [1]
-                    price = pos["derivative"].price(S=S_path, K=pos["strike"], step_idx=current_step, N=pos["derivative"].N, h0=h0)
+                    step_idx = current_step - pos["created_at_step"]  # ← ADD THIS
+                    price = pos["derivative"].price(
+                        S=S_path, 
+                        K=pos["strike"], 
+                        step_idx=step_idx,  # ← CHANGE FROM current_step
+                        N=pos["original_maturity_N"],  # ← CHANGE FROM derivative.N
+                        h0=h0
+                    )
                     portfolio_value[path_idx] += pos["quantity"] * float(price)
         return portfolio_value
 
