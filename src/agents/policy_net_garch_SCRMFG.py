@@ -343,7 +343,7 @@ class HedgingEnvGARCH:
 
         # Market / contract parameters
         self.S0 = self.sim.S0
-        self.K = self.sim.K
+        self.K = torch.tensor(self.sim.K, dtype=torch.float32, device=self.device)
         self.T = self.sim.T
         self.r = self.sim.r / 252.0  # keep consistent with original code (per-step r)
         self.option_type = getattr(self.sim, "option_type", "call")
