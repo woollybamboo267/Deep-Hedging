@@ -1,147 +1,88 @@
-# Configuration for hedging with 30 hedging instruments
-# Stock + 29 call options across different moneyness levels and maturities
+# config_floating_grid.yaml
 
-# GARCH model parameters (Heston-Nandi)
+environment:
+  dt_min: 1.0e-10
+
 garch:
-  omega: 1.593749e-07
   alpha: 2.308475e-06
   beta: 0.689984
   gamma: 342.870019
+  h0: 5.14e-07
   lambda: 0.420499
+  omega: 1.593749e-07
   sigma0: 0.127037
 
-# Simulation parameters
-simulation:
-  S0: 100.0          # Initial stock price
-  r: 0.04            # Annual risk-free rate
-  T: 0.25            # Time to maturity (years) - 63 days
-  M: 10000           # Number of Monte Carlo paths
-  N: 63              # Number of time steps (days)
-
-# Hedged derivative (the option we're trying to hedge)
 hedged_option:
-  type: "vanilla"         # vanilla, barrier, american, asian
-  K: 100.0               # Strike price
-  T: 0.25                # Time to maturity (years)
-  option_type: "call"    # call or put
-  side: "short"          # long or short position
+  K: 100
+  T: 1.0
+  option_type: put
+  side: short
+  type: vanilla
 
-# Hedging instruments configuration
-# Instrument 0: Stock (always included)
-# Instruments 1-29: Call options at different strikes and maturities
 instruments:
-  n_hedging_instruments: 30  # Stock + 29 call options
+  mode: "floating_grid"  # or "static" for backward compatibility
+  n_hedging_instruments: 31  # 1 stock + 30 options (5 moneyness × 6 maturities)
   
-  # 29 call options with strikes from 90% to 110% of spot
-  # Moneyness levels: [0.90, 0.92, 0.94, 0.96, 0.98, 1.00, 1.02, 1.04, 1.06, 1.08, 1.10]
-  # Maturities: [7, 14, 21, 30, 45, 60, 90, 120, 180] days
-  # Examples below show a subset - extend as needed
-  
-  strikes: [
-    # 7-day options (3 strikes: ATM, 95%, 105%)
-    100.0, 95.0, 105.0,
-    
-    # 14-day options (3 strikes)
-    100.0, 95.0, 105.0,
-    
-    # 21-day options (3 strikes)
-    100.0, 95.0, 105.0,
-    
-    # 30-day options (5 strikes: 90%, 95%, 100%, 105%, 110%)
-    90.0, 95.0, 100.0, 105.0, 110.0,
-    
-    # 45-day options (5 strikes)
-    90.0, 95.0, 100.0, 105.0, 110.0,
-    
-    # 60-day options (5 strikes)
-    90.0, 95.0, 100.0, 105.0, 110.0,
-    
-    # 90-day options (3 strikes)
-    95.0, 100.0, 105.0,
-    
-    # 120-day options (2 strikes)
-    100.0, 105.0
-  ]  # Total: 29 strikes
-  
-  types: [
-    # All calls for simplicity (can mix with puts if desired)
-    "call", "call", "call",  # 7d
-    "call", "call", "call",  # 14d
-    "call", "call", "call",  # 21d
-    "call", "call", "call", "call", "call",  # 30d
-    "call", "call", "call", "call", "call",  # 45d
-    "call", "call", "call", "call", "call",  # 60d
-    "call", "call", "call",  # 90d
-    "call", "call"  # 120d
-  ]  # Total: 29 types
-  
-  maturities: [
-    # Days to maturity for each option
-    7, 7, 7,           # 7d options
-    14, 14, 14,        # 14d options
-    21, 21, 21,        # 21d options
-    30, 30, 30, 30, 30,  # 30d options
-    45, 45, 45, 45, 45,  # 45d options
-    60, 60, 60, 60, 60,  # 60d options
-    90, 90, 90,        # 90d options
-    120, 120           # 120d options
-  ]  # Total: 29 maturities
+  floating_grid:
+    enabled: true
+    moneyness_levels: [0.8, 0.9, 0.95, 1.0, 1.05, 1.1, 1.2]  # 7 levels
+    maturity_days: [30, 60, 90, 120, 180, 252]  # 6 maturities
+    option_type: "put"
+    sparsity_penalty: 0.01
+    min_trade_size: 0.5
 
-# Transaction costs
-transaction_costs:
-  TC: true  # Enable transaction costs
-  # Detailed costs (optional, will use defaults if TC: true)
-  stock: 0.0001
-  vanilla_option: 0.001
-  barrier_option: 0.002
-  american_option: 0.0015
-  asian_option: 0.0015
-
-# Risk measure configuration
-risk_measure:
-  type: "mse"  # Options: mse, smse, cvar, var, mae
-  # alpha: 0.95  # Only for cvar/var
-
-# Soft constraint configuration (optional)
-soft_constraint:
-  enabled: false
-  lambda: 0.0  # Penalty weight for constraint violations
-
-# Environment settings
-environment:
-  dt_min: 0.01  # Minimum time step
-
-# Model architecture
-model:
-  obs_dim: 4           # [S_t, sigma_t, t, hedge_value]
-  hidden_size: 256     # LSTM hidden size
-  num_layers: 3        # Number of FC layers after LSTM
-
-# Precomputation settings
-precomputation:
-  N_quad: 256          # Number of quadrature points
-  u_max: 500.0         # Maximum integration range
-  device: "cuda"       # cuda or cpu (will auto-detect)
-  cache_dir: "precomputed_cache"  # Directory with precomputed coefficients
-
-# Training settings
-training:
-  episodes: 1000
-  learning_rate: 0.00001
-  weight_decay: 0.001
-  optimizer: "AdamW"   # AdamW or Adam
-  seed: 42
-  device: "cuda"       # Will be auto-detected
-  gradient_clip_max_norm: 1.0
-  checkpoint_frequency: 500  # Save every N episodes
-  plot_frequency: 500        # Plot every N episodes
-
-# Output settings
-output:
-  plot_save_path: "results/hedging_30inst.png"
-  model_save_path: "models/30inst/GARCHLSTMDG.pth"
-
-# Logging
 logging:
-  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
-  log_file: "training_30inst.log"
+  level: INFO
+  log_file: null
+
+model:
+  hidden_size: 128
+  lstm_layers: 1
+  num_layers: 1
+  obs_dim: 9  # Changed from 5 to 9 for floating grid
+
+output:
+  checkpoint_path: policy_net_floating_grid.pth
+  model_save_path: policy_net_floating_grid.pth
+  plot_dpi: 150
+  plot_save_path: hedge_comparison_floating_ep{episode}.png
+  sample_path_index: 1
+
+precomputation:
+  N_quad: 256
+  device: cpu
+  u_max: 500.0
+
+simulation:
+  M: 1000
+  N: 252
+  S0: 100
+  T: 1.0
+  contract_size: 1
+  r: 0.04
+
+training:
+  batch_size: 1000
+  checkpoint_frequency: 25
+  device: cpu
+  entropy_coefficient: 0.5
+  episodes: 300
+  gamma: 0.9999
+  gradient_clip_max_norm: 1.0
+  learning_rate: 0.0001
+  num_epochs: 400
+  optimizer: AdamW
+  plot_frequency: 100
+  seed: 78020349
+  weight_decay: 1.0e-05
+
+transaction_costs:
+  TC: true
+
+risk_measure:
+  type: mse  # or 'smse', 'cvar', 'var', 'mae'
+  # alpha: 0.95  # Only needed for cvar/var
+
+soft_constraint:
+  enabled: true
+  lambda: 1.0
