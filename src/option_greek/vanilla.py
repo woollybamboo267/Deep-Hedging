@@ -58,7 +58,8 @@ class VanillaOption(DerivativeBase):
         precomputed_data = self.precomp_manager.get_precomputed_data(N)
         if precomputed_data is None:
             raise ValueError(f"No precomputed data available for maturity N={N}")
-        
+        logger.info(f"precomputed_data result: {precomputed_data is not None}")
+
         return price_option_precomputed(
             S, K, step_idx, self.r_daily, N,
             self.option_type, precomputed_data
