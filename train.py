@@ -136,7 +136,7 @@ def get_transaction_costs(config: Dict[str, Any]) -> Dict[str, float]:
 def validate_config(config: Dict[str, Any]) -> None:
     """Validate configuration parameters including risk measure and soft constraint."""
     n_inst = config["instruments"]["n_hedging_instruments"]
-    if n_inst < 1 or n_inst > 30:
+    if n_inst < 1 or n_inst > 31:
         raise ValueError(f"n_hedging_instruments must be 1-30, got {n_inst}")
     
     if n_inst > 1:
