@@ -780,9 +780,9 @@ def main():
     # NEW: Move all precomputed tensors to device
     logging.info(f"Moving precomputed coefficients to device: {device}")
     for maturity, coeff_dict in precomputed_data.items():
-    for key, value in coeff_dict.items():
-        if isinstance(value, torch.Tensor):
-            precomputed_data[maturity][key] = value.to(device)
+        for key, value in coeff_dict.items():
+            if isinstance(value, torch.Tensor):
+                precomputed_data[maturity][key] = value.to(device)
     logging.info(f"All precomputed data successfully moved to {device}")
     # Verify all needed maturities are precomputed
     if needs_hedged_precompute:
