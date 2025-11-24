@@ -485,9 +485,13 @@ def run_inference(
     # Get transaction costs from config
     transaction_costs = get_transaction_costs(config)
     
+    # FIX: Convert K and S0 to tensors on device BEFORE passing to HedgingSim
+    K_tensor = torch.tensor(hedged_cfg["K"], dtype=torch.float32, device=device)
+    S0_tensor = torch.tensor(config["simulation"]["S0"], dtype=torch.float32, device=device)
+    
     sim = HedgingSim(
-        S0=config["simulation"]["S0"],
-        K=hedged_cfg["K"],
+        S0=S0_tensor,  # Pass as tensor
+        K=K_tensor,    # Pass as tensor
         m=0.1,
         r=config["simulation"]["r"],
         sigma=config["garch"]["sigma0"],
