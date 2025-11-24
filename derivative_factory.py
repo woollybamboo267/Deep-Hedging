@@ -39,6 +39,9 @@ class DerivativeFactory:
         hedged_cfg = config['hedged_option']
         deriv_type = hedged_cfg['type'].lower()
         
+        # Get device from config
+        device = torch.device(config['training']['device'])
+        
         # === VANILLA OPTION ===
         if deriv_type == 'vanilla':
             maturity_days = int(hedged_cfg['T'] * 252)
@@ -49,21 +52,31 @@ class DerivativeFactory:
                     f"Available maturities: {list(precomputed_data.keys())}"
                 )
             
+            # FIX: Make a deep copy and ensure all tensors are on the correct device
+            maturity_data = {}
+            for key, value in precomputed_data[maturity_days].items():
+                if isinstance(value, torch.Tensor):
+                    maturity_data[key] = value.to(device)
+                else:
+                    maturity_data[key] = value
+            
             class PrecompManagerWrapper:
-                def __init__(self, precomp_dict, r_daily, mat_days):
+                def __init__(self, precomp_dict, r_daily, mat_days, device):
                     self.r_daily = r_daily
+                    self.device = device
                     self._data = {mat_days: precomp_dict}
                 
                 def get_precomputed_data(self, N):
                     return self._data.get(N)
             
             precomp_manager = PrecompManagerWrapper(
-                precomputed_data[maturity_days],
+                maturity_data,
                 config['simulation']['r'] / 252.0,
-                maturity_days
+                maturity_days,
+                device
             )
             
-            logger.info(f"Created vanilla hedged option with maturity {maturity_days} days")
+            logger.info(f"Created vanilla hedged option with maturity {maturity_days} days on device {device}")
             
             vanilla_option = VanillaOption(
                 precomputation_manager=precomp_manager,
@@ -103,18 +116,28 @@ class DerivativeFactory:
                     f"Barrier options require vanilla coefficients for post-breach pricing."
                 )
             
+            # FIX: Make a deep copy and ensure all tensors are on the correct device
+            maturity_data = {}
+            for key, value in precomputed_data[maturity_days].items():
+                if isinstance(value, torch.Tensor):
+                    maturity_data[key] = value.to(device)
+                else:
+                    maturity_data[key] = value
+            
             class PrecompManagerWrapper:
-                def __init__(self, precomp_dict, r_daily, mat_days):
+                def __init__(self, precomp_dict, r_daily, mat_days, device):
                     self.r_daily = r_daily
+                    self.device = device
                     self._data = {mat_days: precomp_dict}
                 
                 def get_precomputed_data(self, N):
                     return self._data.get(N)
             
             precomp_manager = PrecompManagerWrapper(
-                precomputed_data[maturity_days],
+                maturity_data,
                 config['simulation']['r'] / 252.0,
-                maturity_days
+                maturity_days,
+                device
             )
             
             # Create vanilla fallback
@@ -218,6 +241,9 @@ class DerivativeFactory:
         instruments_cfg = config['instruments']
         mode = instruments_cfg.get('mode', 'static')
         
+        # Get device from config
+        device = torch.device(config['training']['device'])
+        
         # === FLOATING GRID MODE ===
         if mode == 'floating_grid':
             logger.info("Floating grid mode detected - hedging instruments will be created dynamically by environment")
@@ -264,18 +290,28 @@ class DerivativeFactory:
                         f"Available maturities: {list(precomputed_data.keys())}"
                     )
                 
+                # FIX: Make a deep copy and ensure all tensors are on the correct device
+                maturity_data = {}
+                for key, value in precomputed_data[maturity_days].items():
+                    if isinstance(value, torch.Tensor):
+                        maturity_data[key] = value.to(device)
+                    else:
+                        maturity_data[key] = value
+                
                 class PrecompManagerWrapper:
-                    def __init__(self, precomp_dict, r_daily, mat_days):
+                    def __init__(self, precomp_dict, r_daily, mat_days, device):
                         self.r_daily = r_daily
+                        self.device = device
                         self._data = {mat_days: precomp_dict}
                     
                     def get_precomputed_data(self, N):
                         return self._data.get(N)
                 
                 precomp_manager = PrecompManagerWrapper(
-                    precomputed_data[maturity_days],
+                    maturity_data,
                     config['simulation']['r'] / 252.0,
-                    maturity_days
+                    maturity_days,
+                    device
                 )
                 
                 hedging_option = VanillaOption(
@@ -291,7 +327,7 @@ class DerivativeFactory:
                 
                 logger.info(
                     f"Created vanilla hedging option {i+1}: {opt_type} with K={strike}, "
-                    f"T={maturity_days} days"
+                    f"T={maturity_days} days on device {device}"
                 )
             
             # === ASIAN HEDGING INSTRUMENT (FUTURE EXTENSION) ===
