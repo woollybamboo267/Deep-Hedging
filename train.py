@@ -339,17 +339,18 @@ def train_episode(
         seed=episode
     )
     
-    env = HedgingEnvGARCH(
-        sim=sim,
-        derivative=hedged_derivative,
-        hedging_derivatives=None if is_floating_grid else hedging_derivatives,
-        garch_params=config["garch"],
-        n_hedging_instruments=config["instruments"]["n_hedging_instruments"],
-        dt_min=config["environment"]["dt_min"],
-        device=str(device),
-        transaction_costs=transaction_costs,
-        grid_config=config if is_floating_grid else None
-    )
+     env = HedgingEnvGARCH(
+         sim=sim,
+         derivative=hedged_derivative,
+         hedging_derivatives=None if is_floating_grid else hedging_derivatives,
+         garch_params=config["garch"],
+         n_hedging_instruments=config["instruments"]["n_hedging_instruments"],
+         dt_min=config["environment"]["dt_min"],
+         device=str(device),
+         transaction_costs=transaction_costs,
+         grid_config=config if is_floating_grid else None,
+         precomputation_manager=hedged_derivative.precomp_manager  # ← ADD THIS
+     )
     
     env.reset()
     
