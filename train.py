@@ -774,16 +774,16 @@ def main():
                     f"requires precomputation - added to list"
                 )
     
-     precomputed_data = precomputation_manager.precompute_all()
-     logging.info(f"Precomputation complete for maturities: {list(precomputed_data.keys())}")
+    precomputed_data = precomputation_manager.precompute_all()
+    logging.info(f"Precomputation complete for maturities: {list(precomputed_data.keys())}")
      
-     # NEW: Move all precomputed tensors to device
-     logging.info(f"Moving precomputed coefficients to device: {device}")
-     for maturity, coeff_dict in precomputed_data.items():
-         for key, value in coeff_dict.items():
-             if isinstance(value, torch.Tensor):
-                 precomputed_data[maturity][key] = value.to(device)
-     logging.info(f"All precomputed data successfully moved to {device}")
+    # NEW: Move all precomputed tensors to device
+    logging.info(f"Moving precomputed coefficients to device: {device}")
+    for maturity, coeff_dict in precomputed_data.items():
+    for key, value in coeff_dict.items():
+        if isinstance(value, torch.Tensor):
+            precomputed_data[maturity][key] = value.to(device)
+    logging.info(f"All precomputed data successfully moved to {device}")
     # Verify all needed maturities are precomputed
     if needs_hedged_precompute:
         hedged_maturity_days = int(config["hedged_option"]["T"] * 252)
