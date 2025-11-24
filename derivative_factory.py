@@ -1,9 +1,10 @@
 """
 Factory for creating derivative objects from config.
 Supports vanilla, barrier, American, and Asian options.
+Compatible with both static and floating_grid modes.
 """
 
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import torch
 import logging
 from src.option_greek.vanilla import VanillaOption
@@ -193,14 +194,17 @@ class DerivativeFactory:
     def create_hedging_derivatives(
         config: Dict[str, Any],
         precomputed_data: Dict[int, Dict[str, Any]]
-    ) -> List:
+    ) -> Optional[List]:
         """
         Create hedging instruments.
         
-        Currently supports:
+        For static mode:
         - Stock (None)
         - Vanilla options (requires precomputation)
         - Asian options (model-driven, for future extension)
+        
+        For floating_grid mode:
+        - Returns None (hedging instruments created dynamically by environment)
         
         Args:
             config: Full config dict
@@ -209,9 +213,17 @@ class DerivativeFactory:
         
         Returns:
             List of derivative objects [None (stock), VanillaOption1, VanillaOption2, ...]
-            or [None (stock), AsianOption1, ...] (if extended)
+            or None (if floating_grid mode)
         """
         instruments_cfg = config['instruments']
+        mode = instruments_cfg.get('mode', 'static')
+        
+        # === FLOATING GRID MODE ===
+        if mode == 'floating_grid':
+            logger.info("Floating grid mode detected - hedging instruments will be created dynamically by environment")
+            return None
+        
+        # === STATIC MODE ===
         n_instruments = instruments_cfg['n_hedging_instruments']
         
         hedging_derivs = [None]  # First instrument is always stock
@@ -327,21 +339,31 @@ def setup_derivatives_from_precomputed(
                          Only required for vanilla options (hedged or hedging)
     
     Returns:
-        (hedged_derivative, hedging_derivatives_list)
+        (hedged_derivative, hedging_derivatives_list_or_None)
+        
+        For static mode: (hedged_derivative, [None, VanillaOption1, ...])
+        For floating_grid mode: (hedged_derivative, None)
     """
+    mode = config['instruments'].get('mode', 'static')
+    
     logger.info("Setting up derivatives from config...")
+    logger.info(f"Mode: {mode}")
     logger.info(f"Available precomputed maturities: {list(precomputed_data.keys())}")
     
     hedged_derivative = DerivativeFactory.create_hedged_derivative(config, precomputed_data)
     logger.info(f"Created hedged derivative: {type(hedged_derivative).__name__}")
     
     hedging_derivatives = DerivativeFactory.create_hedging_derivatives(config, precomputed_data)
-    logger.info(f"Created {len(hedging_derivatives)} hedging instruments")
     
-    for i, deriv in enumerate(hedging_derivatives):
-        if deriv is None:
-            logger.info(f"  Instrument {i}: Stock")
-        else:
-            logger.info(f"  Instrument {i}: {type(deriv).__name__}")
+    if hedging_derivatives is None:
+        logger.info("Floating grid mode - hedging derivatives will be created by environment")
+    else:
+        logger.info(f"Created {len(hedging_derivatives)} hedging instruments (static mode)")
+        
+        for i, deriv in enumerate(hedging_derivatives):
+            if deriv is None:
+                logger.info(f"  Instrument {i}: Stock")
+            else:
+                logger.info(f"  Instrument {i}: {type(deriv).__name__}")
     
     return hedged_derivative, hedging_derivatives
