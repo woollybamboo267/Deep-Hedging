@@ -320,33 +320,31 @@ class PrecomputationManager:
         self.precomputed_data[maturity] = self._load_from_disk(maturity)
 
 
-def create_precomputation_manager_from_config(
-    config: Dict[str, Any]
-) -> PrecomputationManager:
+def create_precomputation_manager_from_config(config):
     """
     Factory function to create a PrecomputationManager from configuration.
-    
-    Args:
-        config: Configuration dictionary containing:
-            - garch: GARCH parameters
-            - simulation: Simulation parameters (for r)
-            - instruments: Instrument configuration (for maturities)
-            - precomputation: Precomputation parameters
-            
-    Returns:
-        Configured PrecomputationManager instance
+    Handles both static maturities and floating_grid maturities.
     """
-    # Get cache directory from config or use default
+
+    # ===== Determine maturities based on mode =====
+    mode = config["instruments"].get("mode", "static")
+
+    if mode == "floating_grid":
+        maturities = config["instruments"]["floating_grid"]["maturity_days"]
+    else:
+        maturities = config["instruments"]["maturities"]
+
+    # ===== Cache directory (fallback to default) =====
     cache_dir = config.get("precomputation", {}).get("cache_dir", "precomputed_cache")
-    
-    manager = PrecomputationManager(
+
+    # ===== Return manager =====
+    return PrecomputationManager(
         garch_params=config["garch"],
         r_annual=config["simulation"]["r"],
-        maturities=config["instruments"]["maturities"],
+        maturities=maturities,
         N_quad=config["precomputation"]["N_quad"],
         u_max=config["precomputation"]["u_max"],
         device=config["precomputation"]["device"],
         cache_dir=cache_dir
     )
-    
-    return manager
+
