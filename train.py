@@ -863,9 +863,9 @@ def main():
             precomputed_data[hedged_maturity_days] = precomputation_manager.get_precomputed_data(hedged_maturity_days)
             logging.info(f"Precomputation complete for N={hedged_maturity_days}")
     
-    hedged_derivative, hedging_derivatives = setup_derivatives_from_precomputed(
-        config, precomputed_data
-    )
+     hedged_derivative, hedging_derivatives = setup_derivatives_from_precomputed(
+         config, precomputation_manager 
+     )
     
     if args.inference_only and args.load_model:
         logging.info(f"Loading pretrained model from {args.load_model}")
