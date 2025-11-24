@@ -23,15 +23,14 @@ class DerivativeFactory:
     @staticmethod
     def create_hedged_derivative(
         config: Dict[str, Any], 
-        precomputed_data: Dict[int, Dict[str, Any]]
+        precomputation_manager: PrecomputationManager
     ) -> Any:
         """
         Create the derivative to be hedged.
         
         Args:
             config: Full config dict
-            precomputed_data: Dict mapping maturity (in days) to precomputed coefficients
-                             Only required for vanilla and barrier options
+            precomputation_manager: PrecomputationManager instance with all maturities loaded
         
         Returns:
             VanillaOption, BarrierOptionWithVanillaFallback, AmericanOption, or AsianOption instance
@@ -46,40 +45,16 @@ class DerivativeFactory:
         if deriv_type == 'vanilla':
             maturity_days = int(hedged_cfg['T'] * 252)
             
-            if maturity_days not in precomputed_data:
+            if maturity_days not in precomputation_manager.precomputed_data:
                 raise ValueError(
                     f"No precomputed data for hedged vanilla option maturity {maturity_days} days. "
-                    f"Available maturities: {list(precomputed_data.keys())}"
+                    f"Available maturities: {list(precomputation_manager.precomputed_data.keys())}"
                 )
-            
-            # FIX: Make a deep copy and ensure all tensors are on the correct device
-            maturity_data = {}
-            for key, value in precomputed_data[maturity_days].items():
-                if isinstance(value, torch.Tensor):
-                    maturity_data[key] = value.to(device)
-                else:
-                    maturity_data[key] = value
-            
-            class PrecompManagerWrapper:
-                def __init__(self, precomp_dict, r_daily, mat_days, device):
-                    self.r_daily = r_daily
-                    self.device = device
-                    self._data = {mat_days: precomp_dict}
-                
-                def get_precomputed_data(self, N):
-                    return self._data.get(N)
-            
-            precomp_manager = PrecompManagerWrapper(
-                maturity_data,
-                config['simulation']['r'] / 252.0,
-                maturity_days,
-                device
-            )
             
             logger.info(f"Created vanilla hedged option with maturity {maturity_days} days on device {device}")
             
             vanilla_option = VanillaOption(
-                precomputation_manager=precomp_manager,
+                precomputation_manager=precomputation_manager,
                 garch_params=config['garch'],
                 option_type=hedged_cfg['option_type']
             )
@@ -110,39 +85,15 @@ class DerivativeFactory:
             
             maturity_days = int(hedged_cfg['T'] * 252)
             
-            if maturity_days not in precomputed_data:
+            if maturity_days not in precomputation_manager.precomputed_data:
                 raise ValueError(
                     f"No precomputed vanilla data for barrier fallback at maturity {maturity_days} days. "
                     f"Barrier options require vanilla coefficients for post-breach pricing."
                 )
             
-            # FIX: Make a deep copy and ensure all tensors are on the correct device
-            maturity_data = {}
-            for key, value in precomputed_data[maturity_days].items():
-                if isinstance(value, torch.Tensor):
-                    maturity_data[key] = value.to(device)
-                else:
-                    maturity_data[key] = value
-            
-            class PrecompManagerWrapper:
-                def __init__(self, precomp_dict, r_daily, mat_days, device):
-                    self.r_daily = r_daily
-                    self.device = device
-                    self._data = {mat_days: precomp_dict}
-                
-                def get_precomputed_data(self, N):
-                    return self._data.get(N)
-            
-            precomp_manager = PrecompManagerWrapper(
-                maturity_data,
-                config['simulation']['r'] / 252.0,
-                maturity_days,
-                device
-            )
-            
             # Create vanilla fallback
             vanilla_fallback = VanillaOption(
-                precomputation_manager=precomp_manager,
+                precomputation_manager=precomputation_manager,
                 garch_params=config['garch'],
                 option_type=hedged_cfg['option_type']
             )
@@ -189,13 +140,12 @@ class DerivativeFactory:
             )
             
             # Create Asian option (model-driven, no precomputation needed)
-            # Running average will be tracked by HedgingEnvGARCH
             asian_option = AsianOption(
                 model_path=hedged_cfg['model_path'],
                 option_type=hedged_cfg['option_type'],
                 r_annual=config['simulation']['r'],
                 device=config['training']['device'],
-                averaging_days=hedged_cfg.get('averaging_days', None)  # Optional: specify averaging period
+                averaging_days=hedged_cfg.get('averaging_days', None)
             )
             
             asian_option.N = int(hedged_cfg['T'] * 252)
@@ -216,7 +166,7 @@ class DerivativeFactory:
     @staticmethod
     def create_hedging_derivatives(
         config: Dict[str, Any],
-        precomputed_data: Dict[int, Dict[str, Any]]
+        precomputation_manager: PrecomputationManager
     ) -> Optional[List]:
         """
         Create hedging instruments.
@@ -231,8 +181,7 @@ class DerivativeFactory:
         
         Args:
             config: Full config dict
-            precomputed_data: Dict mapping maturity (in days) to precomputed coefficients
-                             Only required if using vanilla options as hedging instruments
+            precomputation_manager: PrecomputationManager instance with all maturities loaded
         
         Returns:
             List of derivative objects [None (stock), VanillaOption1, VanillaOption2, ...]
@@ -284,38 +233,14 @@ class DerivativeFactory:
             
             # === VANILLA HEDGING INSTRUMENT ===
             if inst_class == 'vanilla':
-                if maturity_days not in precomputed_data:
+                if maturity_days not in precomputation_manager.precomputed_data:
                     raise ValueError(
                         f"No precomputed data for hedging maturity {maturity_days} days. "
-                        f"Available maturities: {list(precomputed_data.keys())}"
+                        f"Available maturities: {list(precomputation_manager.precomputed_data.keys())}"
                     )
                 
-                # FIX: Make a deep copy and ensure all tensors are on the correct device
-                maturity_data = {}
-                for key, value in precomputed_data[maturity_days].items():
-                    if isinstance(value, torch.Tensor):
-                        maturity_data[key] = value.to(device)
-                    else:
-                        maturity_data[key] = value
-                
-                class PrecompManagerWrapper:
-                    def __init__(self, precomp_dict, r_daily, mat_days, device):
-                        self.r_daily = r_daily
-                        self.device = device
-                        self._data = {mat_days: precomp_dict}
-                    
-                    def get_precomputed_data(self, N):
-                        return self._data.get(N)
-                
-                precomp_manager = PrecompManagerWrapper(
-                    maturity_data,
-                    config['simulation']['r'] / 252.0,
-                    maturity_days,
-                    device
-                )
-                
                 hedging_option = VanillaOption(
-                    precomputation_manager=precomp_manager,
+                    precomputation_manager=precomputation_manager,
                     garch_params=config['garch'],
                     option_type=opt_type
                 )
@@ -332,9 +257,6 @@ class DerivativeFactory:
             
             # === ASIAN HEDGING INSTRUMENT (FUTURE EXTENSION) ===
             elif inst_class == 'asian':
-                # This is for future extension: hedging with Asian options
-                # Requires Asian option model at the specified strike/maturity
-                
                 model_path = instruments_cfg.get('asian_model_paths', [])[i]
                 averaging_days = instruments_cfg.get('asian_averaging_days', [None] * n_options)[i]
                 
@@ -364,15 +286,14 @@ class DerivativeFactory:
 
 def setup_derivatives_from_precomputed(
     config: Dict[str, Any],
-    precomputed_data: Dict[int, Dict[str, Any]]
+    precomputation_manager: PrecomputationManager
 ) -> tuple:
     """
-    Setup all derivatives from config and existing precomputed data.
+    Setup all derivatives from config and PrecomputationManager.
     
     Args:
         config: Full config dict
-        precomputed_data: Dict mapping maturity (in days) to precomputed coefficients
-                         Only required for vanilla options (hedged or hedging)
+        precomputation_manager: PrecomputationManager instance with all maturities loaded
     
     Returns:
         (hedged_derivative, hedging_derivatives_list_or_None)
@@ -384,12 +305,12 @@ def setup_derivatives_from_precomputed(
     
     logger.info("Setting up derivatives from config...")
     logger.info(f"Mode: {mode}")
-    logger.info(f"Available precomputed maturities: {list(precomputed_data.keys())}")
+    logger.info(f"Available precomputed maturities: {list(precomputation_manager.precomputed_data.keys())}")
     
-    hedged_derivative = DerivativeFactory.create_hedged_derivative(config, precomputed_data)
+    hedged_derivative = DerivativeFactory.create_hedged_derivative(config, precomputation_manager)
     logger.info(f"Created hedged derivative: {type(hedged_derivative).__name__}")
     
-    hedging_derivatives = DerivativeFactory.create_hedging_derivatives(config, precomputed_data)
+    hedging_derivatives = DerivativeFactory.create_hedging_derivatives(config, precomputation_manager)
     
     if hedging_derivatives is None:
         logger.info("Floating grid mode - hedging derivatives will be created by environment")
