@@ -29,7 +29,7 @@ import os
 from pathlib import Path
 from typing import Dict, Any, Optional
 
-from src.agents.policy_net_garch_SCRM import (
+from src.agents.policy_net_garch_SCRMFG import (
     PolicyNetGARCH, 
     HedgingEnvGARCH,
     compute_loss_with_soft_constraint
