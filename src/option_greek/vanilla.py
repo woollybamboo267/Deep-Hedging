@@ -181,6 +181,7 @@ def price_option_precomputed(S, K, step_idx, r_daily, N, option_type, precompute
     """
     device = torch.device(precomputed_data["device"])
     coefficients = precomputed_data["coefficients"]
+    device = coefficients.device  # Get device from actual tensor, not stale string    
     u_nodes = precomputed_data["u_nodes"]
     w_nodes = precomputed_data["w_nodes"]
 
