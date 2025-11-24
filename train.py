@@ -305,6 +305,8 @@ def train_episode(
     """Train for a single episode with configurable risk measure and soft constraint."""
     
     hedged_cfg = config["hedged_option"]
+    mode = config["instruments"].get("mode", "static")
+    is_floating_grid = (mode == "floating_grid")
     
     # Get transaction costs from config
     transaction_costs = get_transaction_costs(config)
@@ -316,6 +318,11 @@ def train_episode(
     risk_measure = risk_config.get("type", "mse")
     alpha = risk_config.get("alpha", None)  # Only needed for CVaR
     lambda_constraint = constraint_config.get("lambda", 0.0) if constraint_config.get("enabled", False) else 0.0
+    
+    # Get sparsity penalty for floating grid
+    lambda_sparsity = 0.0
+    if is_floating_grid:
+        lambda_sparsity = config["instruments"]["floating_grid"].get("sparsity_penalty", 0.0)
     
     sim = HedgingSim(
         S0=config["simulation"]["S0"],
@@ -335,12 +342,13 @@ def train_episode(
     env = HedgingEnvGARCH(
         sim=sim,
         derivative=hedged_derivative,
-        hedging_derivatives=hedging_derivatives,
+        hedging_derivatives=None if is_floating_grid else hedging_derivatives,
         garch_params=config["garch"],
         n_hedging_instruments=config["instruments"]["n_hedging_instruments"],
         dt_min=config["environment"]["dt_min"],
         device=str(device),
-        transaction_costs=transaction_costs
+        transaction_costs=transaction_costs,
+        grid_config=config if is_floating_grid else None
     )
     
     env.reset()
@@ -353,12 +361,13 @@ def train_episode(
     optimizer.zero_grad()
     
     # NEW: Compute loss with configurable risk measure and soft constraint
-    total_loss, risk_loss, constraint_penalty = compute_loss_with_soft_constraint(
+    total_loss, risk_loss, constraint_penalty, sparsity_penalty = compute_loss_with_soft_constraint(
         terminal_errors, 
         trajectories,
         risk_measure=risk_measure,
         alpha=alpha,
-        lambda_constraint=lambda_constraint
+        lambda_constraint=lambda_constraint,
+        lambda_sparsity=lambda_sparsity
     )
     
     total_loss.backward()
@@ -392,7 +401,16 @@ def train_episode(
             f"Avg Violation: {avg_violation:.6f}"
         )
     
+    if lambda_sparsity > 0:
+        log_msg += f" | Sparsity Penalty: {sparsity_penalty.item():.6f} (λ={lambda_sparsity})"
+    
     log_msg += f" | Final Reward: {final_reward:.6f}"
+    
+    # Add ledger info for floating grid
+    if is_floating_grid and "ledger_size_trajectory" in trajectories:
+        avg_ledger = np.mean(trajectories["ledger_size_trajectory"])
+        max_ledger = np.max(trajectories["ledger_size_trajectory"])
+        log_msg += f" | Ledger (Avg/Max): {avg_ledger:.1f}/{max_ledger:.0f}"
     
     logging.info(log_msg)
     
@@ -401,6 +419,7 @@ def train_episode(
         "loss": total_loss.item(),
         "risk_loss": risk_loss.item(),
         "constraint_penalty": constraint_penalty.item(),
+        "sparsity_penalty": sparsity_penalty.item(),
         "reward": final_reward,
         "trajectories": trajectories,
         "RL_positions": RL_positions,
