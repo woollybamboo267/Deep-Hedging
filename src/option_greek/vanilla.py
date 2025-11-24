@@ -195,10 +195,13 @@ def price_option_precomputed(S, K, step_idx, r_daily, N, option_type, precompute
     else:
         K_t = torch.tensor(K, dtype=torch.float64, device=device)
 
+    S_t = S_t.to(device)
+    K_t = K_t.to(device)
+    
     shape = torch.broadcast_shapes(S_t.shape, K_t.shape)
     S_bc = S_t.expand(shape) if S_t.shape != shape else S_t
     K_bc = K_t.expand(shape) if K_t.shape != shape else K_t
-
+    
     log_S = torch.log(S_bc)
     log_K = torch.log(K_bc)
 
