@@ -282,6 +282,7 @@ class HedgingEnvGARCH:
         device: str = "cpu",
         transaction_costs: Optional[Dict[str, float]] = None,
         grid_config: Optional[Dict[str, Any]] = None,
+        precomputation_manager = None  # ← ADD THIS
     ):
         self.sim = sim
         self.M = sim.M
@@ -293,20 +294,25 @@ class HedgingEnvGARCH:
 
         # Detect floating-grid mode
         self.is_floating_grid = bool(grid_config and grid_config.get("instruments", {}).get("floating_grid", {}).get("enabled", False))
-
+    
         if self.is_floating_grid:
             from src.option_greek.vanilla import VanillaOption
             
-            # Get precomputation manager from the hedged derivative
-            # (assumes hedged derivative is a VanillaOption with precomp_manager)
-            precomp_manager = derivative.precomp_manager
+            # Extract precomputation manager
+            if precomputation_manager is None:
+                # Fallback: try to get it from hedged derivative
+                precomp_manager = getattr(derivative, 'precomp_manager', None)
+                if precomp_manager is None:
+                    raise ValueError("Floating grid requires precomputation_manager")
+            else:
+                precomp_manager = precomputation_manager
             
             self.grid_manager = FloatingGridManager(
                 config=grid_config,
                 derivative_class=VanillaOption,
                 sim_params={"r": sim.r / 252.0, "T": sim.T, "N": sim.N, "M": sim.M},
-                precomputation_manager=precomp_manager,  # ADD THIS
-                garch_params=garch_params  # ADD THIS
+                precomputation_manager=precomp_manager,  # ← Now available!
+                garch_params=garch_params
             )
             self.position_ledger: Optional[PositionLedger] = None  # created per episode in reset()
             self.hedging_derivatives_static = None
