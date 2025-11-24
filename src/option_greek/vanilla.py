@@ -213,6 +213,23 @@ def price_option_precomputed(S, K, step_idx, r_daily, N, option_type, precompute
     coeff_S_1 = coeff_step[:, 0, 1]
     const_term_1 = coeff_step[:, 0, 2]
 
+    # DEBUG: Print device information RIGHT BEFORE the error line
+    print("=" * 80)
+    print("DEVICE DEBUG INFO:")
+    print(f"precomputed_data['device']: {precomputed_data['device']}")
+    print(f"device variable: {device}")
+    print(f"coefficients.device: {coefficients.device}")
+    print(f"coeff_K_1.device: {coeff_K_1.device}")
+    print(f"log_K.device: {log_K.device}")
+    print(f"log_K dtype: {log_K.dtype}")
+    print(f"K input type: {type(K)}")
+    if isinstance(K, torch.Tensor):
+        print(f"K input device: {K.device}")
+    print(f"S_t.device: {S_t.device}")
+    print(f"K_t.device: {K_t.device}")
+    print(f"K_bc.device: {K_bc.device}")
+    print("=" * 80)
+
     exponent_1 = (coeff_K_1.unsqueeze(-1) * log_K.unsqueeze(0) +
                   coeff_S_1.unsqueeze(-1) * log_S.unsqueeze(0) +
                   const_term_1.unsqueeze(-1))
