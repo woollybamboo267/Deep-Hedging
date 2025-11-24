@@ -91,16 +91,8 @@ class PolicyNetGARCH(nn.Module):
 # Floating grid manager
 # ----------------------------------------
 class FloatingGridManager:
-    """
-    Manages dynamic option grid generation for floating-grid hedging.
-
-    The floating grid is a cross-product of moneyness_levels x maturity_days.
-    The instrument indexing convention used in the environment:
-        index 0 -> stock
-        indices 1..K -> options in flattened grid order
-    """
-
-    def __init__(self, config: Dict[str, Any], derivative_class, sim_params: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], derivative_class, sim_params: Dict[str, Any], 
+                 precomputation_manager, garch_params: Dict[str, float]):  # ADD THESE
         grid_config = config["instruments"]["floating_grid"]
         self.enabled = grid_config.get("enabled", False)
         if not self.enabled:
@@ -111,9 +103,12 @@ class FloatingGridManager:
         self.option_type: str = grid_config.get("option_type", "call")
         self.derivative_class = derivative_class
         self.sim_params = sim_params
+        
+        # NEW: Store these for creating VanillaOptions
+        self.precomputation_manager = precomputation_manager
+        self.garch_params = garch_params
 
         self.grid_size = len(self.moneyness_levels) * len(self.maturity_days)
-        # Expect number of hedging instruments (including the stock)
         expected_size = 1 + self.grid_size
         actual_size = config["instruments"]["n_hedging_instruments"]
         if expected_size != actual_size:
@@ -125,6 +120,23 @@ class FloatingGridManager:
             f"{len(self.maturity_days)} maturities = {self.grid_size} option buckets"
         )
 
+    def create_derivative(self, S_current: float, bucket_idx: int, current_step: int, total_steps: int):
+        """Create a VanillaOption for the chosen bucket."""
+        moneyness, maturity_days = self.get_bucket_params(bucket_idx)
+        K = moneyness * S_current
+        
+        # Create VanillaOption properly
+        deriv = self.derivative_class(
+            precomputation_manager=self.precomputation_manager,
+            garch_params=self.garch_params,
+            option_type=self.option_type
+        )
+        
+        # Store K and N as attributes (they're used in .price() calls, not __init__)
+        deriv.K = K
+        deriv.N = maturity_days
+        
+        return deriv
     def get_bucket_params(self, bucket_idx: int) -> Tuple[float, int]:
         """
         Convert flat bucket index to (moneyness, maturity_days).
@@ -134,26 +146,6 @@ class FloatingGridManager:
         moneyness_idx = bucket_idx // n_maturities
         maturity_idx = bucket_idx % n_maturities
         return self.moneyness_levels[moneyness_idx], self.maturity_days[maturity_idx]
-
-    def create_derivative(self, S_current: float, bucket_idx: int, current_step: int, total_steps: int):
-        """
-        Instantiate a derivative for the chosen bucket. The derivative_class is expected
-        to accept arguments like K, N, option_type, r, T, S0, M.
-        """
-        moneyness, maturity_days = self.get_bucket_params(bucket_idx)
-        K = moneyness * S_current
-        N_option = maturity_days
-        deriv = self.derivative_class(
-            K=K,
-            N=N_option,
-            option_type=self.option_type,
-            r=self.sim_params["r"],
-            T=self.sim_params["T"],
-            S0=S_current,
-            M=self.sim_params["M"],
-        )
-        return deriv
-
 
 # ----------------------------------------
 # Position ledger for floating grid mode
@@ -299,13 +291,18 @@ class HedgingEnvGARCH:
         self.is_floating_grid = bool(grid_config and grid_config.get("instruments", {}).get("floating_grid", {}).get("enabled", False))
 
         if self.is_floating_grid:
-            # import derivative class lazily (module may differ in your codebase)
-            from src.option_greek.vanilla import VanillaOption  # type: ignore
-
+            from src.option_greek.vanilla import VanillaOption
+            
+            # Get precomputation manager from the hedged derivative
+            # (assumes hedged derivative is a VanillaOption with precomp_manager)
+            precomp_manager = derivative.precomp_manager
+            
             self.grid_manager = FloatingGridManager(
                 config=grid_config,
                 derivative_class=VanillaOption,
                 sim_params={"r": sim.r / 252.0, "T": sim.T, "N": sim.N, "M": sim.M},
+                precomputation_manager=precomp_manager,  # ADD THIS
+                garch_params=garch_params  # ADD THIS
             )
             self.position_ledger: Optional[PositionLedger] = None  # created per episode in reset()
             self.hedging_derivatives_static = None
