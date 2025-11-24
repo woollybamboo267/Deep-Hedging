@@ -967,42 +967,37 @@ def train_episode(
     hedged_derivative,
     hedging_derivatives,
     HedgingSim,
-    device: torch.device,
+    device: torch.device
 ) -> Dict[str, Any]:
-    """
-    Train for a single episode (one gradient update).
-    This function:
-      - constructs simulation spec
-      - creates environment
-      - simulates rollout with policy to get observations and RL actions
-      - simulates full P&L using those actions
-      - computes loss and backprops
-    """
+    """Train for a single episode with configurable risk measure and soft constraint."""
+    
     hedged_cfg = config["hedged_option"]
     mode = config["instruments"].get("mode", "static")
-    is_floating = mode == "floating_grid"
-
-    # Acquire transaction costs if helper exists; otherwise use defaults
-    try:
-        from train import get_transaction_costs  # type: ignore
-
-        transaction_costs = get_transaction_costs(config)
-    except Exception:
-        transaction_costs = {"stock": 0.0001, "vanilla_option": 0.001}
-
+    is_floating_grid = (mode == "floating_grid")
+    
+    # Get transaction costs from config
+    transaction_costs = get_transaction_costs(config)
+    
+    # NEW: Get risk measure and soft constraint configuration
     risk_config = config.get("risk_measure", {"type": "mse"})
     constraint_config = config.get("soft_constraint", {"enabled": False, "lambda": 0.0})
+    
     risk_measure = risk_config.get("type", "mse")
     alpha = risk_config.get("alpha", None)
     lambda_constraint = constraint_config.get("lambda", 0.0) if constraint_config.get("enabled", False) else 0.0
+    
+    # Get sparsity penalty for floating grid
     lambda_sparsity = 0.0
-    if is_floating:
+    if is_floating_grid:
         lambda_sparsity = config["instruments"]["floating_grid"].get("sparsity_penalty", 0.0)
-
-    # Build simulation object (assumes HedgingSim constructor accepts these args)
+    
+    # FIX: Convert K to tensor on device BEFORE passing to HedgingSim
+    K_tensor = torch.tensor(hedged_cfg["K"], dtype=torch.float32, device=device)
+    S0_tensor = torch.tensor(config["simulation"]["S0"], dtype=torch.float32, device=device)
+    
     sim = HedgingSim(
-        S0=config["simulation"]["S0"],
-        K=hedged_cfg["K"],
+        S0=S0_tensor,  # Pass as tensor
+        K=K_tensor,    # Pass as tensor
         m=0.1,
         r=config["simulation"]["r"],
         sigma=config["garch"]["sigma0"],
@@ -1011,8 +1006,8 @@ def train_episode(
         position=hedged_cfg["side"],
         M=config["simulation"]["M"],
         N=config["simulation"]["N"],
-        TCP=transaction_costs.get("stock", 0.0001),
-        seed=episode,
+        TCP=transaction_costs.get('stock', 0.0001),
+        seed=episode
     )
 
     env = HedgingEnvGARCH(
