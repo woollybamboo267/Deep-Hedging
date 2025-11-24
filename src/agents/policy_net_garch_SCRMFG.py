@@ -107,7 +107,12 @@ class FloatingGridManager:
         # NEW: Store these for creating VanillaOptions
         self.precomputation_manager = precomputation_manager
         self.garch_params = garch_params
-
+        logger.info(f"FloatingGridManager received precomputation_manager: {type(precomputation_manager)}")
+        if hasattr(precomputation_manager, 'maturities'):
+            logger.info(f"Precomputation manager has maturities: {precomputation_manager.maturities}")
+        if hasattr(precomputation_manager, '_data'):
+            logger.info(f"Precomputation manager _data keys: {list(precomputation_manager._data.keys())}")
+        
         self.grid_size = len(self.moneyness_levels) * len(self.maturity_days)
         expected_size = 1 + self.grid_size
         actual_size = config["instruments"]["n_hedging_instruments"]
@@ -123,7 +128,9 @@ class FloatingGridManager:
     def create_derivative(self, S_current: float, bucket_idx: int, current_step: int, total_steps: int):
         moneyness, maturity_days = self.get_bucket_params(bucket_idx)
         K = moneyness * S_current
-        
+        logger.info(f"Creating derivative for bucket {bucket_idx}: maturity={maturity_days}, K={K}")
+        logger.info(f"self.precomputation_manager type: {type(self.precomputation_manager)}")
+       
         deriv = self.derivative_class(
             precomputation_manager=self.precomputation_manager,
             garch_params=self.garch_params,
@@ -133,7 +140,9 @@ class FloatingGridManager:
         deriv.K = K
         deriv.N = maturity_days
         deriv.created_at_step = current_step  # ← ADD THIS LINE
-        
+        logger.info(f"Created derivative: N={deriv.N}, K={deriv.K}")
+        logger.info(f"Derivative's precomp_manager type: {type(deriv.precomp_manager)}")
+    
         return deriv
     def get_bucket_params(self, bucket_idx: int) -> Tuple[float, int]:
         """
