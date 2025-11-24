@@ -479,6 +479,8 @@ def run_inference(
     policy_net.eval()
     
     hedged_cfg = config["hedged_option"]
+    mode = config["instruments"].get("mode", "static")
+    is_floating_grid = (mode == "floating_grid")
     
     # Get transaction costs from config
     transaction_costs = get_transaction_costs(config)
@@ -501,12 +503,13 @@ def run_inference(
     env = HedgingEnvGARCH(
         sim=sim,
         derivative=hedged_derivative,
-        hedging_derivatives=hedging_derivatives,
+        hedging_derivatives=None if is_floating_grid else hedging_derivatives,
         garch_params=config["garch"],
         n_hedging_instruments=config["instruments"]["n_hedging_instruments"],
         dt_min=config["environment"]["dt_min"],
         device=str(device),
-        transaction_costs=transaction_costs
+        transaction_costs=transaction_costs,
+        grid_config=config if is_floating_grid else None
     )
     
     env.reset()
@@ -533,19 +536,26 @@ def run_inference(
     risk_measure = risk_config.get("type", "mse")
     alpha = risk_config.get("alpha", None)
     lambda_constraint = constraint_config.get("lambda", 0.0) if constraint_config.get("enabled", False) else 0.0
+    lambda_sparsity = 0.0
+    if is_floating_grid:
+        lambda_sparsity = config["instruments"]["floating_grid"].get("sparsity_penalty", 0.0)
     
-    total_loss, risk_loss, constraint_penalty = compute_loss_with_soft_constraint(
+    total_loss, risk_loss, constraint_penalty, sparsity_penalty = compute_loss_with_soft_constraint(
         terminal_errors,
         trajectories,
         risk_measure=risk_measure,
         alpha=alpha,
-        lambda_constraint=lambda_constraint
+        lambda_constraint=lambda_constraint,
+        lambda_sparsity=lambda_sparsity
     )
     
     logging.info(
         f"Configured Risk Measure ({risk_measure.upper()}): {risk_loss.item():.6f} | "
         f"Constraint Penalty: {constraint_penalty.item():.6f}"
     )
+    
+    if lambda_sparsity > 0:
+        logging.info(f"Sparsity Penalty: {sparsity_penalty.item():.6f}")
     
     # ============================================================
     # CONSTRUCT PROPER SAVE PATH
@@ -565,17 +575,20 @@ def run_inference(
         derivative_folder = config["hedged_option"]["type"].lower()
     
     # Determine instrument folder name
-    n_inst = config["instruments"]["n_hedging_instruments"]
-    if n_inst == 1:
-        instrument_folder = "1inst"
-    elif n_inst == 2:
-        instrument_folder = "2inst"
-    elif n_inst == 3:
-        instrument_folder = "3inst"
-    elif n_inst == 4:
-        instrument_folder = "4inst"
+    if is_floating_grid:
+        instrument_folder = "floating_grid"
     else:
-        instrument_folder = f"{n_inst}inst"
+        n_inst = config["instruments"]["n_hedging_instruments"]
+        if n_inst == 1:
+            instrument_folder = "1inst"
+        elif n_inst == 2:
+            instrument_folder = "2inst"
+        elif n_inst == 3:
+            instrument_folder = "3inst"
+        elif n_inst == 4:
+            instrument_folder = "4inst"
+        else:
+            instrument_folder = f"{n_inst}inst"
     
     # Determine TC folder based on config name ending
     # Config names ending in 'X' → NoTC
@@ -606,6 +619,7 @@ def run_inference(
         "loss": total_loss.item(),
         "risk_loss": risk_loss.item(),
         "constraint_penalty": constraint_penalty.item(),
+        "sparsity_penalty": sparsity_penalty.item(),
         "reward": -float(total_loss.item()),
         "trajectories": trajectories,
         "RL_positions": RL_positions,
@@ -625,7 +639,6 @@ def run_inference(
         logging.warning(f"Plot generation failed: {e}")
         import traceback
         traceback.print_exc()
-
 
 def train(
     config: Dict[str, Any],
