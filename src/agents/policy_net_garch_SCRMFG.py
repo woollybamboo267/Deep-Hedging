@@ -907,52 +907,57 @@ class HedgingEnvGARCH:
 # Loss & training utilities
 # ----------------------------------------
 def compute_loss_with_soft_constraint(
-    terminal_error: torch.Tensor,
+    terminal_errors: torch.Tensor,
     trajectories: Dict[str, Any],
     risk_measure: str = "mse",
     alpha: Optional[float] = None,
     lambda_constraint: float = 0.0,
-    lambda_sparsity: float = 0.0,
-):
+    lambda_sparsity: float = 0.0
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Compute combined loss:
-      total_loss = risk_loss + lambda_constraint * constraint_penalty + lambda_sparsity * sparsity_penalty
-
-    Supported risk_measure: 'mse', 'smse', 'cvar', 'var', 'mae'
+    Compute combined loss with risk measure, soft constraint, and sparsity penalty.
+    
+    Returns:
+        total_loss, risk_loss, constraint_penalty, sparsity_penalty
     """
-    M = terminal_error.shape[0]
+    M = terminal_errors.shape[0]
+    
+    # Compute risk loss based on chosen measure
     if risk_measure == "mse":
-        risk_loss = (terminal_error ** 2).mean()
+        risk_loss = (terminal_errors ** 2).mean()
     elif risk_measure == "smse":
-        positive_mask = (terminal_error >= 0).float()
-        risk_loss = ((terminal_error ** 2) * positive_mask).mean()
+        positive_mask = (terminal_errors >= 0).float()
+        risk_loss = ((terminal_errors ** 2) * positive_mask).mean()
     elif risk_measure == "cvar":
         if alpha is None:
             raise ValueError("alpha parameter required for CVaR")
-        sorted_errors, _ = torch.sort(terminal_error, descending=True)
+        sorted_errors, _ = torch.sort(terminal_errors, descending=True)
         n_tail = max(1, int(np.ceil(M * (1 - alpha))))
         risk_loss = sorted_errors[:n_tail].mean()
     elif risk_measure == "var":
         if alpha is None:
             raise ValueError("alpha parameter required for VaR")
-        risk_loss = torch.quantile(terminal_error, alpha)
+        risk_loss = torch.quantile(terminal_errors, alpha)
     elif risk_measure == "mae":
-        risk_loss = terminal_error.abs().mean()
+        risk_loss = terminal_errors.abs().mean()
     else:
         raise ValueError(f"Unknown risk measure: {risk_measure}")
-
-    soft_violations = trajectories.get("soft_constraint_violations", torch.zeros_like(terminal_error))
+    
+    # Compute soft constraint penalty
+    soft_violations = trajectories.get("soft_constraint_violations", torch.zeros_like(terminal_errors))
     constraint_penalty = soft_violations.mean()
-
-    sparsity_penalty = torch.tensor(0.0, device=terminal_error.device)
+    
+    # Compute sparsity penalty (for floating grid mode)
+    sparsity_penalty = torch.tensor(0.0, device=terminal_errors.device)
     if lambda_sparsity > 0 and "all_actions" in trajectories:
         all_actions = trajectories["all_actions"]  # [M, N+1, n_instruments]
-        option_actions = all_actions[:, :, 1:]  # exclude stock
+        option_actions = all_actions[:, :, 1:]  # exclude stock (index 0)
         sparsity_penalty = option_actions.abs().mean()
-
+    
+    # Total loss
     total_loss = risk_loss + lambda_constraint * constraint_penalty + lambda_sparsity * sparsity_penalty
+    
     return total_loss, risk_loss, constraint_penalty, sparsity_penalty
-
 
 def train_episode(
     episode: int,
