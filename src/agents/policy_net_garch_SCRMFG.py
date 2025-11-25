@@ -222,12 +222,17 @@ class PositionLedger:
             for pos in self.positions[path_idx]:
                 if pos["expiry_step"] > current_step:
                     S_path = S_current[path_idx].unsqueeze(0)  # shape [1]
-                    step_idx = current_step - pos["created_at_step"]  # ← ADD THIS
+                    step_idx = current_step - pos["created_at_step"]
+                    
+                    # Validate step_idx is within bounds
+                    if step_idx < 0 or step_idx >= pos["original_maturity_N"]:
+                        continue  # Skip invalid positions
+                    
                     price = pos["derivative"].price(
                         S=S_path, 
                         K=pos["strike"], 
-                        step_idx=step_idx,  # ← CHANGE FROM current_step
-                        N=pos["original_maturity_N"],  # ← CHANGE FROM derivative.N
+                        step_idx=step_idx,
+                        N=pos["original_maturity_N"],
                         h0=h0
                     )
                     portfolio_value[path_idx] += pos["quantity"] * float(price)
@@ -243,8 +248,20 @@ class PositionLedger:
             for pos in self.positions[path_idx]:
                 if pos["expiry_step"] > current_step:
                     S_path = S_current[path_idx].unsqueeze(0)
+                    step_idx = current_step - pos["created_at_step"]
+                    
+                    # Validate step_idx is within bounds
+                    if step_idx < 0 or step_idx >= pos["original_maturity_N"]:
+                        continue
+                    
                     greek_method = getattr(pos["derivative"], greek_name)
-                    greek_val = greek_method(S=S_path, K=pos["strike"], step_idx=current_step, N=pos["derivative"].N, h0=h0)
+                    greek_val = greek_method(
+                        S=S_path, 
+                        K=pos["strike"], 
+                        step_idx=step_idx, 
+                        N=pos["original_maturity_N"], 
+                        h0=h0
+                    )
                     greeks[path_idx] += float(greek_val)
         return greeks
 
@@ -825,26 +842,21 @@ class HedgingEnvGARCH:
             cost_breakdown["stock"] += stock_cost
             stock_position = actions_t[:, 0]
 
-            # Option trades (interpreted as integerized trade quantities)
             for bucket_idx in range(1, self.n_hedging_instruments):
                 trade_qty = torch.round(actions_t[:, bucket_idx])
                 trade_qty = torch.where(trade_qty.abs() < self.min_trade_size, torch.zeros_like(trade_qty), trade_qty)
                 if trade_qty.abs().sum() > 1e-6:
                     S_mean = float(S_t.mean().item())
                     deriv = self.grid_manager.create_derivative(S_current=S_mean, bucket_idx=bucket_idx - 1, current_step=t, total_steps=self.N)
-                    # price for transaction cost per-path
-                    option_prices = torch.zeros(self.M, device=self.device)
-                    for path_idx in range(self.M):
-                        if abs(trade_qty[path_idx]) > 1e-6:
-                            S_path = S_t[path_idx].unsqueeze(0)
-                            price = deriv.price(S=S_path, K=deriv.K, step_idx=t, N=deriv.N, h0=h0_current)
-                            option_prices[path_idx] = float(price)
+                    
+                    # BATCH PRICE: step_idx=0 since just created
+                    option_prices = deriv.price(S=S_t, K=deriv.K, step_idx=0, N=deriv.N, h0=h0_current)
+                    
                     tcp_option = self._get_transaction_cost_rate(bucket_idx)
                     option_cost = tcp_option * trade_qty.abs() * option_prices
                     B_t -= trade_qty * option_prices + option_cost
                     cost_breakdown["vanilla_option"] += option_cost
                     ledger.add_position(deriv, trade_qty, bucket_idx, t, S_t)
-
             # Evolve GARCH and stock
             sqrt_h = torch.sqrt(h_t)
             h_t = self.omega + self.beta * h_t + self.alpha * (self.Z[:, t] - self.gamma * sqrt_h) ** 2
