@@ -634,18 +634,18 @@ class HedgingEnvGARCH:
         V_trajectory = []
         obs_list = []
         all_actions = []
-
+    
         # Initialize ledger and state
         ledger = PositionLedger(self.M, self.device)
         S_t = torch.full((self.M,), self.S0, dtype=torch.float32, device=self.device)
         h_t = self.h_t.clone()
         stock_position = torch.zeros(self.M, dtype=torch.float32, device=self.device)
-
+    
         S_trajectory.append(S_t.clone())
         h0_current = h_t.mean().item()
         V0 = self.derivative.price(S=S_t, K=self.K, step_idx=0, N=self.N, h0=h0_current)
         V_trajectory.append(V0)
-
+    
         # Initial observation
         obs_t = torch.zeros((self.M, 1, self.obs_dim), dtype=torch.float32, device=self.device)
         obs_t[:, 0, 0] = 0.0  # time (normalized)
@@ -654,7 +654,7 @@ class HedgingEnvGARCH:
         obs_t[:, 0, 3] = torch.sqrt(h_t)  # volatility
         obs_t[:, 0, 4] = V0  # derivative value
         obs_list.append(obs_t)
-
+    
         # Get initial actions
         lstm_out, hidden_state = policy_net.lstm(obs_t)
         x = lstm_out
@@ -666,44 +666,73 @@ class HedgingEnvGARCH:
             outputs.append(output)
         actions_t = torch.stack(outputs, dim=-1)  # [M, n_instruments]
         all_actions.append(actions_t)
-
+    
         # Main loop
         for t in range(self.N):
             # Execute actions from previous output (actions_t is target positions / trades)
             actions_prev = all_actions[-1]
-
+    
             # Stock semantics: interpret as target position
             stock_trade = actions_prev[:, 0] - stock_position
             stock_position = actions_prev[:, 0]
-
+    
             # Options: treat actions_prev[:, i] (i>=1) as immediate trade quantities (rounded)
             for bucket_idx in range(1, self.n_hedging_instruments):
                 trade_qty = torch.round(actions_prev[:, bucket_idx])  # integerize
                 # suppress small trades
                 trade_qty = torch.where(trade_qty.abs() < self.min_trade_size, torch.zeros_like(trade_qty), trade_qty)
+                
                 if trade_qty.abs().sum() > 1e-6:
-                    S_mean = float(S_t.mean().item())
-                    deriv = self.grid_manager.create_derivative(
-                        S_current=S_mean, bucket_idx=bucket_idx - 1, current_step=t, total_steps=self.N
-                    )
-                    ledger.add_position(deriv, trade_qty, bucket_idx, t, S_t)
-
+                    # Get bucket parameters (moneyness and maturity)
+                    moneyness, maturity_days = self.grid_manager.get_bucket_params(bucket_idx - 1)
+                    
+                    # Process each path independently
+                    for path_idx in range(self.M):
+                        qty = float(trade_qty[path_idx].item())
+                        if abs(qty) < 1e-6:
+                            continue
+                        
+                        # Get THIS path's spot price
+                        S_path = float(S_t[path_idx].item())
+                        
+                        # Calculate path-specific strike based on THIS path's spot
+                        K_path = moneyness * S_path
+                        
+                        # Create derivative template for this path
+                        deriv_template = self.grid_manager.create_derivative(
+                            S_current=S_path,  # Use path-specific spot
+                            bucket_idx=bucket_idx - 1,
+                            current_step=t,
+                            total_steps=self.N
+                        )
+                        
+                        # Add position with path-specific parameters
+                        ledger.add_position(
+                            path_idx=path_idx,
+                            derivative_template=deriv_template,
+                            quantity=qty,
+                            bucket_idx=bucket_idx,
+                            current_step=t,
+                            S_current=S_path,
+                            K_path=K_path  # PATH-SPECIFIC STRIKE
+                        )
+    
             # Evolve GARCH and stock
             sqrt_h = torch.sqrt(h_t)
             h_t = self.omega + self.beta * h_t + self.alpha * (self.Z[:, t] - self.gamma * sqrt_h) ** 2
             h_t = torch.clamp(h_t, min=1e-12)
             r_t = (self.r + self.lambda_ * h_t - 0.5 * h_t) + torch.sqrt(h_t) * self.Z[:, t]
             S_t = S_t * torch.exp(r_t)
-
+    
             # Remove expired positions (they expire at t+1 if expiry_step <= t+1)
             ledger.remove_expired(t + 1)
-
+    
             # Price current hedged derivative
             h0_current = h_t.mean().item()
             V_t = self.derivative.price(S=S_t, K=self.K, step_idx=t + 1, N=self.N, h0=h0_current)
             S_trajectory.append(S_t.clone())
             V_trajectory.append(V_t)
-
+    
             # Build observation for next iteration
             time_val = (t + 1) / self.N
             obs_new = torch.zeros((self.M, 1, self.obs_dim), dtype=torch.float32, device=self.device)
@@ -714,7 +743,7 @@ class HedgingEnvGARCH:
             obs_new[:, 0, 3] = torch.sqrt(h_t)
             obs_new[:, 0, 4] = V_t
             obs_list.append(obs_new)
-
+    
             # Ask policy for next actions (unless at the last time step)
             if t < self.N - 1:
                 lstm_out, hidden_state = policy_net.lstm(obs_new, hidden_state)
@@ -727,13 +756,13 @@ class HedgingEnvGARCH:
                     outputs.append(output)
                 actions_t = torch.stack(outputs, dim=-1)
                 all_actions.append(actions_t)
-
+    
         # Stack outputs and store ledger
         S_trajectory = torch.stack(S_trajectory, dim=1)
         V_trajectory = torch.stack(V_trajectory, dim=1)
         all_actions = torch.stack(all_actions, dim=1)  # [M, N+1, n_instruments]
         obs_sequence = torch.cat(obs_list, dim=1)
-
+    
         self.position_ledger = ledger
         return S_trajectory, V_trajectory, None, obs_sequence, all_actions
 
