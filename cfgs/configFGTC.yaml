@@ -64,7 +64,7 @@ simulation:
 training:
   batch_size: 1000
   checkpoint_frequency: 25
-  device: cpu
+  device: cuda
   entropy_coefficient: 0.5
   episodes: 300
   gamma: 0.9999
