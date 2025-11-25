@@ -153,7 +153,7 @@ class PositionLedger:
         self.device = device
         self.positions = [[] for _ in range(M)]
     
-    def add_position_single_path(
+    def add_position(
         self, 
         path_idx: int, 
         derivative_template, 
@@ -852,7 +852,7 @@ class HedgingEnvGARCH:
                     cost_breakdown["vanilla_option"][path_idx] += option_cost
                     
                     # Add to ledger with PATH-SPECIFIC strike
-                    ledger.add_position_single_path(
+                    ledger.add_position(
                         path_idx=path_idx,
                         derivative_template=deriv_template,
                         quantity=qty,
