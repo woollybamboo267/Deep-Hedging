@@ -296,7 +296,8 @@ class HedgingEnvGARCH:
         device: str = "cpu",
         transaction_costs: Optional[Dict[str, float]] = None,
         grid_config: Optional[Dict[str, Any]] = None,
-        precomputation_manager = None  # ← ADD THIS
+        precomputation_manager = None,
+        lambda_constraint: float = 0.0
     ):
         self.sim = sim
         self.M = sim.M
@@ -361,6 +362,8 @@ class HedgingEnvGARCH:
         self.beta = float(self.garch_params["beta"])
         self.gamma = float(self.garch_params["gamma"])
         self.lambda_ = float(self.garch_params["lambda"])
+        self.lambda_constraint = lambda_constraint
+
 
         # Market / contract parameters
         self.S0 = self.sim.S0
@@ -703,82 +706,117 @@ class HedgingEnvGARCH:
         else:
             return self._simulate_full_trajectory_static(all_actions, O_trajectories_or_None)
 
-    def _simulate_full_trajectory_static(self, all_positions: torch.Tensor, O_trajectories: List[torch.Tensor]):
+    def _simulate_full_trajectory_floating(self, all_actions: torch.Tensor):
         """
-        P&L calculation for static hedging instruments.
-        all_positions: [M, N+1, n_instruments] (positions per time step)
-        O_trajectories: list of option price paths [M, N+1] for the option instruments (excluding stock)
+        P&L calculation for the floating-grid mode. all_actions interpreted as:
+            - all_actions[:, t, 0] = target stock position at time t
+            - all_actions[:, t, i] (i>=1) = trade quantities for bucket (i-1) at time t
+        The ledger is reconstructed and used to price portfolio positions pathwise.
         """
+        ledger = PositionLedger(self.M, self.device)
         S_t = torch.full((self.M,), self.S0, dtype=torch.float32, device=self.device)
-        positions_t = all_positions[:, 0]
-        h0_current = self.h_t.mean().item()
-        V0 = self.derivative.price(S=S_t, K=self.K, step_idx=0, N=self.N, h0=h0_current)
-
-        # Initialize bank account with derivative proceeds and the cost of initial hedges
-        B_t = self.side * V0 - positions_t[:, 0] * S_t
-        for i in range(len(O_trajectories)):
-            B_t -= positions_t[:, i + 1] * O_trajectories[i][:, 0]
-
-        V0_portfolio = self.side * V0
+        stock_position = torch.zeros(self.M, dtype=torch.float32, device=self.device)
         h_t = self.h_t.clone()
-
-        S_traj, B_traj = [S_t], [B_t]
+        h0_current = h_t.mean().item()
+        V0 = self.derivative.price(S=S_t, K=self.K, step_idx=0, N=self.N, h0=h0_current)
+    
+        # Initialize bank account with proceeds from selling/hedging the derivative
+        B_t = self.side * V0
+        V0_portfolio = self.side * V0
+    
+        # Preallocate trajectories
+        S_trajectory = torch.zeros(self.M, self.N + 1, dtype=torch.float32, device=self.device)
+        B_trajectory = torch.zeros(self.M, self.N + 1, dtype=torch.float32, device=self.device)
+        stock_pos_trajectory = torch.zeros(self.M, self.N + 1, dtype=torch.float32, device=self.device)
+        
+        S_trajectory[:, 0] = S_t
+        B_trajectory[:, 0] = B_t
+        stock_pos_trajectory[:, 0] = stock_position
+    
         cost_breakdown = {
             "stock": torch.zeros(self.M, device=self.device),
-            "vanilla_option": torch.zeros(self.M, device=self.device),
-            "barrier_option": torch.zeros(self.M, device=self.device),
-            "american_option": torch.zeros(self.M, device=self.device),
+            "vanilla_option": torch.zeros(self.M, device=self.device)
         }
         soft_constraint_violations = torch.zeros(self.M, device=self.device)
-
+        ledger_size_trajectory = []
+        
+        # Check if soft constraint is enabled
+        compute_soft_constraint = (
+            hasattr(self, 'lambda_constraint') and 
+            self.lambda_constraint is not None and 
+            self.lambda_constraint > 0
+        )
+    
         for t in range(self.N):
+            actions_t = all_actions[:, t]
+    
+            # Stock trade (target semantics)
+            stock_trade = actions_t[:, 0] - stock_position
+            tcp_stock = self._get_transaction_cost_rate(0)
+            stock_cost = tcp_stock * torch.abs(stock_trade) * S_t
+            B_t -= stock_trade * S_t + stock_cost
+            cost_breakdown["stock"] += stock_cost
+            stock_position = actions_t[:, 0]
+    
+            # Option trades
+            for bucket_idx in range(1, self.n_hedging_instruments):
+                trade_qty = torch.round(actions_t[:, bucket_idx])
+                trade_qty = torch.where(
+                    trade_qty.abs() < self.min_trade_size,
+                    torch.zeros_like(trade_qty),
+                    trade_qty
+                )
+                if trade_qty.abs().sum() > 1e-6:
+                    S_mean = float(S_t.mean().item())
+                    deriv = self.grid_manager.create_derivative(
+                        S_current=S_mean,
+                        bucket_idx=bucket_idx - 1,
+                        current_step=t,
+                        total_steps=self.N
+                    )
+                    
+                    # Batch price: step_idx=0 since just created
+                    option_prices = deriv.price(S=S_t, K=deriv.K, step_idx=0, N=deriv.N, h0=h0_current)
+                    
+                    tcp_option = self._get_transaction_cost_rate(bucket_idx)
+                    option_cost = tcp_option * trade_qty.abs() * option_prices
+                    B_t -= trade_qty * option_prices + option_cost
+                    cost_breakdown["vanilla_option"] += option_cost
+                    ledger.add_position(deriv, trade_qty, bucket_idx, t, S_t)
+    
+            # Evolve GARCH and stock
             sqrt_h = torch.sqrt(h_t)
             h_t = self.omega + self.beta * h_t + self.alpha * (self.Z[:, t] - self.gamma * sqrt_h) ** 2
             h_t = torch.clamp(h_t, min=1e-12)
-
-            # Evolve stock
             r_t = (self.r + self.lambda_ * h_t - 0.5 * h_t) + torch.sqrt(h_t) * self.Z[:, t]
             S_t = S_t * torch.exp(r_t)
-
-            # New positions
-            positions_new = all_positions[:, t + 1]
-
-            # Accrue interest on bank account
+    
+            # Accrue interest
             dt = 1.0 / self.N
             B_t = B_t * torch.exp(torch.tensor(self.r * 252.0, device=self.device) * dt)
-
-            # Rebalance per instrument and apply transaction costs
-            for i in range(self.n_hedging_instruments):
-                trade = positions_new[:, i] - positions_t[:, i]
-                tcp_rate = self._get_transaction_cost_rate(i)
-                if i == 0:
-                    price = S_t
-                    instrument_type = "stock"
-                else:
-                    price = O_trajectories[i - 1][:, t + 1]
-                    instrument_type = self.instrument_types_list[i]
-                cost = tcp_rate * torch.abs(trade) * price
-                B_t = B_t - trade * price - cost
-                cost_breakdown[instrument_type] += cost
-
-            positions_t = positions_new
-
-            # Compute portfolio value
-            P_t = B_t + positions_t[:, 0] * S_t
-            for i in range(len(O_trajectories)):
-                P_t += positions_t[:, i + 1] * O_trajectories[i][:, t + 1]
-
-            # Soft constraint: positive exceeding of portfolio over derivative value
-            h0_current = h_t.mean().item()
-            V_t_phi = self.derivative.price(S=S_t, K=self.K, step_idx=t + 1, N=self.N, h0=h0_current)
-            V_t_phi = self.side * V_t_phi
-            xi_t = P_t - V_t_phi
-            soft_constraint_violations += torch.clamp(xi_t, min=0.0)
-
-            S_traj.append(S_t)
-            B_traj.append(B_t)
-
-        # Terminal payoff and portfolio value
+    
+            # Expirations: realize payoffs for expired positions and remove them
+            expired_payoffs = ledger.compute_and_remove_expired(S_t, t + 1, h_t.mean().item())
+            B_t += expired_payoffs
+    
+            # Soft constraint computation (only if enabled)
+            if compute_soft_constraint:
+                h0_current = h_t.mean().item()
+                portfolio_value = ledger.compute_total_value(S_t, t + 1, h0_current)
+                P_t = B_t + stock_position * S_t + portfolio_value
+                
+                V_t_phi = self.derivative.price(S=S_t, K=self.K, step_idx=t + 1, N=self.N, h0=h0_current)
+                V_t_phi = self.side * V_t_phi
+                xi_t = P_t - V_t_phi
+                soft_constraint_violations += torch.clamp(xi_t, min=0.0)
+    
+            # Record trajectories
+            S_trajectory[:, t + 1] = S_t
+            B_trajectory[:, t + 1] = B_t
+            stock_pos_trajectory[:, t + 1] = stock_position
+            ledger_size_trajectory.append(float(ledger.get_ledger_size().mean().item()))
+    
+        # Terminal payoff
         if hasattr(self.derivative, "option_type"):
             opt_type = self.derivative.option_type.lower()
             if opt_type == "call":
@@ -788,21 +826,23 @@ class HedgingEnvGARCH:
         else:
             payoff = torch.clamp(S_t - self.K, min=0.0)
         payoff = payoff * self.contract_size
-
-        terminal_value = B_t + positions_t[:, 0] * S_t
-        for i in range(len(O_trajectories)):
-            terminal_value += positions_t[:, i + 1] * O_trajectories[i][:, -1]
-
+    
+        # Terminal portfolio value (ALWAYS computed for P&L)
+        portfolio_value_final = ledger.compute_total_value(S_t, self.N, h_t.mean().item())
+        terminal_value = B_t + stock_position * S_t + portfolio_value_final
         terminal_error = terminal_value - self.side * payoff
-
+    
         trajectories = {
-            "S": torch.stack(S_traj, dim=1),
-            "B": torch.stack(B_traj, dim=1),
-            "positions": all_positions,
-            "O": O_trajectories,
+            "S": S_trajectory,
+            "B": B_trajectory,
+            "stock_positions": stock_pos_trajectory,
+            "positions": all_actions,
+            "O": None,
             "cost_breakdown": cost_breakdown,
             "soft_constraint_violations": soft_constraint_violations,
             "V0_portfolio": V0_portfolio,
+            "ledger_size_trajectory": ledger_size_trajectory,
+            "all_actions": all_actions,
         }
         return terminal_error, trajectories
 
@@ -1029,13 +1069,15 @@ def train_episode(
     env = HedgingEnvGARCH(
         sim=sim,
         derivative=hedged_derivative,
-        hedging_derivatives=None if is_floating else hedging_derivatives,
+        hedging_derivatives=None if is_floating_grid else hedging_derivatives,
         garch_params=config["garch"],
         n_hedging_instruments=config["instruments"]["n_hedging_instruments"],
         dt_min=config["environment"]["dt_min"],
         device=str(device),
         transaction_costs=transaction_costs,
-        grid_config=config if is_floating else None,
+        grid_config=config if is_floating_grid else None,
+        precomputation_manager=precomputation_manager,
+        lambda_constraint=lambda_constraint  # ← Add this
     )
 
     env.reset()
