@@ -146,78 +146,105 @@ class FloatingGridManager:
 # Position ledger for floating grid mode
 # ----------------------------------------
 class PositionLedger:
-    """
-    Tracks per-path option positions (for the floating grid mode).
-    Each path has an independent list of open positions (with quantity, strike, expiry).
-    """
-
+    """Position ledger with path-specific strike support."""
+    
     def __init__(self, M: int, device: torch.device):
         self.M = M
         self.device = device
-        self.positions: List[List[Dict[str, Any]]] = [[] for _ in range(M)]
-
-    def add_position(self, derivative, quantity: torch.Tensor, bucket_idx: int, current_step: int, S_current: torch.Tensor):
+        self.positions = [[] for _ in range(M)]
+    
+    def add_position_single_path(
+        self, 
+        path_idx: int, 
+        derivative_template, 
+        quantity: float, 
+        bucket_idx: int, 
+        current_step: int, 
+        S_current: float,
+        K_path: float
+    ):
         """
-        Add positions per-path.
-
+        Add position for a SINGLE path with path-specific strike.
+        
         Args:
-            derivative: option object (shared config; pricing methods operate pathwise)
-            quantity: [M] tensor (can be negative for short)
-            bucket_idx: integer bucket index (with stock reserved at index 0)
-            current_step: timestep when opened
-            S_current: [M] spots at opening
+            path_idx: Which path (0 to M-1)
+            derivative_template: Derivative object (template for pricing)
+            quantity: Number of contracts (can be negative for short)
+            bucket_idx: Bucket index
+            current_step: Current time step
+            S_current: Spot price for this path
+            K_path: Strike price for this path (path-specific!)
         """
-        for path_idx in range(self.M):
-            qty = float(quantity[path_idx])
-            if abs(qty) > 1e-6:
-                self.positions[path_idx].append({
-                    "derivative": derivative,
-                    "quantity": qty,
-                    "bucket_idx": bucket_idx,
-                    "created_at_step": current_step,  # ← ADD THIS
-                    "expiry_step": current_step + derivative.N,
-                    "strike": derivative.K,
-                    "original_maturity_N": derivative.N,  # ← ADD THIS
-                    "opening_spot": float(S_current[path_idx]),
-                })
-
+        self.positions[path_idx].append({
+            "derivative": derivative_template,
+            "quantity": quantity,
+            "bucket_idx": bucket_idx,
+            "created_at_step": current_step,
+            "expiry_step": current_step + derivative_template.N,
+            "strike": K_path,  # PATH-SPECIFIC STRIKE!
+            "original_maturity_N": derivative_template.N,
+            "opening_spot": S_current,
+        })
+    
     def remove_expired(self, current_step: int):
-        """Remove positions whose expiry_step <= current_step (they've expired)."""
+        """Remove positions whose expiry_step <= current_step."""
         for path_idx in range(self.M):
-            self.positions[path_idx] = [pos for pos in self.positions[path_idx] if pos["expiry_step"] > current_step]
-
-    def compute_and_remove_expired(self, S_current: torch.Tensor, current_step: int, h0: float) -> torch.Tensor:
+            self.positions[path_idx] = [
+                pos for pos in self.positions[path_idx] 
+                if pos["expiry_step"] > current_step
+            ]
+    
+    def compute_and_remove_expired(
+        self, 
+        S_current: torch.Tensor, 
+        current_step: int, 
+        h0: float
+    ) -> torch.Tensor:
         """
         Compute payoffs for positions that expire at or before current_step,
         remove them from ledger, and return the per-path total payoffs.
         """
         payoffs = torch.zeros(self.M, device=self.device)
+        
         for path_idx in range(self.M):
             expired = []
             remaining = []
+            
             for pos in self.positions[path_idx]:
                 if pos["expiry_step"] <= current_step:
                     expired.append(pos)
                 else:
                     remaining.append(pos)
+            
+            # Compute payoffs for expired options
             for pos in expired:
                 S_path = float(S_current[path_idx].item())
-                K = pos["strike"]
+                K = pos["strike"]  # Use path-specific strike!
                 opt_type = getattr(pos["derivative"], "option_type", "call").lower()
+                
                 if opt_type == "call":
                     payoff = max(S_path - K, 0.0)
                 else:
                     payoff = max(K - S_path, 0.0)
+                
                 payoffs[path_idx] += pos["quantity"] * payoff
+            
             self.positions[path_idx] = remaining
+        
         return payoffs
-
-    def compute_total_value(self, S_current: torch.Tensor, current_step: int, h0: float) -> torch.Tensor:
+    
+    def compute_total_value(
+        self, 
+        S_current: torch.Tensor, 
+        current_step: int, 
+        h0: float
+    ) -> torch.Tensor:
         """
         Price all active positions in the ledger (for each path) and return aggregate [M].
-        This uses each stored pos['derivative'] to compute current prices (per-path).
+        Uses path-specific strikes stored in each position.
         """
         portfolio_value = torch.zeros(self.M, device=self.device)
+        
         for path_idx in range(self.M):
             for pos in self.positions[path_idx]:
                 if pos["expiry_step"] > current_step:
@@ -226,47 +253,60 @@ class PositionLedger:
                     
                     # Validate step_idx is within bounds
                     if step_idx < 0 or step_idx >= pos["original_maturity_N"]:
-                        continue  # Skip invalid positions
+                        continue
                     
+                    # Price using PATH-SPECIFIC strike
                     price = pos["derivative"].price(
                         S=S_path, 
-                        K=pos["strike"], 
+                        K=pos["strike"],  # Path-specific strike!
                         step_idx=step_idx,
                         N=pos["original_maturity_N"],
                         h0=h0
                     )
                     portfolio_value[path_idx] += pos["quantity"] * float(price)
+        
         return portfolio_value
-
-    def compute_greeks(self, S_current: torch.Tensor, current_step: int, h0: float, greek_name: str) -> torch.Tensor:
+    
+    def compute_greeks(
+        self, 
+        S_current: torch.Tensor, 
+        current_step: int, 
+        h0: float, 
+        greek_name: str
+    ) -> torch.Tensor:
         """
         Aggregate a named Greek across all active positions per path.
-        greek_name must be one of 'delta', 'gamma', 'vega', 'theta' and the derivative must expose it.
         """
         greeks = torch.zeros(self.M, device=self.device)
+        
         for path_idx in range(self.M):
             for pos in self.positions[path_idx]:
                 if pos["expiry_step"] > current_step:
                     S_path = S_current[path_idx].unsqueeze(0)
                     step_idx = current_step - pos["created_at_step"]
                     
-                    # Validate step_idx is within bounds
                     if step_idx < 0 or step_idx >= pos["original_maturity_N"]:
                         continue
                     
                     greek_method = getattr(pos["derivative"], greek_name)
                     greek_val = greek_method(
                         S=S_path, 
-                        K=pos["strike"], 
+                        K=pos["strike"],  # Path-specific strike!
                         step_idx=step_idx, 
                         N=pos["original_maturity_N"], 
                         h0=h0
                     )
                     greeks[path_idx] += float(greek_val)
+        
         return greeks
-
+    
     def get_ledger_size(self) -> torch.Tensor:
-        sizes = torch.tensor([len(self.positions[path_idx]) for path_idx in range(self.M)], dtype=torch.float32, device=self.device)
+        """Return number of active positions per path."""
+        sizes = torch.tensor(
+            [len(self.positions[path_idx]) for path_idx in range(self.M)], 
+            dtype=torch.float32, 
+            device=self.device
+        )
         return sizes
 
 
@@ -706,24 +746,26 @@ class HedgingEnvGARCH:
         else:
             return self._simulate_full_trajectory_static(all_actions, O_trajectories_or_None)
 
+
     def _simulate_full_trajectory_floating(self, all_actions: torch.Tensor):
         """
-        P&L calculation for the floating-grid mode. all_actions interpreted as:
-            - all_actions[:, t, 0] = target stock position at time t
-            - all_actions[:, t, i] (i>=1) = trade quantities for bucket (i-1) at time t
-        The ledger is reconstructed and used to price portfolio positions pathwise.
+        P&L calculation for floating-grid mode with PATH-SPECIFIC strikes.
+        
+        CRITICAL FIX: Each path now gets options with strikes based on its own
+        spot price, not the mean across all paths.
         """
         ledger = PositionLedger(self.M, self.device)
         S_t = torch.full((self.M,), self.S0, dtype=torch.float32, device=self.device)
         stock_position = torch.zeros(self.M, dtype=torch.float32, device=self.device)
         h_t = self.h_t.clone()
         h0_current = h_t.mean().item()
+        
         V0 = self.derivative.price(S=S_t, K=self.K, step_idx=0, N=self.N, h0=h0_current)
-    
+        
         # Initialize bank account with proceeds from selling/hedging the derivative
         B_t = self.side * V0
         V0_portfolio = self.side * V0
-    
+        
         # Preallocate trajectories
         S_trajectory = torch.zeros(self.M, self.N + 1, dtype=torch.float32, device=self.device)
         B_trajectory = torch.zeros(self.M, self.N + 1, dtype=torch.float32, device=self.device)
@@ -732,7 +774,7 @@ class HedgingEnvGARCH:
         S_trajectory[:, 0] = S_t
         B_trajectory[:, 0] = B_t
         stock_pos_trajectory[:, 0] = stock_position
-    
+        
         cost_breakdown = {
             "stock": torch.zeros(self.M, device=self.device),
             "vanilla_option": torch.zeros(self.M, device=self.device)
@@ -746,19 +788,21 @@ class HedgingEnvGARCH:
             self.lambda_constraint is not None and 
             self.lambda_constraint > 0
         )
-    
+        
+        # Get transaction cost rates
+        tcp_stock = self._get_transaction_cost_rate(0)
+        
         for t in range(self.N):
             actions_t = all_actions[:, t]
-    
-            # Stock trade (target semantics)
+            
+            # ===== STOCK TRADE (vectorized) =====
             stock_trade = actions_t[:, 0] - stock_position
-            tcp_stock = self._get_transaction_cost_rate(0)
             stock_cost = tcp_stock * torch.abs(stock_trade) * S_t
             B_t -= stock_trade * S_t + stock_cost
             cost_breakdown["stock"] += stock_cost
             stock_position = actions_t[:, 0]
-    
-            # Option trades
+            
+            # ===== OPTION TRADES (path-specific strikes) =====
             for bucket_idx in range(1, self.n_hedging_instruments):
                 trade_qty = torch.round(actions_t[:, bucket_idx])
                 trade_qty = torch.where(
@@ -766,42 +810,76 @@ class HedgingEnvGARCH:
                     torch.zeros_like(trade_qty),
                     trade_qty
                 )
-                if trade_qty.abs().sum() > 1e-6:
-                    S_mean = float(S_t.mean().item())
-                    deriv = self.grid_manager.create_derivative(
-                        S_current=S_mean,
-                        bucket_idx=bucket_idx - 1,
-                        current_step=t,
-                        total_steps=self.N
+                
+                # Get bucket parameters (moneyness and maturity)
+                moneyness, maturity_days = self.grid_manager.get_bucket_params(bucket_idx - 1)
+                tcp_option = self._get_transaction_cost_rate(bucket_idx)
+                
+                # Create derivative template (just for pricing methods)
+                from src.option_greek.vanilla import VanillaOption
+                deriv_template = VanillaOption(
+                    precomputation_manager=self.derivative.precomp_manager,
+                    garch_params=self.garch_params,
+                    option_type=self.grid_manager.option_type
+                )
+                deriv_template.N = maturity_days
+                deriv_template.created_at_step = t
+                
+                # Process each path individually
+                for path_idx in range(self.M):
+                    qty = float(trade_qty[path_idx].item())
+                    if abs(qty) < 1e-6:
+                        continue
+                    
+                    # PATH-SPECIFIC strike based on THIS path's spot
+                    S_path_float = float(S_t[path_idx].item())
+                    K_path = moneyness * S_path_float
+                    
+                    # Price option for THIS path with ITS strike
+                    S_path_tensor = S_t[path_idx].unsqueeze(0)
+                    option_price = deriv_template.price(
+                        S=S_path_tensor, 
+                        K=K_path, 
+                        step_idx=0, 
+                        N=maturity_days, 
+                        h0=h0_current
                     )
+                    option_price_float = float(option_price.item())
                     
-                    # Batch price: step_idx=0 since just created
-                    option_prices = deriv.price(S=S_t, K=deriv.K, step_idx=0, N=deriv.N, h0=h0_current)
+                    # Transaction cost for this path
+                    option_cost = tcp_option * abs(qty) * option_price_float
+                    B_t[path_idx] -= qty * option_price_float + option_cost
+                    cost_breakdown["vanilla_option"][path_idx] += option_cost
                     
-                    tcp_option = self._get_transaction_cost_rate(bucket_idx)
-                    option_cost = tcp_option * trade_qty.abs() * option_prices
-                    B_t -= trade_qty * option_prices + option_cost
-                    cost_breakdown["vanilla_option"] += option_cost
-                    ledger.add_position(deriv, trade_qty, bucket_idx, t, S_t)
-    
-            # Evolve GARCH and stock
+                    # Add to ledger with PATH-SPECIFIC strike
+                    ledger.add_position_single_path(
+                        path_idx=path_idx,
+                        derivative_template=deriv_template,
+                        quantity=qty,
+                        bucket_idx=bucket_idx,
+                        current_step=t,
+                        S_current=S_path_float,
+                        K_path=K_path
+                    )
+            
+            # ===== EVOLVE GARCH AND STOCK =====
             sqrt_h = torch.sqrt(h_t)
             h_t = self.omega + self.beta * h_t + self.alpha * (self.Z[:, t] - self.gamma * sqrt_h) ** 2
             h_t = torch.clamp(h_t, min=1e-12)
             r_t = (self.r + self.lambda_ * h_t - 0.5 * h_t) + torch.sqrt(h_t) * self.Z[:, t]
             S_t = S_t * torch.exp(r_t)
-    
-            # Accrue interest
+            
+            # ===== ACCRUE INTEREST =====
             dt = 1.0 / self.N
             B_t = B_t * torch.exp(torch.tensor(self.r * 252.0, device=self.device) * dt)
-    
-            # Expirations: realize payoffs for expired positions and remove them
-            expired_payoffs = ledger.compute_and_remove_expired(S_t, t + 1, h_t.mean().item())
+            
+            # ===== EXPIRATIONS: Realize payoffs for expired positions =====
+            h0_current = h_t.mean().item()
+            expired_payoffs = ledger.compute_and_remove_expired(S_t, t + 1, h0_current)
             B_t += expired_payoffs
-    
-            # Soft constraint computation (only if enabled)
+            
+            # ===== SOFT CONSTRAINT (optional) =====
             if compute_soft_constraint:
-                h0_current = h_t.mean().item()
                 portfolio_value = ledger.compute_total_value(S_t, t + 1, h0_current)
                 P_t = B_t + stock_position * S_t + portfolio_value
                 
@@ -809,14 +887,14 @@ class HedgingEnvGARCH:
                 V_t_phi = self.side * V_t_phi
                 xi_t = P_t - V_t_phi
                 soft_constraint_violations += torch.clamp(xi_t, min=0.0)
-    
-            # Record trajectories
+            
+            # ===== RECORD TRAJECTORIES =====
             S_trajectory[:, t + 1] = S_t
             B_trajectory[:, t + 1] = B_t
             stock_pos_trajectory[:, t + 1] = stock_position
             ledger_size_trajectory.append(float(ledger.get_ledger_size().mean().item()))
-    
-        # Terminal payoff
+        
+        # ===== TERMINAL PAYOFF =====
         if hasattr(self.derivative, "option_type"):
             opt_type = self.derivative.option_type.lower()
             if opt_type == "call":
@@ -826,12 +904,14 @@ class HedgingEnvGARCH:
         else:
             payoff = torch.clamp(S_t - self.K, min=0.0)
         payoff = payoff * self.contract_size
-    
-        # Terminal portfolio value (ALWAYS computed for P&L)
+        
+        # ===== TERMINAL PORTFOLIO VALUE =====
+        # Mark-to-market any remaining options (shouldn't be many if all expire by N)
         portfolio_value_final = ledger.compute_total_value(S_t, self.N, h_t.mean().item())
         terminal_value = B_t + stock_position * S_t + portfolio_value_final
         terminal_error = terminal_value - self.side * payoff
-    
+        
+        # ===== RETURN RESULTS =====
         trajectories = {
             "S": S_trajectory,
             "B": B_trajectory,
@@ -844,6 +924,7 @@ class HedgingEnvGARCH:
             "ledger_size_trajectory": ledger_size_trajectory,
             "all_actions": all_actions,
         }
+        
         return terminal_error, trajectories
 # ----------------------------------------
 # Loss & training utilities
