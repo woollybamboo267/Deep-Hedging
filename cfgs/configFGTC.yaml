@@ -84,5 +84,5 @@ risk_measure:
   # alpha: 0.95  # Only needed for cvar/var
 
 soft_constraint:
-  enabled: true
-  lambda: 1.0
+  enabled: false
+  lambda: 0.0
