@@ -882,7 +882,7 @@ class HedgingEnvGARCH:
         all_positions = torch.stack(all_positions, dim=1)  # [M, N+1, n_instruments]
         obs_sequence = torch.cat(obs_list, dim=1)  # [M, N+1, obs_dim]
         return S_trajectory, V_trajectory, O_trajectories, obs_sequence, all_positions
-
+    
     def _simulate_floating_grid(self, policy_net: PolicyNetGARCH):
         """
         Floating grid simulation with action recurrence (Mueller et al. approach).
@@ -1027,7 +1027,8 @@ class HedgingEnvGARCH:
             # Ask policy for next actions
             # Prepare previous actions for network input (Mueller's approach)
             if policy_net.use_action_recurrence:
-                prev_actions_t = actions_t.unsqueeze(1)
+                # CRITICAL: Use .detach() on prev_actions to prevent BPTT through time
+                prev_actions_t = actions_t.detach().unsqueeze(1)
                 # Detach hidden states - hidden_states is a list of (h, c) tuples
                 hidden_states = [(h.detach(), c.detach()) for h, c in hidden_states]
                 # Pass as positional arguments: obs, prev_actions, hidden_states
@@ -1039,8 +1040,6 @@ class HedgingEnvGARCH:
                 outputs, hidden_states = policy_net(obs_new, None, hidden_states)
             
             actions_t = torch.stack([out[:, 0] for out in outputs], dim=-1)
-            # CRITICAL: Detach to prevent gradient accumulation across timesteps
-            actions_t = actions_t.detach()
             all_actions.append(actions_t)
         
         # Stack outputs and store ledger
