@@ -338,7 +338,11 @@ def train_episode(
         TCP=transaction_costs.get('stock', 0.0001),
         seed=episode
     )
-     
+    if hasattr(hedged_derivative, 'precomp_manager'):
+         precomp_check = hedged_derivative.precomp_manager
+    else:
+         precomp_check = None
+
     env = HedgingEnvGARCH(
         sim=sim,
         derivative=hedged_derivative,
@@ -349,7 +353,7 @@ def train_episode(
         device=str(device),
         transaction_costs=transaction_costs,
         grid_config=config if is_floating_grid else None,
-        precomputation_manager=hedged_derivative.precomp_manager  # ← ADD THIS
+        precomputation_manager=precomp_check
     )
 
     env.reset()
