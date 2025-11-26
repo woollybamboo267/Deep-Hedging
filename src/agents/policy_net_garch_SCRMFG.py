@@ -1157,14 +1157,21 @@ def compute_loss_with_soft_constraint(
     soft_violations = trajectories.get("soft_constraint_violations", torch.zeros_like(terminal_errors))
     constraint_penalty = soft_violations.mean()
     
-    # Compute sparsity penalty (for floating grid mode)
+    # Compute sparsity penalty (for floating grid mode) - SCALED VERSION
     sparsity_penalty = torch.tensor(0.0, device=terminal_errors.device)
     if lambda_sparsity > 0 and "all_actions" in trajectories:
         all_actions = trajectories["all_actions"]  # [M, N+1, n_instruments]
         option_actions = all_actions[:, :, 1:]  # exclude stock (index 0)
-        sparsity_penalty = option_actions.abs().mean()
+        
+        # Raw sparsity: mean absolute number of contracts
+        raw_sparsity = option_actions.abs().mean()
+        
+        # Scale to risk magnitude (makes lambda interpretable)
+        # lambda=0.01 now means "1% penalty per contract relative to risk"
+        # Use detach() so sparsity gradient doesn't affect risk_loss
+        sparsity_penalty = raw_sparsity * risk_loss.detach()
     
-    # Total loss
+    # Total loss with properly scaled sparsity
     total_loss = risk_loss + lambda_constraint * constraint_penalty + lambda_sparsity * sparsity_penalty
     
     return total_loss, risk_loss, constraint_penalty, sparsity_penalty
