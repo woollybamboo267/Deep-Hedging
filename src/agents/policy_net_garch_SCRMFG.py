@@ -508,6 +508,7 @@ class HedgingEnvGARCH:
         self.device = torch.device(device)
         self.derivative = derivative
         self.n_hedging_instruments = n_hedging_instruments
+        self.precomputation_manager = precomputation_manager
 
         # Detect floating-grid mode
         self.is_floating_grid = bool(grid_config and grid_config.get("instruments", {}).get("floating_grid", {}).get("enabled", False))
@@ -854,7 +855,7 @@ class HedgingEnvGARCH:
                     # Create derivative template
                     from src.option_greek.vanilla import VanillaOption
                     deriv_template = VanillaOption(
-                        precomputation_manager=precomp_manager,
+                        precomputation_manager=self.precomputation_manager,
                         garch_params=self.garch_params,
                         option_type=self.grid_manager.option_type
                     )
@@ -1010,7 +1011,7 @@ class HedgingEnvGARCH:
                 # Create derivative template
                 from src.option_greek.vanilla import VanillaOption
                 deriv_template = VanillaOption(
-                    precomputation_manager=precomp_manager,
+                    precomputation_manager=self.precomputation_manager,
                     garch_params=self.garch_params,
                     option_type=self.grid_manager.option_type
                 )
