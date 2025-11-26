@@ -62,7 +62,7 @@ class DerivativeFactory:
             vanilla_option.N = maturity_days
             vanilla_option.K = hedged_cfg['K']
             
-            return vanilla_option
+            return vanilla_option, precomputation_manager
         
         # === BARRIER OPTION ===
         elif deriv_type == 'barrier':
@@ -108,7 +108,7 @@ class DerivativeFactory:
             
             logger.info("Wrapped barrier option with vanilla fallback for breach handling")
             
-            return wrapped_barrier
+            return wrapped_barrier, precomputation_manager
         
         # === AMERICAN OPTION ===
         elif deriv_type == 'american':
@@ -130,7 +130,7 @@ class DerivativeFactory:
             
             logger.info(f"Created American option with maturity {american_option.N} days")
             
-            return american_option
+            return american_option, precomputation_manager
         
         # === ASIAN OPTION ===
         elif deriv_type == 'asian':
