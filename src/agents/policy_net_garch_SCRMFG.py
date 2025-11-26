@@ -870,6 +870,8 @@ class HedgingEnvGARCH:
                         
                         # Add position with path-specific parameters
                         # NEW (FAST):
+                        nonzero_mask = trade_qty.abs() > 1e-6  # <-- DEFINED HERE
+
                         if nonzero_mask.sum() > 0:
                             ledger.add_positions_batch(
                                 path_indices=torch.where(nonzero_mask)[0],
@@ -1044,6 +1046,8 @@ class HedgingEnvGARCH:
                 
                 for path_idx in nonzero_indices.tolist():
                     # NEW (FAST):
+                    nonzero_mask = trade_qty.abs() > 1e-6  # <-- DEFINED HERE
+
                     if nonzero_mask.sum() > 0:
                         ledger.add_positions_batch(
                             path_indices=torch.where(nonzero_mask)[0],
