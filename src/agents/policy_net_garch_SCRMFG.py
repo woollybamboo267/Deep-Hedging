@@ -838,14 +838,19 @@ class HedgingEnvGARCH:
         obs_t[:, 0, 4] = V0  # derivative value
         obs_list.append(obs_t)
     
-        # NEW: Initialize previous actions as zeros for t=0
-        prev_actions_t = torch.zeros((self.M, 1, self.n_hedging_instruments), dtype=torch.float32, device=self.device)
+        # Initialize previous actions as zeros for t=0
+        prev_actions_t = torch.zeros(
+            (self.M, 1, self.n_hedging_instruments), 
+            dtype=torch.float32, 
+            device=self.device
+        )
     
         # Get initial actions WITH action recurrence
         if policy_net.use_action_recurrence:
             outputs, hidden_state = policy_net(obs_t, prev_actions_t, hidden_state=None)
         else:
             outputs, hidden_state = policy_net(obs_t, hidden_state=None)
+        
         actions_t = torch.stack([out[:, 0] for out in outputs], dim=-1)  # [M, n_instruments]
         all_actions.append(actions_t)
     
@@ -862,7 +867,11 @@ class HedgingEnvGARCH:
             for bucket_idx in range(1, self.n_hedging_instruments):
                 trade_qty = torch.round(actions_prev[:, bucket_idx])  # integerize
                 # suppress small trades
-                trade_qty = torch.where(trade_qty.abs() < self.min_trade_size, torch.zeros_like(trade_qty), trade_qty)
+                trade_qty = torch.where(
+                    trade_qty.abs() < self.min_trade_size, 
+                    torch.zeros_like(trade_qty), 
+                    trade_qty
+                )
                 
                 if trade_qty.abs().sum() > 1e-6:
                     # Get bucket parameters (moneyness and maturity)
@@ -929,24 +938,26 @@ class HedgingEnvGARCH:
             obs_new[:, 0, 4] = V_t
             obs_list.append(obs_new)
     
-            # Ask policy for next actions (unless at the last time step)
-# Ask policy for next actions (unless at the last time step)
-            if t < self.N - 1:
-                # NEW: Prepare previous actions for network input (Mueller's approach)
-                if policy_net.use_action_recurrence:
-                    prev_actions_t = actions_t.unsqueeze(1).detach()
-                    hidden_state = tuple(h.detach() for h in hidden_state)  # YOUR FIX
-                    outputs, hidden_state = policy_net(obs_new, prev_actions_t, hidden_state)
-                else:
-                    hidden_state = tuple(h.detach() for h in hidden_state)
-                    outputs, hidden_state = policy_net(obs_new, hidden_state=hidden_state)
-                actions_t = torch.stack([out[:, 0] for out in outputs], dim=-1)
-                all_actions.append(actions_t)  # ← This line
+            # Ask policy for next actions
+            # Prepare previous actions for network input (Mueller's approach)
+            if policy_net.use_action_recurrence:
+                prev_actions_t = actions_t.unsqueeze(1).detach()
+                # Detach hidden state to prevent gradients flowing through time
+                hidden_state = tuple(h.detach() for h in hidden_state)
+                outputs, hidden_state = policy_net(obs_new, prev_actions_t, hidden_state)
+            else:
+                # Still detach hidden state even without action recurrence
+                hidden_state = tuple(h.detach() for h in hidden_state)
+                outputs, hidden_state = policy_net(obs_new, hidden_state=hidden_state)
+            
+            actions_t = torch.stack([out[:, 0] for out in outputs], dim=-1)
+            all_actions.append(actions_t)
+        
         # Stack outputs and store ledger
-        S_trajectory = torch.stack(S_trajectory, dim=1)
-        V_trajectory = torch.stack(V_trajectory, dim=1)
+        S_trajectory = torch.stack(S_trajectory, dim=1)  # [M, N+1]
+        V_trajectory = torch.stack(V_trajectory, dim=1)  # [M, N+1]
         all_actions = torch.stack(all_actions, dim=1)  # [M, N+1, n_instruments]
-        obs_sequence = torch.cat(obs_list, dim=1)
+        obs_sequence = torch.cat(obs_list, dim=1)  # [M, N+1, obs_dim]
     
         self.position_ledger = ledger
         return S_trajectory, V_trajectory, None, obs_sequence, all_actions
