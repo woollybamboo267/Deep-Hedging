@@ -379,19 +379,19 @@ def train_episode(
     )
     
     total_loss.backward()
-    
-    torch.nn.utils.clip_grad_norm_(
-        policy_net.parameters(),
-        max_norm=config["training"]["gradient_clip_max_norm"]
-    )
-    # After backward(), before optimizer.step():
     total_grad_norm = 0.0
     for p in policy_net.parameters():
         if p.grad is not None:
             total_grad_norm += p.grad.norm().item() ** 2
     total_grad_norm = total_grad_norm ** 0.5
     print(f"Gradient norm: {total_grad_norm:.6f}")
-     
+         
+    torch.nn.utils.clip_grad_norm_(
+        policy_net.parameters(),
+        max_norm=config["training"]["gradient_clip_max_norm"]
+    )
+    # After backward(), before optimizer.step():
+
      # If this is >1000, you have exploding gradients
      # If this is <0.0001, you have vanishing gradients
     optimizer.step()
