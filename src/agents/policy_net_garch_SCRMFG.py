@@ -1027,12 +1027,13 @@ class HedgingEnvGARCH:
             if policy_net.use_action_recurrence:
                 prev_actions_t = actions_t.unsqueeze(1).detach()
                 # Detach hidden state to prevent gradients flowing through time
-                hidden_states = tuple(h.detach() for h in hidden_states)
+                hidden_states = [(h.detach(), c.detach()) for h, c in hidden_states]
+
                 # Pass as positional arguments: obs, prev_actions, hidden_states
                 outputs, hidden_states = policy_net(obs_new, prev_actions_t, hidden_states)
             else:
                 # Still detach hidden state even without action recurrence
-                hidden_states = tuple(h.detach() for h in hidden_states)
+                hidden_states = [(h.detach(), c.detach()) for h, c in hidden_states]
                 # Pass as positional arguments: obs, prev_actions, hidden_states
                 outputs, hidden_states = policy_net(obs_new, None, hidden_states)
             
