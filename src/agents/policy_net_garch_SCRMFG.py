@@ -41,51 +41,73 @@ class PolicyNetGARCH(nn.Module):
         n_hedging_instruments: int = 2,
         num_lstm_layers: int = 2,
         num_fc_layers: int = 2,
+        use_action_recurrence: bool = False,  # NEW parameter
     ):
         super().__init__()
         self.n_hedging_instruments = n_hedging_instruments
         self.hidden_size = hidden_size
-
+        self.use_action_recurrence = use_action_recurrence
+        
+        # NEW: Input size includes previous actions if enabled
+        lstm_input_size = obs_dim + n_hedging_instruments if use_action_recurrence else obs_dim
+    
         # LSTM
         self.lstm = nn.LSTM(
-            input_size=obs_dim, hidden_size=hidden_size, num_layers=num_lstm_layers, batch_first=True
+            input_size=lstm_input_size, 
+            hidden_size=hidden_size, 
+            num_layers=num_lstm_layers, 
+            batch_first=True
         )
-
+    
         # A small stack of fully connected layers applied to the LSTM outputs
         self.fc_layers = nn.ModuleList()
         in_dim = hidden_size
         for _ in range(num_fc_layers):
             self.fc_layers.append(nn.Linear(in_dim, hidden_size))
             in_dim = hidden_size
-
+    
         # One head per hedging instrument
         self.instrument_heads = nn.ModuleList([nn.Linear(hidden_size, 1) for _ in range(n_hedging_instruments)])
-
+    
         # Initialize parameters
         for name, param in self.named_parameters():
             if "weight" in name and param.dim() >= 2:
                 nn.init.xavier_uniform_(param)
             elif "bias" in name:
                 nn.init.zeros_(param)
-
-    def forward(self, obs_sequence: torch.Tensor) -> List[torch.Tensor]:
+    def forward(
+        self, 
+        obs_sequence: torch.Tensor,
+        prev_actions: Optional[torch.Tensor] = None,
+        hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    ) -> Tuple[List[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """
         Args:
             obs_sequence: [batch, seq_len, obs_dim]
+            prev_actions: [batch, seq_len, n_instruments] - previous actions (optional)
+            hidden_state: LSTM hidden state tuple (optional)
         Returns:
-            List of length n_hedging_instruments, each tensor is [batch, seq_len]
-            (i.e., the head outputs per time-step). This matches the original
-            code which returned per-head sequences.
+            outputs: List of length n_hedging_instruments, each tensor is [batch, seq_len]
+            hidden_state: Updated LSTM hidden state (or None if not using recurrence)
         """
-        lstm_out, _ = self.lstm(obs_sequence)  # [batch, seq_len, hidden_size]
+        # Concatenate observations with previous actions if using action recurrence
+        if self.use_action_recurrence and prev_actions is not None:
+            lstm_input = torch.cat([obs_sequence, prev_actions], dim=-1)
+        else:
+            lstm_input = obs_sequence
+        
+        if hidden_state is not None:
+            lstm_out, hidden_state = self.lstm(lstm_input, hidden_state)
+        else:
+            lstm_out, hidden_state = self.lstm(lstm_input)
+        
         x = lstm_out
         for fc in self.fc_layers:
-            # apply fc to last dim
             x = F.relu(fc(x))
-        # produce per-head outputs, squeeze last dim
+        
+        # Produce per-head outputs, squeeze last dim
         outputs = [head(x).squeeze(-1) for head in self.instrument_heads]  # list of [batch, seq_len]
-        return outputs
-
+        return outputs, hidden_state
 
 # ----------------------------------------
 # Floating grid manager
@@ -499,7 +521,6 @@ class HedgingEnvGARCH:
         transaction_costs: Optional[Dict[str, float]] = None,
         grid_config: Optional[Dict[str, Any]] = None,
         precomputation_manager = None,
-        lambda_constraint: float = 0.0
     ):
         self.sim = sim
         self.M = sim.M
@@ -508,8 +529,7 @@ class HedgingEnvGARCH:
         self.device = torch.device(device)
         self.derivative = derivative
         self.n_hedging_instruments = n_hedging_instruments
-        self.precomputation_manager = precomputation_manager
-
+    
         # Detect floating-grid mode
         self.is_floating_grid = bool(grid_config and grid_config.get("instruments", {}).get("floating_grid", {}).get("enabled", False))
     
@@ -529,14 +549,15 @@ class HedgingEnvGARCH:
                 config=grid_config,
                 derivative_class=VanillaOption,
                 sim_params={"r": sim.r / 252.0, "T": sim.T, "N": sim.N, "M": sim.M},
-                precomputation_manager=precomp_manager,  # ← Now available!
+                precomputation_manager=precomp_manager,
                 garch_params=garch_params
             )
-            self.position_ledger: Optional[VectorizedPositionLedger] = None  # created per episode in reset()
+            self.position_ledger: Optional[PositionLedger] = None
             self.hedging_derivatives_static = None
             # For logging/transaction typing
             self.instrument_types_list = ["stock"] + ["vanilla_option"] * self.grid_manager.grid_size
-            self.obs_dim = 5
+            self.obs_dim = 5  # Keep base obs_dim at 5 (time, S, S_prev, vol, V)
+            # Note: action recurrence handled in network input, not obs_dim
             self.sparsity_penalty = grid_config["instruments"]["floating_grid"].get("sparsity_penalty", 0.0)
             self.min_trade_size = grid_config["instruments"]["floating_grid"].get("min_trade_size", 0.1)
             logger.info(f"Floating grid mode: {self.grid_manager.grid_size} option buckets, obs_dim={self.obs_dim}")
@@ -550,7 +571,7 @@ class HedgingEnvGARCH:
             self.sparsity_penalty = 0.0
             self.min_trade_size = 0.0
             logger.info(f"Static grid mode: {n_hedging_instruments} instruments, obs_dim={self.obs_dim}")
-
+    
         # GARCH parameters (defaults provided if not present)
         self.garch_params = garch_params or {
             "omega": 1.593749e-07,
@@ -565,18 +586,16 @@ class HedgingEnvGARCH:
         self.beta = float(self.garch_params["beta"])
         self.gamma = float(self.garch_params["gamma"])
         self.lambda_ = float(self.garch_params["lambda"])
-        self.lambda_constraint = lambda_constraint
-
-
+    
         # Market / contract parameters
         self.S0 = self.sim.S0
         self.K = torch.tensor(self.sim.K, dtype=torch.float32, device=self.device)
         self.T = self.sim.T
-        self.r = self.sim.r / 252.0  # keep consistent with original code (per-step r)
+        self.r = self.sim.r / 252.0
         self.option_type = getattr(self.sim, "option_type", "call")
         self.side = self.sim.side
         self.contract_size = self.sim.contract_size
-
+    
         # Transaction costs per instrument type
         default_tcp = getattr(self.sim, "TCP", 0.0001)
         self.transaction_costs = transaction_costs or {
@@ -585,17 +604,17 @@ class HedgingEnvGARCH:
             "barrier_option": default_tcp * 20,
             "american_option": default_tcp * 15,
         }
-
+    
         # Static-mode instrument metadata
         if not self.is_floating_grid and self.hedging_derivatives_static:
             self.instrument_maturities = []
             self.instrument_strikes = []
             self.instrument_types = []
             # lazy imports for type-checking
-            from src.option_greek.vanilla import VanillaOption  # type: ignore
-            from src.option_greek.barrier import BarrierOption  # type: ignore
-            from src.option_greek.american import AmericanOption  # type: ignore
-
+            from src.option_greek.vanilla import VanillaOption
+            from src.option_greek.barrier import BarrierOption
+            from src.option_greek.american import AmericanOption
+    
             for deriv in self.hedging_derivatives_static:
                 if deriv is None:
                     self.instrument_maturities.append(0)
@@ -612,7 +631,7 @@ class HedgingEnvGARCH:
                         self.instrument_types.append("american")
                     else:
                         self.instrument_types.append("vanilla")
-
+    
         # Initial volatility / variance state
         self.sigma0 = float(self.garch_params["sigma0"])
         self.sigma_t = torch.full((self.M,), self.sigma0, dtype=torch.float32, device=self.device)
@@ -782,10 +801,10 @@ class HedgingEnvGARCH:
 
     def _simulate_floating_grid(self, policy_net: PolicyNetGARCH):
         """
-        Floating grid simulation. The policy outputs:
+        Floating grid simulation with action recurrence (Mueller et al. approach).
+        The policy outputs:
           - actions[:, t, 0] = target stock position
-          - actions[:, t, i] (i>=1) = trades (or target) for option bucket i-1 (rounded to integer)
-        The ledger records opened option positions (with expiries); P&L computed later using ledger.
+          - actions[:, t, i] (i>=1) = trades for option bucket i-1 (rounded to integer)
         Returns:
             S_trajectory: [M, N+1]
             V_trajectory: [M, N+1]
@@ -799,7 +818,7 @@ class HedgingEnvGARCH:
         all_actions = []
     
         # Initialize ledger and state
-        ledger = VectorizedPositionLedger(self.M, self.device)
+        ledger = PositionLedger(self.M, self.device)
         S_t = torch.full((self.M,), self.S0, dtype=torch.float32, device=self.device)
         h_t = self.h_t.clone()
         stock_position = torch.zeros(self.M, dtype=torch.float32, device=self.device)
@@ -818,16 +837,15 @@ class HedgingEnvGARCH:
         obs_t[:, 0, 4] = V0  # derivative value
         obs_list.append(obs_t)
     
-        # Get initial actions
-        lstm_out, hidden_state = policy_net.lstm(obs_t)
-        x = lstm_out
-        for fc in policy_net.fc_layers:
-            x = F.relu(fc(x))
-        outputs = []
-        for head in policy_net.instrument_heads:
-            output = head(x).squeeze(-1)[:, 0]
-            outputs.append(output)
-        actions_t = torch.stack(outputs, dim=-1)  # [M, n_instruments]
+        # NEW: Initialize previous actions as zeros for t=0
+        prev_actions_t = torch.zeros((self.M, 1, self.n_hedging_instruments), dtype=torch.float32, device=self.device)
+    
+        # Get initial actions WITH action recurrence
+        if policy_net.use_action_recurrence:
+            outputs, hidden_state = policy_net(obs_t, prev_actions_t, hidden_state=None)
+        else:
+            outputs, hidden_state = policy_net(obs_t, hidden_state=None)
+        actions_t = torch.stack([out[:, 0] for out in outputs], dim=-1)  # [M, n_instruments]
         all_actions.append(actions_t)
     
         # Main loop
@@ -844,44 +862,12 @@ class HedgingEnvGARCH:
                 trade_qty = torch.round(actions_prev[:, bucket_idx])  # integerize
                 # suppress small trades
                 trade_qty = torch.where(trade_qty.abs() < self.min_trade_size, torch.zeros_like(trade_qty), trade_qty)
-                
                 if trade_qty.abs().sum() > 1e-6:
-                    # Get bucket parameters (moneyness and maturity)
-                    moneyness, maturity_days = self.grid_manager.get_bucket_params(bucket_idx - 1)
-                    
-                    # VECTORIZED: Compute strikes for ALL paths at once
-                    K_paths = moneyness * S_t  # [M]
-                    
-                    # Create derivative template
-                    from src.option_greek.vanilla import VanillaOption
-                    deriv_template = VanillaOption(
-                        precomputation_manager=self.precomputation_manager,
-                        garch_params=self.garch_params,
-                        option_type=self.grid_manager.option_type
+                    S_mean = float(S_t.mean().item())
+                    deriv = self.grid_manager.create_derivative(
+                        S_current=S_mean, bucket_idx=bucket_idx - 1, current_step=t, total_steps=self.N
                     )
-                    deriv_template.N = maturity_days
-                    deriv_template.created_at_step = t
-                    
-                    # Add positions to ledger (BATCHED - NO LOOP)
-                    nonzero_mask = trade_qty.abs() > 1e-6
-                    
-                    if nonzero_mask.sum() > 0:
-                        ledger.add_positions_batch(
-                            path_indices=torch.where(nonzero_mask)[0],
-                            quantities=trade_qty[nonzero_mask],
-                            strikes=K_paths[nonzero_mask],
-                            expiry_steps=torch.full(
-                                (nonzero_mask.sum(),), 
-                                t + maturity_days, 
-                                dtype=torch.long, 
-                                device=self.device
-                            ),
-                            created_at_step=t,
-                            original_maturity=maturity_days,
-                            bucket_idx=bucket_idx,
-                            opening_spots=S_t[nonzero_mask],
-                            derivative_template=deriv_template
-                        )
+                    ledger.add_position(deriv, trade_qty, bucket_idx, t, S_t)
     
             # Evolve GARCH and stock
             sqrt_h = torch.sqrt(h_t)
@@ -912,15 +898,13 @@ class HedgingEnvGARCH:
     
             # Ask policy for next actions (unless at the last time step)
             if t < self.N - 1:
-                lstm_out, hidden_state = policy_net.lstm(obs_new, hidden_state)
-                x = lstm_out
-                for fc in policy_net.fc_layers:
-                    x = F.relu(fc(x))
-                outputs = []
-                for head in policy_net.instrument_heads:
-                    output = head(x).squeeze(-1)[:, 0]
-                    outputs.append(output)
-                actions_t = torch.stack(outputs, dim=-1)
+                # NEW: Prepare previous actions for network input (Mueller's approach)
+                if policy_net.use_action_recurrence:
+                    prev_actions_t = actions_t.unsqueeze(1).detach()  # [M, 1, n_instruments]
+                    outputs, hidden_state = policy_net(obs_new, prev_actions_t, hidden_state)
+                else:
+                    outputs, hidden_state = policy_net(obs_new, hidden_state=hidden_state)
+                actions_t = torch.stack([out[:, 0] for out in outputs], dim=-1)
                 all_actions.append(actions_t)
     
         # Stack outputs and store ledger
