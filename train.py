@@ -588,108 +588,182 @@ def run_inference(
         import traceback
         traceback.print_exc()
 
-def train(
+def train_episode(
+    episode: int,
     config: Dict[str, Any],
-    HedgingSim,
+    policy_net: PolicyNetGARCH,
+    optimizer: torch.optim.Optimizer,
     hedged_derivative,
     hedging_derivatives,
-    visualize: bool = True,
-    initial_model: Optional[PolicyNetGARCH] = None,
-    config_name: str = "config",
-    precomputation_manager: Any=None
-) -> PolicyNetGARCH:
-    """Main training loop."""
+    HedgingSim,
+    device: torch.device,
+    precomputation_manager
+) -> Dict[str, Any]:
+    """
+    Train for a single episode with Mueller et al. (2024) architecture.
     
-    seed = config["training"]["seed"]
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    Args:
+        episode: Current episode number
+        config: Configuration dictionary
+        policy_net: Mueller policy network with residual LSTM blocks
+        optimizer: Optimizer instance
+        hedged_derivative: Derivative being hedged
+        hedging_derivatives: List of hedging instruments (None for floating grid)
+        HedgingSim: Simulation class
+        device: torch.device
+        precomputation_manager: Manager for precomputed option prices
     
-    device = torch.device(config["training"]["device"])
-    logging.info(f"Using device: {device}")
+    Returns:
+        Dictionary containing episode metrics and trajectories
+    """
     
-    # NEW: Log risk measure and soft constraint configuration
+    hedged_cfg = config["hedged_option"]
+    mode = config["instruments"].get("mode", "static")
+    is_floating_grid = (mode == "floating_grid")
+    
+    # Get transaction costs from config
+    transaction_costs = get_transaction_costs(config)
+    
+    # Get risk measure and soft constraint configuration
     risk_config = config.get("risk_measure", {"type": "mse"})
     constraint_config = config.get("soft_constraint", {"enabled": False, "lambda": 0.0})
     
-    logging.info("=" * 70)
-    logging.info("RISK MEASURE & SOFT CONSTRAINT CONFIGURATION")
-    logging.info(f"Risk Measure: {risk_config.get('type', 'mse').upper()}")
-    if risk_config.get('type') == 'cvar':
-        logging.info(f"CVaR Alpha: {risk_config.get('alpha', 0.95)}")
-    logging.info(f"Soft Constraint Enabled: {constraint_config.get('enabled', False)}")
-    if constraint_config.get('enabled', False):
-        logging.info(f"Constraint Lambda: {constraint_config.get('lambda', 0.0)}")
-    logging.info("=" * 70)
+    risk_measure = risk_config.get("type", "mse")
+    alpha = risk_config.get("alpha", None)  # Only needed for CVaR/VaR
+    lambda_constraint = constraint_config.get("lambda", 0.0) if constraint_config.get("enabled", False) else 0.0
     
-    policy_net = create_policy_network(config, device)
+    # Get sparsity penalty for floating grid mode
+    lambda_sparsity = 0.0
+    if is_floating_grid:
+        lambda_sparsity = config["instruments"]["floating_grid"].get("sparsity_penalty", 0.0)
     
-    if initial_model is not None:
-        policy_net.load_state_dict(initial_model.state_dict())
-        logging.info("Initialized policy network from pretrained model")
+    # Create simulation instance
+    sim = HedgingSim(
+        S0=config["simulation"]["S0"],
+        K=hedged_cfg["K"],
+        m=0.1,
+        r=config["simulation"]["r"],
+        sigma=config["garch"]["sigma0"],
+        T=config["simulation"]["T"],
+        option_type=hedged_cfg["option_type"],
+        position=hedged_cfg["side"],
+        M=config["simulation"]["M"],
+        N=config["simulation"]["N"],
+        TCP=transaction_costs.get('stock', 0.0001),
+        seed=episode
+    )
+
+    # Create hedging environment
+    env = HedgingEnvGARCH(
+        sim=sim,
+        derivative=hedged_derivative,
+        hedging_derivatives=None if is_floating_grid else hedging_derivatives,
+        garch_params=config["garch"],
+        n_hedging_instruments=config["instruments"]["n_hedging_instruments"],
+        dt_min=config["environment"]["dt_min"],
+        device=str(device),
+        transaction_costs=transaction_costs,
+        grid_config=config if is_floating_grid else None,
+        precomputation_manager=precomputation_manager
+    )
+
+    # Reset environment (resets GARCH state, random shocks, ledger)
+    env.reset()
     
-    optimizer = create_optimizer(policy_net, config)
+    # Simulate trajectory using policy network
+    # This handles action recurrence internally via the Mueller architecture
+    S_traj, V_traj, O_traj, obs_sequence, RL_actions = \
+        env.simulate_trajectory_and_get_observations(policy_net)
     
-    n_episodes = config["training"]["episodes"]
-    checkpoint_freq = config["training"]["checkpoint_frequency"]
-    plot_freq = config["training"]["plot_frequency"]
+    # Compute full P&L trajectory with transaction costs
+    terminal_errors, trajectories = env.simulate_full_trajectory(RL_actions, O_traj)
     
-    logging.info(
-        f"Starting training: {n_episodes} episodes, "
-        f"{config['instruments']['n_hedging_instruments']} instruments, "
-        f"device={device}"
+    # Backpropagation
+    optimizer.zero_grad()
+    
+    # Compute loss with configurable risk measure and penalties
+    total_loss, risk_loss, constraint_penalty, sparsity_penalty = compute_loss_with_soft_constraint(
+        terminal_errors, 
+        trajectories,
+        risk_measure=risk_measure,
+        alpha=alpha,
+        lambda_constraint=lambda_constraint,
+        lambda_sparsity=lambda_sparsity
     )
     
-    for episode in range(1, n_episodes + 1):
-        try:
-            metrics = train_episode(
-                episode=episode,
-                config=config,
-                policy_net=policy_net,
-                optimizer=optimizer,
-                hedged_derivative=hedged_derivative,
-                hedging_derivatives=hedging_derivatives,
-                HedgingSim=HedgingSim,
-                device=device,
-                precomputation_manager=precomputation_manager
-            )
-            
-            if episode % checkpoint_freq == 0:
-                save_checkpoint(policy_net, config, episode, config_name)
-            
-            if visualize and episode % plot_freq == 0:
-                try:
-                    from src.visualization.plot_results import plot_episode_results
-                    plot_episode_results(episode, metrics, config)
-                except Exception as e:
-                    logging.warning(f"Plotting failed: {e}")
-        
-        except Exception as e:
-            logging.exception(f"Error during episode {episode}: {e}")
-            raise
+    total_loss.backward()
     
-    # Save final model with config name in models/{instrument_name}/checkpoint
-    n_inst = config["instruments"]["n_hedging_instruments"]
+    # Gradient diagnostics (helpful for debugging)
+    total_grad_norm = 0.0
+    for p in policy_net.parameters():
+        if p.grad is not None:
+            total_grad_norm += p.grad.norm().item() ** 2
+    total_grad_norm = total_grad_norm ** 0.5
     
-    if n_inst == 1:
-        instrument_name = "stock_only"
-    elif n_inst == 2:
-        instrument_name = "2inst"
-    elif n_inst == 3:
-        instrument_name = "3inst"
-    elif n_inst == 4:
-        instrument_name = "4inst"
-    else:
-        instrument_name = f"{n_inst}inst"
+    # Gradient clipping to prevent exploding gradients
+    torch.nn.utils.clip_grad_norm_(
+        policy_net.parameters(),
+        max_norm=config["training"]["gradient_clip_max_norm"]
+    )
     
-    final_dir = os.path.join("models", instrument_name, "checkpoint")
-    final_filename = f"{config_name}.pth"
-    final_path = os.path.join(final_dir, final_filename)
+    optimizer.step()
     
-    os.makedirs(final_dir, exist_ok=True)
-    torch.save(policy_net.state_dict(), final_path)
-    logging.info(f"Training finished. Model saved to {final_path}")
+    # Check for NaN/Inf (critical for stability)
+    if torch.isnan(total_loss) or torch.isinf(total_loss):
+        logging.error(f"Loss became NaN/Inf at episode {episode}")
+        raise RuntimeError("Loss became NaN/Inf")
     
-    return policy_net
+    final_reward = -float(total_loss.item())
+    
+    # Construct detailed logging message
+    log_msg = (
+        f"Episode {episode} | "
+        f"Risk: {risk_measure.upper()} | "
+        f"Total Loss: {total_loss.item():.6f} | "
+        f"Risk Loss: {risk_loss.item():.6f} | "
+        f"Grad Norm: {total_grad_norm:.6f}"
+    )
+    
+    # Add constraint penalty info if enabled
+    if lambda_constraint > 0:
+        avg_violation = trajectories['soft_constraint_violations'].mean().item()
+        log_msg += (
+            f" | Constraint: {constraint_penalty.item():.6f} "
+            f"(λ={lambda_constraint}, Avg Viol: {avg_violation:.6f})"
+        )
+    
+    # Add sparsity penalty info if enabled
+    if lambda_sparsity > 0:
+        log_msg += f" | Sparsity: {sparsity_penalty.item():.6f} (λ={lambda_sparsity})"
+    
+    log_msg += f" | Reward: {final_reward:.6f}"
+    
+    # Add ledger statistics for floating grid mode
+    if is_floating_grid and "ledger_size_trajectory" in trajectories:
+        avg_ledger = np.mean(trajectories["ledger_size_trajectory"])
+        max_ledger = np.max(trajectories["ledger_size_trajectory"])
+        log_msg += f" | Ledger (Avg/Max): {avg_ledger:.1f}/{max_ledger:.0f}"
+    
+    logging.info(log_msg)
+    
+    # Return comprehensive metrics dictionary
+    return {
+        "episode": episode,
+        "loss": total_loss.item(),
+        "risk_loss": risk_loss.item(),
+        "constraint_penalty": constraint_penalty.item(),
+        "sparsity_penalty": sparsity_penalty.item(),
+        "reward": final_reward,
+        "trajectories": trajectories,
+        "RL_positions": RL_actions,
+        "S_traj": S_traj,
+        "V_traj": V_traj,
+        "O_traj": O_traj,
+        "env": env,
+        "risk_measure": risk_measure,
+        "lambda_constraint": lambda_constraint,
+        "grad_norm": total_grad_norm
+    }
 
 
 def main():
