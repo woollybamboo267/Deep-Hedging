@@ -385,12 +385,12 @@ def train_episode(
         max_norm=config["training"]["gradient_clip_max_norm"]
     )
     # After backward(), before optimizer.step():
-     total_grad_norm = 0.0
-     for p in policy_net.parameters():
-         if p.grad is not None:
-             total_grad_norm += p.grad.norm().item() ** 2
-     total_grad_norm = total_grad_norm ** 0.5
-     print(f"Gradient norm: {total_grad_norm:.6f}")
+    total_grad_norm = 0.0
+    for p in policy_net.parameters():
+        if p.grad is not None:
+            total_grad_norm += p.grad.norm().item() ** 2
+    total_grad_norm = total_grad_norm ** 0.5
+    print(f"Gradient norm: {total_grad_norm:.6f}")
      
      # If this is >1000, you have exploding gradients
      # If this is <0.0001, you have vanishing gradients
