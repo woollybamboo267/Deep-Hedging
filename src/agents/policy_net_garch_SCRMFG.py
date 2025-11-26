@@ -930,16 +930,18 @@ class HedgingEnvGARCH:
             obs_list.append(obs_new)
     
             # Ask policy for next actions (unless at the last time step)
-            # In _simulate_floating_grid, around line 917
+# Ask policy for next actions (unless at the last time step)
             if t < self.N - 1:
+                # NEW: Prepare previous actions for network input (Mueller's approach)
                 if policy_net.use_action_recurrence:
                     prev_actions_t = actions_t.unsqueeze(1).detach()
-                    # DETACH hidden state for stability with multiple FC layers
-                    hidden_state = tuple(h.detach() for h in hidden_state)  # ← ADD THIS
+                    hidden_state = tuple(h.detach() for h in hidden_state)  # YOUR FIX
                     outputs, hidden_state = policy_net(obs_new, prev_actions_t, hidden_state)
                 else:
-                    hidden_state = tuple(h.detach() for h in hidden_state)  # ← ADD THIS TOO
+                    hidden_state = tuple(h.detach() for h in hidden_state)
                     outputs, hidden_state = policy_net(obs_new, hidden_state=hidden_state)
+                actions_t = torch.stack([out[:, 0] for out in outputs], dim=-1)
+                all_actions.append(actions_t)  # ← This line
         # Stack outputs and store ledger
         S_trajectory = torch.stack(S_trajectory, dim=1)
         V_trajectory = torch.stack(V_trajectory, dim=1)
