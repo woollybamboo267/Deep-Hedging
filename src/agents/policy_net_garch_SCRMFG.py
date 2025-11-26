@@ -11,7 +11,6 @@
 #   and should be syntactically valid Python.
 import logging
 from typing import Any, Dict, List, Optional, Tuple
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -21,94 +20,178 @@ logger = logging.getLogger(__name__)
 
 
 # ----------------------------------------
-# Policy network (LSTM + per-instrument heads)
+# RMSNorm and symexp activation
+# ----------------------------------------
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization (Zhang & Sennrich 2019)"""
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+    
+    def forward(self, x):
+        rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
+        x_normed = x / rms
+        return self.weight * x_normed
+
+
+def symexp(x: torch.Tensor) -> torch.Tensor:
+    """Symmetric exponential: symexp(x) = sign(x) * (exp(|x|) - 1)"""
+    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
+
+
+class ResidualLSTMBlock(nn.Module):
+    """Residual LSTM block: x → RMSNorm → LSTMCell → (+residual) → out"""
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.rms_norm = RMSNorm(hidden_size)
+        self.lstm_cell = nn.LSTMCell(hidden_size, hidden_size)
+    
+    def forward(self, x: torch.Tensor, hidden_state: Tuple[torch.Tensor, torch.Tensor]):
+        x_norm = self.rms_norm(x)
+        h_new, c_new = self.lstm_cell(x_norm, hidden_state)
+        out = x + h_new  # Residual connection
+        return out, (h_new, c_new)
+
+
+# ----------------------------------------
+# Mueller et al. (2024) Policy Network
 # ----------------------------------------
 class PolicyNetGARCH(nn.Module):
     """
-    Policy network that consumes a sequence of observations (batch_first=True)
-    and outputs a scalar per hedging instrument at each timestep.
-
+    Mueller et al. (2024) exact architecture for deep hedging.
+    
     Architecture:
-      - LSTM (obs_dim -> hidden_size), num_layers configurable
-      - N fully-connected layers (applied to LSTM outputs)
-      - One linear head per hedging instrument (outputs scalar per time step)
+      Input → Linear → [4x Residual LSTM Blocks] → Linear → symexp → clamp
+    
+    Key specifications:
+    - LSTM hidden size: 32 (not 128 or 256!)
+    - 4 residually stacked LSTM blocks with RMSNorm
+    - Output activation: symexp (not tanh!)
+    - Final layer initialization: He init × 1e-3, zero bias
     """
 
     def __init__(
         self,
         obs_dim: int = 5,
-        hidden_size: int = 128,
+        hidden_size: int = 32,  # Mueller uses 32!
         n_hedging_instruments: int = 2,
-        num_lstm_layers: int = 2,
-        num_fc_layers: int = 2,
-        use_action_recurrence: bool = False,  # NEW parameter
+        num_lstm_blocks: int = 4,  # 4 residual blocks
+        use_action_recurrence: bool = True,
+        max_option_contracts: float = 10.0,
     ):
         super().__init__()
         self.n_hedging_instruments = n_hedging_instruments
         self.hidden_size = hidden_size
         self.use_action_recurrence = use_action_recurrence
+        self.max_option_contracts = max_option_contracts
         
-        # NEW: Input size includes previous actions if enabled
-        lstm_input_size = obs_dim + n_hedging_instruments if use_action_recurrence else obs_dim
+        # Input size includes previous actions if enabled
+        input_size = obs_dim + n_hedging_instruments if use_action_recurrence else obs_dim
+        
+        # Input projection
+        self.input_proj = nn.Linear(input_size, hidden_size)
+        
+        # 4 Residual LSTM blocks
+        self.lstm_blocks = nn.ModuleList([
+            ResidualLSTMBlock(hidden_size) for _ in range(num_lstm_blocks)
+        ])
+        
+        # Output heads: one per hedging instrument
+        self.instrument_heads = nn.ModuleList([
+            nn.Linear(hidden_size, 1) for _ in range(n_hedging_instruments)
+        ])
+        
+        # Initialize parameters (Mueller's way)
+        self._initialize_parameters()
     
-        # LSTM
-        self.lstm = nn.LSTM(
-            input_size=lstm_input_size, 
-            hidden_size=hidden_size, 
-            num_layers=num_lstm_layers, 
-            batch_first=True
-        )
+    def _initialize_parameters(self):
+        """Initialize following Mueller et al. specifications"""
+        # Input projection: Xavier
+        nn.init.xavier_uniform_(self.input_proj.weight)
+        nn.init.zeros_(self.input_proj.bias)
+        
+        # Output heads: He init scaled by 1e-3, zero bias (CRITICAL!)
+        for head in self.instrument_heads:
+            nn.init.kaiming_uniform_(head.weight, a=0, mode='fan_in', nonlinearity='linear')
+            head.weight.data *= 1e-3  # Scale down by 1000x
+            nn.init.zeros_(head.bias)
     
-        # A small stack of fully connected layers applied to the LSTM outputs
-        self.fc_layers = nn.ModuleList()
-        in_dim = hidden_size
-        for _ in range(num_fc_layers):
-            self.fc_layers.append(nn.Linear(in_dim, hidden_size))
-            in_dim = hidden_size
-    
-        # One head per hedging instrument
-        self.instrument_heads = nn.ModuleList([nn.Linear(hidden_size, 1) for _ in range(n_hedging_instruments)])
-    
-        # Initialize parameters
-        for name, param in self.named_parameters():
-            if "weight" in name and param.dim() >= 2:
-                nn.init.xavier_uniform_(param)
-            elif "bias" in name:
-                nn.init.zeros_(param)
     def forward(
         self, 
         obs_sequence: torch.Tensor,
         prev_actions: Optional[torch.Tensor] = None,
-        hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-    ) -> Tuple[List[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        hidden_states: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
+    ) -> Tuple[List[torch.Tensor], List[Tuple[torch.Tensor, torch.Tensor]]]:
         """
         Args:
             obs_sequence: [batch, seq_len, obs_dim]
-            prev_actions: [batch, seq_len, n_instruments] - previous actions (optional)
-            hidden_state: LSTM hidden state tuple (optional)
+            prev_actions: [batch, seq_len, n_instruments]
+            hidden_states: List of (h, c) for each LSTM block
+        
         Returns:
-            outputs: List of length n_hedging_instruments, each tensor is [batch, seq_len]
-            hidden_state: Updated LSTM hidden state (or None if not using recurrence)
+            outputs: List of [batch, seq_len] per instrument
+            new_hidden_states: List of (h, c) per block
         """
-        # Concatenate observations with previous actions if using action recurrence
+        batch_size, seq_len, _ = obs_sequence.shape
+        
+        # Concatenate observations with previous actions
         if self.use_action_recurrence and prev_actions is not None:
-            lstm_input = torch.cat([obs_sequence, prev_actions], dim=-1)
+            x = torch.cat([obs_sequence, prev_actions], dim=-1)
         else:
-            lstm_input = obs_sequence
+            x = obs_sequence
         
-        if hidden_state is not None:
-            lstm_out, hidden_state = self.lstm(lstm_input, hidden_state)
-        else:
-            lstm_out, hidden_state = self.lstm(lstm_input)
+        # Input projection
+        x = self.input_proj(x)
         
-        x = lstm_out
-        for fc in self.fc_layers:
-            x = F.relu(fc(x))
+        # Initialize hidden states if not provided
+        if hidden_states is None:
+            hidden_states = [
+                (
+                    torch.zeros(batch_size, self.hidden_size, device=x.device),
+                    torch.zeros(batch_size, self.hidden_size, device=x.device)
+                )
+                for _ in range(len(self.lstm_blocks))
+            ]
         
-        # Produce per-head outputs, squeeze last dim
-        outputs = [head(x).squeeze(-1) for head in self.instrument_heads]  # list of [batch, seq_len]
-        return outputs, hidden_state
-
+        # Process through residual LSTM blocks sequentially over time
+        outputs_per_timestep = []
+        
+        for t in range(seq_len):
+            x_t = x[:, t, :]  # [batch, hidden_size]
+            
+            # Pass through all 4 residual LSTM blocks
+            block_hiddens = []
+            for block_idx, lstm_block in enumerate(self.lstm_blocks):
+                x_t, new_h = lstm_block(x_t, hidden_states[block_idx])
+                block_hiddens.append(new_h)
+            
+            # Update hidden states for next timestep
+            hidden_states = block_hiddens
+            outputs_per_timestep.append(x_t)
+        
+        # Stack timesteps: [batch, seq_len, hidden_size]
+        x = torch.stack(outputs_per_timestep, dim=1)
+        
+        # Generate outputs for each instrument
+        outputs = []
+        for i, head in enumerate(self.instrument_heads):
+            out = head(x).squeeze(-1)  # [batch, seq_len]
+            
+            # Apply symexp activation
+            out = symexp(out)
+            
+            # Apply position limits
+            if i == 0:
+                # Stock: reasonable hedge ratios
+                out = torch.clamp(out, min=-5.0, max=5.0)
+            else:
+                # Options: hard limit on contracts
+                out = torch.clamp(out, min=-self.max_option_contracts, max=self.max_option_contracts)
+            
+            outputs.append(out)
+        
+        return outputs, hidden_states
 # ----------------------------------------
 # Floating grid manager
 # ----------------------------------------
