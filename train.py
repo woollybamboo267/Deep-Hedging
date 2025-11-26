@@ -300,7 +300,8 @@ def train_episode(
     hedged_derivative,
     hedging_derivatives,
     HedgingSim,
-    device: torch.device
+    device: torch.device,
+    precomputation_manager
 ) -> Dict[str, Any]:
     """Train for a single episode with configurable risk measure and soft constraint."""
     
@@ -350,7 +351,7 @@ def train_episode(
         device=str(device),
         transaction_costs=transaction_costs,
         grid_config=config if is_floating_grid else None,
-        precomputation_manager=None
+        precomputation_manager=precomputation_manager
     )
 
     env.reset()
@@ -654,7 +655,8 @@ def train(
     hedging_derivatives,
     visualize: bool = True,
     initial_model: Optional[PolicyNetGARCH] = None,
-    config_name: str = "config"
+    config_name: str = "config",
+    precomputation_manager
 ) -> PolicyNetGARCH:
     """Main training loop."""
     
@@ -707,7 +709,8 @@ def train(
                 hedged_derivative=hedged_derivative,
                 hedging_derivatives=hedging_derivatives,
                 HedgingSim=HedgingSim,
-                device=device
+                device=device,
+                precomputation_manager
             )
             
             if episode % checkpoint_freq == 0:
@@ -866,7 +869,7 @@ def main():
             precomputed_data[hedged_maturity_days] = precomputation_manager.get_precomputed_data(hedged_maturity_days)
             logging.info(f"Precomputation complete for N={hedged_maturity_days}")
     
-    hedged_derivative, hedging_derivatives = setup_derivatives_from_precomputed(
+    hedged_derivative, hedging_derivatives, passed_precomputation_manager = setup_derivatives_from_precomputed(
         config, precomputation_manager 
     )
     
@@ -901,7 +904,8 @@ def main():
         hedging_derivatives=hedging_derivatives,
         visualize=not args.no_visualize,
         initial_model=initial_model,
-        config_name=config_name
+        config_name=config_name,
+        precomputation_manager=precomputation_manager
     )
     
     logging.info("Training complete!")
