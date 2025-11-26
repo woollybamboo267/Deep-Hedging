@@ -73,7 +73,7 @@ training:
   episodes: 300
   gamma: 0.99999
   gradient_clip_max_norm: 100
-  learning_rate: 0.001
+  learning_rate: 0.01
   num_epochs: 400
   optimizer: AdamW
   plot_frequency: 100
