@@ -710,7 +710,7 @@ def train(
                 hedging_derivatives=hedging_derivatives,
                 HedgingSim=HedgingSim,
                 device=device,
-                precomputation_manager
+                precomputation_manager=precomputation_manager
             )
             
             if episode % checkpoint_freq == 0:
