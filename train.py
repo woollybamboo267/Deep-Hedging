@@ -656,7 +656,7 @@ def train(
     visualize: bool = True,
     initial_model: Optional[PolicyNetGARCH] = None,
     config_name: str = "config",
-    precomputation_manager: 
+    precomputation_manager: Any=None,
 ) -> PolicyNetGARCH: Any=None
     """Main training loop."""
     
