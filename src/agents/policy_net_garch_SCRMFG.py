@@ -818,7 +818,7 @@ class HedgingEnvGARCH:
         all_actions = []
     
         # Initialize ledger and state
-        ledger = PositionLedger(self.M, self.device)
+        ledger = VectorizedPositionLedger(self.M, self.device)
         S_t = torch.full((self.M,), self.S0, dtype=torch.float32, device=self.device)
         h_t = self.h_t.clone()
         stock_position = torch.zeros(self.M, dtype=torch.float32, device=self.device)
