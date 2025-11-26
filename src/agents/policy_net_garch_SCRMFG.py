@@ -848,47 +848,39 @@ class HedgingEnvGARCH:
                     # Get bucket parameters (moneyness and maturity)
                     moneyness, maturity_days = self.grid_manager.get_bucket_params(bucket_idx - 1)
                     
-                    # Process each path independently
-                    for path_idx in range(self.M):
-                        qty = float(trade_qty[path_idx].item())
-                        if abs(qty) < 1e-6:
-                            continue
-                        
-                        # Get THIS path's spot price
-                        S_path = float(S_t[path_idx].item())
-                        
-                        # Calculate path-specific strike based on THIS path's spot
-                        K_path = moneyness * S_path
-                        
-                        # Create derivative template for this path
-                        deriv_template = self.grid_manager.create_derivative(
-                            S_current=S_path,  # Use path-specific spot
-                            bucket_idx=bucket_idx - 1,
-                            current_step=t,
-                            total_steps=self.N
+                    # VECTORIZED: Compute strikes for ALL paths at once
+                    K_paths = moneyness * S_t  # [M]
+                    
+                    # Create derivative template
+                    from src.option_greek.vanilla import VanillaOption
+                    deriv_template = VanillaOption(
+                        precomputation_manager=self.derivative.precomp_manager,
+                        garch_params=self.garch_params,
+                        option_type=self.grid_manager.option_type
+                    )
+                    deriv_template.N = maturity_days
+                    deriv_template.created_at_step = t
+                    
+                    # Add positions to ledger (BATCHED - NO LOOP)
+                    nonzero_mask = trade_qty.abs() > 1e-6
+                    
+                    if nonzero_mask.sum() > 0:
+                        ledger.add_positions_batch(
+                            path_indices=torch.where(nonzero_mask)[0],
+                            quantities=trade_qty[nonzero_mask],
+                            strikes=K_paths[nonzero_mask],
+                            expiry_steps=torch.full(
+                                (nonzero_mask.sum(),), 
+                                t + maturity_days, 
+                                dtype=torch.long, 
+                                device=self.device
+                            ),
+                            created_at_step=t,
+                            original_maturity=maturity_days,
+                            bucket_idx=bucket_idx,
+                            opening_spots=S_t[nonzero_mask],
+                            derivative_template=deriv_template
                         )
-                        
-                        # Add position with path-specific parameters
-                        # NEW (FAST):
-                        nonzero_mask = trade_qty.abs() > 1e-6  # <-- DEFINED HERE
-
-                        if nonzero_mask.sum() > 0:
-                            ledger.add_positions_batch(
-                                path_indices=torch.where(nonzero_mask)[0],
-                                quantities=trade_qty[nonzero_mask],
-                                strikes=K_paths[nonzero_mask],
-                                expiry_steps=torch.full(
-                                    (nonzero_mask.sum(),), 
-                                    t + maturity_days, 
-                                    dtype=torch.long, 
-                                    device=self.device
-                                ),
-                                created_at_step=t,
-                                original_maturity=maturity_days,
-                                bucket_idx=bucket_idx,
-                                opening_spots=S_t[nonzero_mask],
-                                derivative_template=deriv_template
-                            )
     
             # Evolve GARCH and stock
             sqrt_h = torch.sqrt(h_t)
@@ -938,7 +930,6 @@ class HedgingEnvGARCH:
     
         self.position_ledger = ledger
         return S_trajectory, V_trajectory, None, obs_sequence, all_actions
-
     # -------------------------
     # Full-trajectory P&L simulation using policy outputs
     # -------------------------
@@ -1040,31 +1031,26 @@ class HedgingEnvGARCH:
                 B_t -= trade_qty * option_prices + option_costs
                 cost_breakdown["vanilla_option"] += option_costs
                 
-                # Add positions to ledger (still needs loop but batched internally)
+                # Add positions to ledger (BATCHED - NO LOOP)
                 nonzero_mask = trade_qty.abs() > 1e-6
-                nonzero_indices = torch.where(nonzero_mask)[0]
                 
-                for path_idx in nonzero_indices.tolist():
-                    # NEW (FAST):
-                    nonzero_mask = trade_qty.abs() > 1e-6  # <-- DEFINED HERE
-
-                    if nonzero_mask.sum() > 0:
-                        ledger.add_positions_batch(
-                            path_indices=torch.where(nonzero_mask)[0],
-                            quantities=trade_qty[nonzero_mask],
-                            strikes=K_paths[nonzero_mask],
-                            expiry_steps=torch.full(
-                                (nonzero_mask.sum(),), 
-                                t + maturity_days, 
-                                dtype=torch.long, 
-                                device=self.device
-                            ),
-                            created_at_step=t,
-                            original_maturity=maturity_days,
-                            bucket_idx=bucket_idx,
-                            opening_spots=S_t[nonzero_mask],
-                            derivative_template=deriv_template
-                        )
+                if nonzero_mask.sum() > 0:
+                    ledger.add_positions_batch(
+                        path_indices=torch.where(nonzero_mask)[0],
+                        quantities=trade_qty[nonzero_mask],
+                        strikes=K_paths[nonzero_mask],
+                        expiry_steps=torch.full(
+                            (nonzero_mask.sum(),), 
+                            t + maturity_days, 
+                            dtype=torch.long, 
+                            device=self.device
+                        ),
+                        created_at_step=t,
+                        original_maturity=maturity_days,
+                        bucket_idx=bucket_idx,
+                        opening_spots=S_t[nonzero_mask],
+                        derivative_template=deriv_template
+                    )
             
             # ===== EVOLVE GARCH AND STOCK =====
             sqrt_h = torch.sqrt(h_t)
@@ -1182,7 +1168,15 @@ def compute_loss_with_soft_constraint(
     total_loss = risk_loss + lambda_constraint * constraint_penalty + lambda_sparsity * sparsity_penalty
     
     return total_loss, risk_loss, constraint_penalty, sparsity_penalty
-
+def get_transaction_costs(config: Dict[str, Any]) -> Dict[str, float]:
+    """Extract transaction costs from config."""
+    tc = config.get("transaction_costs", {})
+    return {
+        "stock": tc.get("stock", 0.0001),
+        "vanilla_option": tc.get("vanilla_option", 0.001),
+        "barrier_option": tc.get("barrier_option", 0.002),
+        "american_option": tc.get("american_option", 0.0015),
+    }
 def train_episode(
     episode: int,
     config: Dict[str, Any],
@@ -1276,7 +1270,7 @@ def train_episode(
         log_msg += f" | Constraint: {constraint_penalty.item():.6f} (Avg Viol: {avg_violation:.6f})"
     if lambda_sparsity > 0:
         log_msg += f" | Sparsity: {sparsity_pen.item():.6f}"
-    if is_floating and "ledger_size_trajectory" in trajectories:
+    if is_floating_grid and "ledger_size_trajectory" in trajectories:
         avg_ledger = np.mean(trajectories["ledger_size_trajectory"])
         max_ledger = np.max(trajectories["ledger_size_trajectory"])
         log_msg += f" | Ledger (Avg/Max): {avg_ledger:.1f}/{max_ledger:.0f}"
