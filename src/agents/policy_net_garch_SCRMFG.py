@@ -529,6 +529,7 @@ class HedgingEnvGARCH:
         self.device = torch.device(device)
         self.derivative = derivative
         self.n_hedging_instruments = n_hedging_instruments
+        self.precomputation_manager = precomputation_manager  # ← STORE IT HERE
     
         # Detect floating-grid mode
         self.is_floating_grid = bool(grid_config and grid_config.get("instruments", {}).get("floating_grid", {}).get("enabled", False))
@@ -552,7 +553,7 @@ class HedgingEnvGARCH:
                 precomputation_manager=precomp_manager,
                 garch_params=garch_params
             )
-            self.position_ledger: Optional[PositionLedger] = None
+            self.position_ledger: Optional[VectorizedPositionLedger] = None
             self.hedging_derivatives_static = None
             # For logging/transaction typing
             self.instrument_types_list = ["stock"] + ["vanilla_option"] * self.grid_manager.grid_size
