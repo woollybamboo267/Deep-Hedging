@@ -81,7 +81,7 @@ training:
   weight_decay: 1.0e-05
 
 transaction_costs:
-  TC: true
+  TC: false
 
 risk_measure:
   type: mse  # or 'smse', 'cvar', 'var', 'mae'
