@@ -24,12 +24,12 @@ hedged_option:
 
 instruments:
   mode: "floating_grid"  # or "static" for backward compatibility
-  n_hedging_instruments: 26  # 1 stock + 30 options (5 moneyness × 6 maturities)
+  n_hedging_instruments: 10  # 1 stock + 30 options (5 moneyness × 6 maturities)
   
   floating_grid:
     enabled: true
-    moneyness_levels: [0.8, 0.9, 1.0, 1.1, 1.2]  # 5 levels
-    maturity_days: [60, 90, 120, 252, 378]  # 5 maturities
+    moneyness_levels: [0.8, 1.0, 1.1]  # 5 levels
+    maturity_days: [120, 252, 378]  # 5 maturities
     option_type: "put"
     sparsity_penalty: 0.0001
     min_trade_size: 0.5
