@@ -350,7 +350,7 @@ def train_episode(
         device=str(device),
         transaction_costs=transaction_costs,
         grid_config=config if is_floating_grid else None,
-        precomputation_manager=hedging_derivatives.precomp_manager
+        precomputation_manager=None
     )
 
     env.reset()
