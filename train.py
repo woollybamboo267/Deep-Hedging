@@ -247,29 +247,25 @@ def create_policy_network(config: Dict[str, Any], device: torch.device) -> Polic
     """Create and initialize policy network."""
     model_config = config["model"]
     
+    # Get use_action_recurrence from config, default to False
+    use_action_recurrence = model_config.get("use_action_recurrence", False)
+    
     policy_net = PolicyNetGARCH(
         obs_dim=model_config["obs_dim"],
         hidden_size=model_config["hidden_size"],
         n_hedging_instruments=config["instruments"]["n_hedging_instruments"],
         num_lstm_layers=model_config["lstm_layers"],
-        num_fc_layers=model_config["num_layers"]
+        num_fc_layers=model_config["num_layers"],
+        use_action_recurrence=use_action_recurrence  # ← ADD THIS
     ).to(device)
     
-    # ============ ADD THIS DEBUG LOGGING ============
-    logging.info("=" * 70)
-    logging.info("POLICY NETWORK CONFIGURATION")
-    logging.info(f"  obs_dim (from config): {model_config['obs_dim']}")
-    logging.info(f"  LSTM input_size (actual): {policy_net.lstm.input_size}")
-    logging.info(f"  use_action_recurrence: {policy_net.use_action_recurrence}")
-    logging.info(f"  n_hedging_instruments: {config['instruments']['n_hedging_instruments']}")
-    logging.info(f"  hidden_size: {model_config['hidden_size']}")
-    logging.info(f"  num_lstm_layers: {model_config['lstm_layers']}")
-    logging.info(f"  num_fc_layers: {model_config['num_layers']}")
-    logging.info("=" * 70)
-    # ================================================
+    logging.info(
+        f"Created policy network with {model_config['hidden_size']} hidden units, "
+        f"{model_config['num_layers']} FC layers, "
+        f"action_recurrence={use_action_recurrence}"  # ← ADD THIS
+    )
     
     return policy_net
-
 
 def create_optimizer(
     policy_net: PolicyNetGARCH,
