@@ -933,7 +933,7 @@ class HedgingEnvGARCH:
             if t < self.N - 1:
                 # NEW: Prepare previous actions for network input (Mueller's approach)
                 if policy_net.use_action_recurrence:
-                    prev_actions_t = actions_t.unsqueeze(1) # [M, 1, n_instruments]
+                    prev_actions_t = actions_t.unsqueeze(1).detach() # [M, 1, n_instruments]
                     outputs, hidden_state = policy_net(obs_new, prev_actions_t, hidden_state)
                 else:
                     outputs, hidden_state = policy_net(obs_new, hidden_state=hidden_state)
