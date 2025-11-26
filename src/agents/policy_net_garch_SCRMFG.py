@@ -929,10 +929,11 @@ class HedgingEnvGARCH:
         )
     
         # Get initial actions WITH action recurrence
+        # NOTE: Pass hidden_states as positional argument, NOT keyword
         if policy_net.use_action_recurrence:
-            outputs, hidden_state = policy_net(obs_t, prev_actions_t, hidden_state=None)
+            outputs, hidden_states = policy_net(obs_t, prev_actions_t, None)  # None = initial hidden states
         else:
-            outputs, hidden_state = policy_net(obs_t, hidden_state=None)
+            outputs, hidden_states = policy_net(obs_t, None, None)  # Ignore prev_actions if not using recurrence
         
         actions_t = torch.stack([out[:, 0] for out in outputs], dim=-1)  # [M, n_instruments]
         all_actions.append(actions_t)
@@ -1026,12 +1027,14 @@ class HedgingEnvGARCH:
             if policy_net.use_action_recurrence:
                 prev_actions_t = actions_t.unsqueeze(1).detach()
                 # Detach hidden state to prevent gradients flowing through time
-                hidden_state = tuple(h.detach() for h in hidden_state)
-                outputs, hidden_state = policy_net(obs_new, prev_actions_t, hidden_state)
+                hidden_states = tuple(h.detach() for h in hidden_states)
+                # Pass as positional arguments: obs, prev_actions, hidden_states
+                outputs, hidden_states = policy_net(obs_new, prev_actions_t, hidden_states)
             else:
                 # Still detach hidden state even without action recurrence
-                hidden_state = tuple(h.detach() for h in hidden_state)
-                outputs, hidden_state = policy_net(obs_new, hidden_state=hidden_state)
+                hidden_states = tuple(h.detach() for h in hidden_states)
+                # Pass as positional arguments: obs, prev_actions, hidden_states
+                outputs, hidden_states = policy_net(obs_new, None, hidden_states)
             
             actions_t = torch.stack([out[:, 0] for out in outputs], dim=-1)
             all_actions.append(actions_t)
