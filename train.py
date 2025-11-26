@@ -824,6 +824,7 @@ def main():
     # NOTE: American and Asian options do NOT need precomputation
     
     precomputation_manager = create_precomputation_manager_from_config(config)
+    print(f"precomputation_manager: {precomputation_manager.maturities}")
     
     # Check if hedged derivative needs precomputation
     needs_hedged_precompute = hedged_type in ["vanilla", "barrier"]
