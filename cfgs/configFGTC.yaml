@@ -39,7 +39,7 @@ logging:
   log_file: null
 
 model:
-  hidden_size: 128
+  hidden_size: 256
   lstm_layers: 1
   num_layers: 1
   obs_dim: 5  # Changed from 5 to 9 for floating grid
