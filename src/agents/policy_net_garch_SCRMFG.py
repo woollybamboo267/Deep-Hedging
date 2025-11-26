@@ -930,12 +930,14 @@ class HedgingEnvGARCH:
     
         # Get initial actions WITH action recurrence
         # NOTE: Pass hidden_states as positional argument, NOT keyword
-        if policy_net.use_action_recurrence:
-            outputs, hidden_states = policy_net(obs_t, prev_actions_t, None)  # None = initial hidden states
-        else:
-            outputs, hidden_states = policy_net(obs_t, None, None)  # Ignore prev_actions if not using recurrence
-        
-        actions_t = torch.stack([out[:, 0] for out in outputs], dim=-1)  # [M, n_instruments]
+        # Use torch.no_grad() for trajectory simulation to prevent memory buildup
+        with torch.no_grad():
+            if policy_net.use_action_recurrence:
+                outputs, hidden_states = policy_net(obs_t, prev_actions_t, None)  # None = initial hidden states
+            else:
+                outputs, hidden_states = policy_net(obs_t, None, None)  # Ignore prev_actions if not using recurrence
+            
+            actions_t = torch.stack([out[:, 0] for out in outputs], dim=-1)  # [M, n_instruments]
         all_actions.append(actions_t)
     
         # Main loop
@@ -1025,10 +1027,9 @@ class HedgingEnvGARCH:
             # Ask policy for next actions
             # Prepare previous actions for network input (Mueller's approach)
             if policy_net.use_action_recurrence:
-                prev_actions_t = actions_t.unsqueeze(1).detach()
-                # Detach hidden state to prevent gradients flowing through time
+                prev_actions_t = actions_t.unsqueeze(1)
+                # Detach hidden states - hidden_states is a list of (h, c) tuples
                 hidden_states = [(h.detach(), c.detach()) for h, c in hidden_states]
-
                 # Pass as positional arguments: obs, prev_actions, hidden_states
                 outputs, hidden_states = policy_net(obs_new, prev_actions_t, hidden_states)
             else:
@@ -1038,6 +1039,8 @@ class HedgingEnvGARCH:
                 outputs, hidden_states = policy_net(obs_new, None, hidden_states)
             
             actions_t = torch.stack([out[:, 0] for out in outputs], dim=-1)
+            # CRITICAL: Detach to prevent gradient accumulation across timesteps
+            actions_t = actions_t.detach()
             all_actions.append(actions_t)
         
         # Stack outputs and store ledger
