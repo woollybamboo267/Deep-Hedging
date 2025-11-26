@@ -862,12 +862,44 @@ class HedgingEnvGARCH:
                 trade_qty = torch.round(actions_prev[:, bucket_idx])  # integerize
                 # suppress small trades
                 trade_qty = torch.where(trade_qty.abs() < self.min_trade_size, torch.zeros_like(trade_qty), trade_qty)
+                
                 if trade_qty.abs().sum() > 1e-6:
-                    S_mean = float(S_t.mean().item())
-                    deriv = self.grid_manager.create_derivative(
-                        S_current=S_mean, bucket_idx=bucket_idx - 1, current_step=t, total_steps=self.N
+                    # Get bucket parameters (moneyness and maturity)
+                    moneyness, maturity_days = self.grid_manager.get_bucket_params(bucket_idx - 1)
+                    
+                    # VECTORIZED: Compute strikes for ALL paths at once
+                    K_paths = moneyness * S_t  # [M]
+                    
+                    # Create derivative template
+                    from src.option_greek.vanilla import VanillaOption
+                    deriv_template = VanillaOption(
+                        precomputation_manager=self.precomputation_manager,
+                        garch_params=self.garch_params,
+                        option_type=self.grid_manager.option_type
                     )
-                    ledger.add_position(deriv, trade_qty, bucket_idx, t, S_t)
+                    deriv_template.N = maturity_days
+                    deriv_template.created_at_step = t
+                    
+                    # Add positions to ledger (BATCHED - NO LOOP)
+                    nonzero_mask = trade_qty.abs() > 1e-6
+                    
+                    if nonzero_mask.sum() > 0:
+                        ledger.add_positions_batch(
+                            path_indices=torch.where(nonzero_mask)[0],
+                            quantities=trade_qty[nonzero_mask],
+                            strikes=K_paths[nonzero_mask],
+                            expiry_steps=torch.full(
+                                (nonzero_mask.sum(),), 
+                                t + maturity_days, 
+                                dtype=torch.long, 
+                                device=self.device
+                            ),
+                            created_at_step=t,
+                            original_maturity=maturity_days,
+                            bucket_idx=bucket_idx,
+                            opening_spots=S_t[nonzero_mask],
+                            derivative_template=deriv_template
+                        )
     
             # Evolve GARCH and stock
             sqrt_h = torch.sqrt(h_t)
