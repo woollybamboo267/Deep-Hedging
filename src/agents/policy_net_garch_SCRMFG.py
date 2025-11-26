@@ -1184,117 +1184,117 @@ def get_transaction_costs(config: Dict[str, Any]) -> Dict[str, float]:
         "barrier_option": tc.get("barrier_option", 0.002),
         "american_option": tc.get("american_option", 0.0015),
     }
-def train_episode(
-    episode: int,
-    config: Dict[str, Any],
-    policy_net: PolicyNetGARCH,
-    optimizer: torch.optim.Optimizer,
-    hedged_derivative,
-    hedging_derivatives,
-    HedgingSim,
-    device: torch.device,
-    precomputation_manager,
-) -> Dict[str, Any]:
-    """Train for a single episode with configurable risk measure and soft constraint."""
+# def train_episode(
+#     episode: int,
+#     config: Dict[str, Any],
+#     policy_net: PolicyNetGARCH,
+#     optimizer: torch.optim.Optimizer,
+#     hedged_derivative,
+#     hedging_derivatives,
+#     HedgingSim,
+#     device: torch.device,
+#     precomputation_manager,
+# ) -> Dict[str, Any]:
+#     """Train for a single episode with configurable risk measure and soft constraint."""
     
-    hedged_cfg = config["hedged_option"]
-    mode = config["instruments"].get("mode", "static")
-    is_floating_grid = (mode == "floating_grid")
+#     hedged_cfg = config["hedged_option"]
+#     mode = config["instruments"].get("mode", "static")
+#     is_floating_grid = (mode == "floating_grid")
     
-    # Get transaction costs from config
-    transaction_costs = get_transaction_costs(config)
+#     # Get transaction costs from config
+#     transaction_costs = get_transaction_costs(config)
     
-    # NEW: Get risk measure and soft constraint configuration
-    risk_config = config.get("risk_measure", {"type": "mse"})
-    constraint_config = config.get("soft_constraint", {"enabled": False, "lambda": 0.0})
+#     # NEW: Get risk measure and soft constraint configuration
+#     risk_config = config.get("risk_measure", {"type": "mse"})
+#     constraint_config = config.get("soft_constraint", {"enabled": False, "lambda": 0.0})
     
-    risk_measure = risk_config.get("type", "mse")
-    alpha = risk_config.get("alpha", None)
-    lambda_constraint = constraint_config.get("lambda", 0.0) if constraint_config.get("enabled", False) else 0.0
+#     risk_measure = risk_config.get("type", "mse")
+#     alpha = risk_config.get("alpha", None)
+#     lambda_constraint = constraint_config.get("lambda", 0.0) if constraint_config.get("enabled", False) else 0.0
     
-    # Get sparsity penalty for floating grid
-    lambda_sparsity = 0.0
-    if is_floating_grid:
-        lambda_sparsity = config["instruments"]["floating_grid"].get("sparsity_penalty", 0.0)
+#     # Get sparsity penalty for floating grid
+#     lambda_sparsity = 0.0
+#     if is_floating_grid:
+#         lambda_sparsity = config["instruments"]["floating_grid"].get("sparsity_penalty", 0.0)
     
-    # FIX: Convert K to tensor on device BEFORE passing to HedgingSim
-    K_tensor = torch.tensor(hedged_cfg["K"], dtype=torch.float32, device=device)
-    S0_tensor = torch.tensor(config["simulation"]["S0"], dtype=torch.float32, device=device)
+#     # FIX: Convert K to tensor on device BEFORE passing to HedgingSim
+#     K_tensor = torch.tensor(hedged_cfg["K"], dtype=torch.float32, device=device)
+#     S0_tensor = torch.tensor(config["simulation"]["S0"], dtype=torch.float32, device=device)
     
-    sim = HedgingSim(
-        S0=S0_tensor,  # Pass as tensor
-        K=K_tensor,    # Pass as tensor
-        m=0.1,
-        r=config["simulation"]["r"],
-        sigma=config["garch"]["sigma0"],
-        T=config["simulation"]["T"],
-        option_type=hedged_cfg["option_type"],
-        position=hedged_cfg["side"],
-        M=config["simulation"]["M"],
-        N=config["simulation"]["N"],
-        TCP=transaction_costs.get('stock', 0.0001),
-        seed=episode
-    )
+#     sim = HedgingSim(
+#         S0=S0_tensor,  # Pass as tensor
+#         K=K_tensor,    # Pass as tensor
+#         m=0.1,
+#         r=config["simulation"]["r"],
+#         sigma=config["garch"]["sigma0"],
+#         T=config["simulation"]["T"],
+#         option_type=hedged_cfg["option_type"],
+#         position=hedged_cfg["side"],
+#         M=config["simulation"]["M"],
+#         N=config["simulation"]["N"],
+#         TCP=transaction_costs.get('stock', 0.0001),
+#         seed=episode
+#     )
 
-    env = HedgingEnvGARCH(
-        sim=sim,
-        derivative=hedged_derivative,
-        hedging_derivatives=None if is_floating_grid else hedging_derivatives,
-        garch_params=config["garch"],
-        n_hedging_instruments=config["instruments"]["n_hedging_instruments"],
-        dt_min=config["environment"]["dt_min"],
-        device=str(device),
-        transaction_costs=transaction_costs,
-        grid_config=config if is_floating_grid else None,
-        precomputation_manager=precomputation_manager,
-        lambda_constraint=lambda_constraint  # ← Add this
-    )
+#     env = HedgingEnvGARCH(
+#         sim=sim,
+#         derivative=hedged_derivative,
+#         hedging_derivatives=None if is_floating_grid else hedging_derivatives,
+#         garch_params=config["garch"],
+#         n_hedging_instruments=config["instruments"]["n_hedging_instruments"],
+#         dt_min=config["environment"]["dt_min"],
+#         device=str(device),
+#         transaction_costs=transaction_costs,
+#         grid_config=config if is_floating_grid else None,
+#         precomputation_manager=precomputation_manager,
+#         lambda_constraint=lambda_constraint  # ← Add this
+#     )
 
-    env.reset()
-    S_traj, V_traj, O_traj, obs_sequence, RL_actions = env.simulate_trajectory_and_get_observations(policy_net)
-    terminal_errors, trajectories = env.simulate_full_trajectory(RL_actions, O_traj)
+#     env.reset()
+#     S_traj, V_traj, O_traj, obs_sequence, RL_actions = env.simulate_trajectory_and_get_observations(policy_net)
+#     terminal_errors, trajectories = env.simulate_full_trajectory(RL_actions, O_traj)
 
-    optimizer.zero_grad()
-    total_loss, risk_loss, constraint_penalty, sparsity_pen = compute_loss_with_soft_constraint(
-        terminal_errors, trajectories, risk_measure=risk_measure, alpha=alpha, lambda_constraint=lambda_constraint, lambda_sparsity=lambda_sparsity
-    )
-    total_loss.backward()
-    torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=config["training"]["gradient_clip_max_norm"])
-    optimizer.step()
+#     optimizer.zero_grad()
+#     total_loss, risk_loss, constraint_penalty, sparsity_pen = compute_loss_with_soft_constraint(
+#         terminal_errors, trajectories, risk_measure=risk_measure, alpha=alpha, lambda_constraint=lambda_constraint, lambda_sparsity=lambda_sparsity
+#     )
+#     total_loss.backward()
+#     torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=config["training"]["gradient_clip_max_norm"])
+#     optimizer.step()
 
-    if torch.isnan(total_loss) or torch.isinf(total_loss):
-        logging.error("Loss became NaN/Inf")
-        raise RuntimeError("Loss became NaN/Inf")
+#     if torch.isnan(total_loss) or torch.isinf(total_loss):
+#         logging.error("Loss became NaN/Inf")
+#         raise RuntimeError("Loss became NaN/Inf")
 
-    final_reward = -float(total_loss.item())
+#     final_reward = -float(total_loss.item())
 
-    # Log summary
-    log_msg = (
-        f"Episode {episode} | Reward: {final_reward:.6f} | "
-        f"Total Loss: {total_loss.item():.6f} | Risk Loss: {risk_loss.item():.6f}"
-    )
-    if lambda_constraint > 0:
-        avg_violation = trajectories["soft_constraint_violations"].mean().item()
-        log_msg += f" | Constraint: {constraint_penalty.item():.6f} (Avg Viol: {avg_violation:.6f})"
-    if lambda_sparsity > 0:
-        log_msg += f" | Sparsity: {sparsity_pen.item():.6f}"
-    if is_floating_grid and "ledger_size_trajectory" in trajectories:
-        avg_ledger = np.mean(trajectories["ledger_size_trajectory"])
-        max_ledger = np.max(trajectories["ledger_size_trajectory"])
-        log_msg += f" | Ledger (Avg/Max): {avg_ledger:.1f}/{max_ledger:.0f}"
-    logging.info(log_msg)
+#     # Log summary
+#     log_msg = (
+#         f"Episode {episode} | Reward: {final_reward:.6f} | "
+#         f"Total Loss: {total_loss.item():.6f} | Risk Loss: {risk_loss.item():.6f}"
+#     )
+#     if lambda_constraint > 0:
+#         avg_violation = trajectories["soft_constraint_violations"].mean().item()
+#         log_msg += f" | Constraint: {constraint_penalty.item():.6f} (Avg Viol: {avg_violation:.6f})"
+#     if lambda_sparsity > 0:
+#         log_msg += f" | Sparsity: {sparsity_pen.item():.6f}"
+#     if is_floating_grid and "ledger_size_trajectory" in trajectories:
+#         avg_ledger = np.mean(trajectories["ledger_size_trajectory"])
+#         max_ledger = np.max(trajectories["ledger_size_trajectory"])
+#         log_msg += f" | Ledger (Avg/Max): {avg_ledger:.1f}/{max_ledger:.0f}"
+#     logging.info(log_msg)
 
-    return {
-        "episode": episode,
-        "loss": total_loss.item(),
-        "risk_loss": risk_loss.item(),
-        "constraint_penalty": constraint_penalty.item(),
-        "sparsity_penalty": sparsity_pen.item() if isinstance(sparsity_pen, torch.Tensor) else float(sparsity_pen),
-        "reward": final_reward,
-        "trajectories": trajectories,
-        "RL_positions": RL_actions,
-        "S_traj": S_traj,
-        "V_traj": V_traj,
-        "O_traj": O_traj,
-        "env": env,
-    }
+#     return {
+#         "episode": episode,
+#         "loss": total_loss.item(),
+#         "risk_loss": risk_loss.item(),
+#         "constraint_penalty": constraint_penalty.item(),
+#         "sparsity_penalty": sparsity_pen.item() if isinstance(sparsity_pen, torch.Tensor) else float(sparsity_pen),
+#         "reward": final_reward,
+#         "trajectories": trajectories,
+#         "RL_positions": RL_actions,
+#         "S_traj": S_traj,
+#         "V_traj": V_traj,
+#         "O_traj": O_traj,
+#         "env": env,
+#     }
