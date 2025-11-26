@@ -779,9 +779,7 @@ class HedgingEnvGARCH:
     def _simulate_full_trajectory_floating(self, all_actions: torch.Tensor):
         """
         P&L calculation for floating-grid mode with PATH-SPECIFIC strikes.
-        
-        CRITICAL FIX: Each path now gets options with strikes based on its own
-        spot price, not the mean across all paths.
+        VECTORIZED VERSION - prices all paths at once per bucket.
         """
         ledger = PositionLedger(self.M, self.device)
         S_t = torch.full((self.M,), self.S0, dtype=torch.float32, device=self.device)
@@ -831,7 +829,7 @@ class HedgingEnvGARCH:
             cost_breakdown["stock"] += stock_cost
             stock_position = actions_t[:, 0]
             
-            # ===== OPTION TRADES (path-specific strikes) =====
+            # ===== OPTION TRADES (VECTORIZED!) =====
             for bucket_idx in range(1, self.n_hedging_instruments):
                 trade_qty = torch.round(actions_t[:, bucket_idx])
                 trade_qty = torch.where(
@@ -840,9 +838,16 @@ class HedgingEnvGARCH:
                     trade_qty
                 )
                 
+                # Skip if no trades
+                if trade_qty.abs().sum() < 1e-6:
+                    continue
+                
                 # Get bucket parameters (moneyness and maturity)
                 moneyness, maturity_days = self.grid_manager.get_bucket_params(bucket_idx - 1)
                 tcp_option = self._get_transaction_cost_rate(bucket_idx)
+                
+                # VECTORIZED: Compute strikes for ALL paths at once
+                K_paths = moneyness * S_t  # [M] strikes
                 
                 # Create derivative template (just for pricing methods)
                 from src.option_greek.vanilla import VanillaOption
@@ -854,41 +859,33 @@ class HedgingEnvGARCH:
                 deriv_template.N = maturity_days
                 deriv_template.created_at_step = t
                 
-                # Process each path individually
-                for path_idx in range(self.M):
-                    qty = float(trade_qty[path_idx].item())
-                    if abs(qty) < 1e-6:
-                        continue
-                    
-                    # PATH-SPECIFIC strike based on THIS path's spot
-                    S_path_float = float(S_t[path_idx].item())
-                    K_path = moneyness * S_path_float
-                    
-                    # Price option for THIS path with ITS strike
-                    S_path_tensor = S_t[path_idx].unsqueeze(0)
-                    option_price = deriv_template.price(
-                        S=S_path_tensor, 
-                        K=K_path, 
-                        step_idx=0, 
-                        N=maturity_days, 
-                        h0=h0_current
-                    )
-                    option_price_float = float(option_price.item())
-                    
-                    # Transaction cost for this path
-                    option_cost = tcp_option * abs(qty) * option_price_float
-                    B_t[path_idx] -= qty * option_price_float + option_cost
-                    cost_breakdown["vanilla_option"][path_idx] += option_cost
-                    
-                    # Add to ledger with PATH-SPECIFIC strike
+                # VECTORIZED: Price ALL paths at once [M]
+                option_prices = deriv_template.price(
+                    S=S_t,  # [M]
+                    K=K_paths,  # [M] - path-specific strikes!
+                    step_idx=0,
+                    N=maturity_days,
+                    h0=h0_current
+                )  # Returns [M]
+                
+                # VECTORIZED: Compute costs and update bank account
+                option_costs = tcp_option * trade_qty.abs() * option_prices
+                B_t -= trade_qty * option_prices + option_costs
+                cost_breakdown["vanilla_option"] += option_costs
+                
+                # Add positions to ledger (only for non-zero trades)
+                nonzero_mask = trade_qty.abs() > 1e-6
+                nonzero_indices = torch.where(nonzero_mask)[0]
+                
+                for path_idx in nonzero_indices.tolist():
                     ledger.add_position(
                         path_idx=path_idx,
                         derivative_template=deriv_template,
-                        quantity=qty,
+                        quantity=float(trade_qty[path_idx].item()),
                         bucket_idx=bucket_idx,
                         current_step=t,
-                        S_current=S_path_float,
-                        K_path=K_path
+                        S_current=float(S_t[path_idx].item()),
+                        K_path=float(K_paths[path_idx].item())
                     )
             
             # ===== EVOLVE GARCH AND STOCK =====
@@ -955,8 +952,7 @@ class HedgingEnvGARCH:
         }
         
         return terminal_error, trajectories
-# ----------------------------------------
-# Loss & training utilities
+    # Loss & training utilities
 # ----------------------------------------
 def compute_loss_with_soft_constraint(
     terminal_errors: torch.Tensor,
