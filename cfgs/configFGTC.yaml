@@ -43,6 +43,7 @@ model:
   lstm_layers: 1
   num_layers: 1
   obs_dim: 5  # Changed from 5 to 9 for floating grid
+  use_action_recurrence: false  # ← ADD THIS LINE
 
 output:
   checkpoint_path: policy_net_floating_grid.pth
