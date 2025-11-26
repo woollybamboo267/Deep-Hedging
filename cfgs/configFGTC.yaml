@@ -39,9 +39,9 @@ logging:
   log_file: null
 
 model:
-  hidden_size: 256
-  lstm_layers: 1
-  num_layers: 4
+  hidden_size: 512
+  lstm_layers: 2
+  num_layers: 2
   obs_dim: 5  # Changed from 5 to 9 for floating grid
   use_action_recurrence: true  # ← ADD THIS LINE
 
@@ -73,12 +73,12 @@ training:
   episodes: 300
   gamma: 0.99999
   gradient_clip_max_norm: 100
-  learning_rate: 0.01
+  learning_rate: 0.001
   num_epochs: 400
   optimizer: AdamW
   plot_frequency: 100
   seed: 78020349
-  weight_decay: 1.0e-05
+  weight_decay: 1.0e-04
 
 transaction_costs:
   TC: false
