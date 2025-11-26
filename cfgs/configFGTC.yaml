@@ -72,7 +72,7 @@ training:
   entropy_coefficient: 0.5
   episodes: 300
   gamma: 0.9999
-  gradient_clip_max_norm: 1.0
+  gradient_clip_max_norm: 100
   learning_rate: 0.00001
   num_epochs: 400
   optimizer: AdamW
