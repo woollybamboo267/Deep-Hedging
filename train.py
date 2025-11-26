@@ -657,7 +657,7 @@ def train(
     initial_model: Optional[PolicyNetGARCH] = None,
     config_name: str = "config",
     precomputation_manager: Any=None
-) -> PolicyNetGARCH
+) -> PolicyNetGARCH:
     """Main training loop."""
     
     seed = config["training"]["seed"]
