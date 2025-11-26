@@ -854,7 +854,7 @@ class HedgingEnvGARCH:
                     # Create derivative template
                     from src.option_greek.vanilla import VanillaOption
                     deriv_template = VanillaOption(
-                        precomputation_manager=self.precomputation_manager,
+                        precomputation_manager=precomp_manager,
                         garch_params=self.garch_params,
                         option_type=self.grid_manager.option_type
                     )
@@ -1010,7 +1010,7 @@ class HedgingEnvGARCH:
                 # Create derivative template
                 from src.option_greek.vanilla import VanillaOption
                 deriv_template = VanillaOption(
-                    precomputation_manager=self.precomputation_manager,
+                    precomputation_manager=precomp_manager,
                     garch_params=self.garch_params,
                     option_type=self.grid_manager.option_type
                 )
