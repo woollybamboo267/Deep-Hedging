@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from numpy.polynomial.legendre import leggauss
 from numba import jit, prange
-from typing import Dict, Any
+from typing import Dict, Any, Union
 from .base import DerivativeBase
 from .precompute import PrecomputationManager
 
@@ -38,13 +38,13 @@ class VanillaOption(DerivativeBase):
         if self.option_type not in ["call", "put"]:
             raise ValueError("option_type must be 'call' or 'put'")
     
-    def price(self, S: torch.Tensor, K: float, step_idx: int, N: int, **kwargs) -> torch.Tensor:
+    def price(self, S: torch.Tensor, K: Union[float, torch.Tensor], step_idx: int, N: int, **kwargs) -> torch.Tensor:
         """
         Calculate option price using precomputed coefficients.
         
         Args:
             S: Spot price(s) - tensor of any shape
-            K: Strike price
+            K: Strike price - scalar float OR tensor with same shape as S
             step_idx: Current step index (0 to N)
             N: Total maturity in days
             **kwargs: Additional arguments (ignored, for interface compatibility)
@@ -60,7 +60,6 @@ class VanillaOption(DerivativeBase):
             S, K, step_idx, self.r_daily, N,
             self.option_type, precomputed_data
         )
-    
     def delta(self, S: torch.Tensor, K: float, step_idx: int, N: int, **kwargs) -> torch.Tensor:
         """
         Calculate delta (∂V/∂S) analytically.
@@ -178,6 +177,7 @@ class VanillaOption(DerivativeBase):
 def price_option_precomputed(S, K, step_idx, r_daily, N, option_type, precomputed_data):
     """
     Price option using precomputed coefficients.
+    Now supports vectorized K (different strike per path).
     """
     device = torch.device(precomputed_data["device"])
     coefficients = precomputed_data["coefficients"]
@@ -185,20 +185,24 @@ def price_option_precomputed(S, K, step_idx, r_daily, N, option_type, precompute
     u_nodes = precomputed_data["u_nodes"]
     w_nodes = precomputed_data["w_nodes"]
 
-    # Convert to float64 for precision - FIXED: Use proper tensor conversion
+    # Convert to float64 for precision
     if isinstance(S, torch.Tensor):
         S_t = S.to(dtype=torch.float64, device=device)
     else:
         S_t = torch.tensor(S, dtype=torch.float64, device=device)
     
+    # NEW: Handle K as either scalar or tensor
     if isinstance(K, torch.Tensor):
         K_t = K.to(dtype=torch.float64, device=device)
+    elif isinstance(K, (list, np.ndarray)):
+        K_t = torch.tensor(K, dtype=torch.float64, device=device)
     else:
         K_t = torch.tensor(K, dtype=torch.float64, device=device)
 
     S_t = S_t.to(device)
     K_t = K_t.to(device)
     
+    # Broadcast S and K to same shape
     shape = torch.broadcast_shapes(S_t.shape, K_t.shape)
     S_bc = S_t.expand(shape) if S_t.shape != shape else S_t
     K_bc = K_t.expand(shape) if K_t.shape != shape else K_t
