@@ -165,30 +165,42 @@ class VectorizedPositionLedger:
         # Store single derivative template (all positions use same pricing logic)
         self.derivative_template = None
         
-    def add_position(
-        self, 
-        path_idx: int, 
-        derivative_template, 
-        quantity: float, 
-        bucket_idx: int, 
-        current_step: int, 
-        S_current: float,
-        K_path: float
+    def add_positions_batch(
+        self,
+        path_indices: torch.Tensor,  # [N] which paths
+        quantities: torch.Tensor,     # [N] quantities
+        strikes: torch.Tensor,        # [N] strikes
+        expiry_steps: torch.Tensor,   # [N] expiry steps
+        created_at_step: int,
+        original_maturity: int,
+        bucket_idx: int,
+        opening_spots: torch.Tensor,  # [N] spots
+        derivative_template
     ):
-        """Add a single position (will be batched internally)."""
+        """Add multiple positions at once - NO LOOP."""
         if self.derivative_template is None:
             self.derivative_template = derivative_template
         
-        # Append to tensors
-        self.path_indices = torch.cat([self.path_indices, torch.tensor([path_idx], dtype=torch.long, device=self.device)])
-        self.quantities = torch.cat([self.quantities, torch.tensor([quantity], dtype=torch.float32, device=self.device)])
-        self.strikes = torch.cat([self.strikes, torch.tensor([K_path], dtype=torch.float32, device=self.device)])
-        self.expiry_steps = torch.cat([self.expiry_steps, torch.tensor([current_step + derivative_template.N], dtype=torch.long, device=self.device)])
-        self.created_at_steps = torch.cat([self.created_at_steps, torch.tensor([current_step], dtype=torch.long, device=self.device)])
-        self.original_maturities = torch.cat([self.original_maturities, torch.tensor([derivative_template.N], dtype=torch.long, device=self.device)])
-        self.bucket_indices = torch.cat([self.bucket_indices, torch.tensor([bucket_idx], dtype=torch.long, device=self.device)])
-        self.opening_spots = torch.cat([self.opening_spots, torch.tensor([S_current], dtype=torch.float32, device=self.device)])
-    
+        n_new = len(path_indices)
+        
+        # Single concatenation instead of loop
+        self.path_indices = torch.cat([self.path_indices, path_indices])
+        self.quantities = torch.cat([self.quantities, quantities])
+        self.strikes = torch.cat([self.strikes, strikes])
+        self.expiry_steps = torch.cat([self.expiry_steps, expiry_steps])
+        self.created_at_steps = torch.cat([
+            self.created_at_steps, 
+            torch.full((n_new,), created_at_step, dtype=torch.long, device=self.device)
+        ])
+        self.original_maturities = torch.cat([
+            self.original_maturities,
+            torch.full((n_new,), original_maturity, dtype=torch.long, device=self.device)
+        ])
+        self.bucket_indices = torch.cat([
+            self.bucket_indices,
+            torch.full((n_new,), bucket_idx, dtype=torch.long, device=self.device)
+        ])
+        self.opening_spots = torch.cat([self.opening_spots, opening_spots])
     def remove_expired(self, current_step: int):
         """Remove positions whose expiry_step <= current_step."""
         active_mask = self.expiry_steps > current_step
@@ -857,15 +869,24 @@ class HedgingEnvGARCH:
                         )
                         
                         # Add position with path-specific parameters
-                        ledger.add_position(
-                            path_idx=path_idx,
-                            derivative_template=deriv_template,
-                            quantity=qty,
-                            bucket_idx=bucket_idx,
-                            current_step=t,
-                            S_current=S_path,
-                            K_path=K_path  # PATH-SPECIFIC STRIKE
-                        )
+                        # NEW (FAST):
+                        if nonzero_mask.sum() > 0:
+                            ledger.add_positions_batch(
+                                path_indices=torch.where(nonzero_mask)[0],
+                                quantities=trade_qty[nonzero_mask],
+                                strikes=K_paths[nonzero_mask],
+                                expiry_steps=torch.full(
+                                    (nonzero_mask.sum(),), 
+                                    t + maturity_days, 
+                                    dtype=torch.long, 
+                                    device=self.device
+                                ),
+                                created_at_step=t,
+                                original_maturity=maturity_days,
+                                bucket_idx=bucket_idx,
+                                opening_spots=S_t[nonzero_mask],
+                                derivative_template=deriv_template
+                            )
     
             # Evolve GARCH and stock
             sqrt_h = torch.sqrt(h_t)
@@ -1022,15 +1043,24 @@ class HedgingEnvGARCH:
                 nonzero_indices = torch.where(nonzero_mask)[0]
                 
                 for path_idx in nonzero_indices.tolist():
-                    ledger.add_position(
-                        path_idx=path_idx,
-                        derivative_template=deriv_template,
-                        quantity=float(trade_qty[path_idx].item()),
-                        bucket_idx=bucket_idx,
-                        current_step=t,
-                        S_current=float(S_t[path_idx].item()),
-                        K_path=float(K_paths[path_idx].item())
-                    )
+                    # NEW (FAST):
+                    if nonzero_mask.sum() > 0:
+                        ledger.add_positions_batch(
+                            path_indices=torch.where(nonzero_mask)[0],
+                            quantities=trade_qty[nonzero_mask],
+                            strikes=K_paths[nonzero_mask],
+                            expiry_steps=torch.full(
+                                (nonzero_mask.sum(),), 
+                                t + maturity_days, 
+                                dtype=torch.long, 
+                                device=self.device
+                            ),
+                            created_at_step=t,
+                            original_maturity=maturity_days,
+                            bucket_idx=bucket_idx,
+                            opening_spots=S_t[nonzero_mask],
+                            derivative_template=deriv_template
+                        )
             
             # ===== EVOLVE GARCH AND STOCK =====
             sqrt_h = torch.sqrt(h_t)
