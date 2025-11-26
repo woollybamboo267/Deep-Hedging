@@ -307,7 +307,7 @@ def setup_derivatives_from_precomputed(
     logger.info(f"Mode: {mode}")
     logger.info(f"Available precomputed maturities: {list(precomputation_manager.precomputed_data.keys())}")
     
-    hedged_derivative = DerivativeFactory.create_hedged_derivative(config, precomputation_manager)
+    hedged_derivative, precomputation_manager = DerivativeFactory.create_hedged_derivative(config, precomputation_manager)
     logger.info(f"Created hedged derivative: {type(hedged_derivative).__name__}")
     
     hedging_derivatives = DerivativeFactory.create_hedging_derivatives(config, precomputation_manager)
@@ -323,4 +323,4 @@ def setup_derivatives_from_precomputed(
             else:
                 logger.info(f"  Instrument {i}: {type(deriv).__name__}")
     
-    return hedged_derivative, hedging_derivatives
+    return hedged_derivative, hedging_derivatives, precomputation_manager
