@@ -1010,7 +1010,7 @@ class HedgingEnvGARCH:
                 # Create derivative template
                 from src.option_greek.vanilla import VanillaOption
                 deriv_template = VanillaOption(
-                    precomputation_manager=precomputation_manager,
+                    precomputation_manager=self.precomputation_manager,
                     garch_params=self.garch_params,
                     option_type=self.grid_manager.option_type
                 )
@@ -1192,7 +1192,8 @@ def train_episode(
     hedged_derivative,
     hedging_derivatives,
     HedgingSim,
-    device: torch.device
+    device: torch.device,
+    precomputation_manager,
 ) -> Dict[str, Any]:
     """Train for a single episode with configurable risk measure and soft constraint."""
     
