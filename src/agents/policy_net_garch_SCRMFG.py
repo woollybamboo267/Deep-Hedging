@@ -145,14 +145,26 @@ class FloatingGridManager:
 # ----------------------------------------
 # Position ledger for floating grid mode
 # ----------------------------------------
-class PositionLedger:
-    """Position ledger with path-specific strike support."""
+class VectorizedPositionLedger:
+    """Fully vectorized position ledger - stores all positions as tensors."""
     
     def __init__(self, M: int, device: torch.device):
         self.M = M
         self.device = device
-        self.positions = [[] for _ in range(M)]
-    
+        
+        # All positions stored as 1D tensors (will grow dynamically)
+        self.path_indices = torch.empty(0, dtype=torch.long, device=device)
+        self.quantities = torch.empty(0, dtype=torch.float32, device=device)
+        self.strikes = torch.empty(0, dtype=torch.float32, device=device)
+        self.expiry_steps = torch.empty(0, dtype=torch.long, device=device)
+        self.created_at_steps = torch.empty(0, dtype=torch.long, device=device)
+        self.original_maturities = torch.empty(0, dtype=torch.long, device=device)
+        self.bucket_indices = torch.empty(0, dtype=torch.long, device=device)
+        self.opening_spots = torch.empty(0, dtype=torch.float32, device=device)
+        
+        # Store single derivative template (all positions use same pricing logic)
+        self.derivative_template = None
+        
     def add_position(
         self, 
         path_idx: int, 
@@ -163,36 +175,31 @@ class PositionLedger:
         S_current: float,
         K_path: float
     ):
-        """
-        Add position for a SINGLE path with path-specific strike.
+        """Add a single position (will be batched internally)."""
+        if self.derivative_template is None:
+            self.derivative_template = derivative_template
         
-        Args:
-            path_idx: Which path (0 to M-1)
-            derivative_template: Derivative object (template for pricing)
-            quantity: Number of contracts (can be negative for short)
-            bucket_idx: Bucket index
-            current_step: Current time step
-            S_current: Spot price for this path
-            K_path: Strike price for this path (path-specific!)
-        """
-        self.positions[path_idx].append({
-            "derivative": derivative_template,
-            "quantity": quantity,
-            "bucket_idx": bucket_idx,
-            "created_at_step": current_step,
-            "expiry_step": current_step + derivative_template.N,
-            "strike": K_path,  # PATH-SPECIFIC STRIKE!
-            "original_maturity_N": derivative_template.N,
-            "opening_spot": S_current,
-        })
+        # Append to tensors
+        self.path_indices = torch.cat([self.path_indices, torch.tensor([path_idx], dtype=torch.long, device=self.device)])
+        self.quantities = torch.cat([self.quantities, torch.tensor([quantity], dtype=torch.float32, device=self.device)])
+        self.strikes = torch.cat([self.strikes, torch.tensor([K_path], dtype=torch.float32, device=self.device)])
+        self.expiry_steps = torch.cat([self.expiry_steps, torch.tensor([current_step + derivative_template.N], dtype=torch.long, device=self.device)])
+        self.created_at_steps = torch.cat([self.created_at_steps, torch.tensor([current_step], dtype=torch.long, device=self.device)])
+        self.original_maturities = torch.cat([self.original_maturities, torch.tensor([derivative_template.N], dtype=torch.long, device=self.device)])
+        self.bucket_indices = torch.cat([self.bucket_indices, torch.tensor([bucket_idx], dtype=torch.long, device=self.device)])
+        self.opening_spots = torch.cat([self.opening_spots, torch.tensor([S_current], dtype=torch.float32, device=self.device)])
     
     def remove_expired(self, current_step: int):
         """Remove positions whose expiry_step <= current_step."""
-        for path_idx in range(self.M):
-            self.positions[path_idx] = [
-                pos for pos in self.positions[path_idx] 
-                if pos["expiry_step"] > current_step
-            ]
+        active_mask = self.expiry_steps > current_step
+        self.path_indices = self.path_indices[active_mask]
+        self.quantities = self.quantities[active_mask]
+        self.strikes = self.strikes[active_mask]
+        self.expiry_steps = self.expiry_steps[active_mask]
+        self.created_at_steps = self.created_at_steps[active_mask]
+        self.original_maturities = self.original_maturities[active_mask]
+        self.bucket_indices = self.bucket_indices[active_mask]
+        self.opening_spots = self.opening_spots[active_mask]
     
     def compute_and_remove_expired(
         self, 
@@ -200,36 +207,47 @@ class PositionLedger:
         current_step: int, 
         h0: float
     ) -> torch.Tensor:
-        """
-        Compute payoffs for positions that expire at or before current_step,
-        remove them from ledger, and return the per-path total payoffs.
-        """
+        """Compute payoffs for expired positions and remove them. VECTORIZED."""
         payoffs = torch.zeros(self.M, device=self.device)
         
-        for path_idx in range(self.M):
-            expired = []
-            remaining = []
-            
-            for pos in self.positions[path_idx]:
-                if pos["expiry_step"] <= current_step:
-                    expired.append(pos)
-                else:
-                    remaining.append(pos)
-            
-            # Compute payoffs for expired options
-            for pos in expired:
-                S_path = float(S_current[path_idx].item())
-                K = pos["strike"]  # Use path-specific strike!
-                opt_type = getattr(pos["derivative"], "option_type", "call").lower()
-                
-                if opt_type == "call":
-                    payoff = max(S_path - K, 0.0)
-                else:
-                    payoff = max(K - S_path, 0.0)
-                
-                payoffs[path_idx] += pos["quantity"] * payoff
-            
-            self.positions[path_idx] = remaining
+        if len(self.expiry_steps) == 0:
+            return payoffs
+        
+        # Find expired positions
+        expired_mask = self.expiry_steps <= current_step
+        
+        if expired_mask.sum() == 0:
+            return payoffs
+        
+        # Get data for expired positions
+        expired_paths = self.path_indices[expired_mask]
+        expired_quantities = self.quantities[expired_mask]
+        expired_strikes = self.strikes[expired_mask]
+        
+        # Get spot prices for expired positions (vectorized indexing)
+        expired_spots = S_current[expired_paths]
+        
+        # Compute payoffs (vectorized)
+        opt_type = getattr(self.derivative_template, "option_type", "call").lower()
+        if opt_type == "call":
+            intrinsic_values = torch.clamp(expired_spots - expired_strikes, min=0.0)
+        else:
+            intrinsic_values = torch.clamp(expired_strikes - expired_spots, min=0.0)
+        
+        position_payoffs = expired_quantities * intrinsic_values
+        
+        # Aggregate payoffs per path using scatter_add
+        payoffs.scatter_add_(0, expired_paths, position_payoffs)
+        
+        # Remove expired positions
+        self.path_indices = self.path_indices[~expired_mask]
+        self.quantities = self.quantities[~expired_mask]
+        self.strikes = self.strikes[~expired_mask]
+        self.expiry_steps = self.expiry_steps[~expired_mask]
+        self.created_at_steps = self.created_at_steps[~expired_mask]
+        self.original_maturities = self.original_maturities[~expired_mask]
+        self.bucket_indices = self.bucket_indices[~expired_mask]
+        self.opening_spots = self.opening_spots[~expired_mask]
         
         return payoffs
     
@@ -239,33 +257,102 @@ class PositionLedger:
         current_step: int, 
         h0: float
     ) -> torch.Tensor:
-        """
-        Price all active positions in the ledger (for each path) and return aggregate [M].
-        Uses path-specific strikes stored in each position.
-        """
+        """Price all active positions. FULLY VECTORIZED."""
         portfolio_value = torch.zeros(self.M, device=self.device)
         
-        for path_idx in range(self.M):
-            for pos in self.positions[path_idx]:
-                if pos["expiry_step"] > current_step:
-                    S_path = S_current[path_idx].unsqueeze(0)  # shape [1]
-                    step_idx = current_step - pos["created_at_step"]
-                    
-                    # Validate step_idx is within bounds
-                    if step_idx < 0 or step_idx >= pos["original_maturity_N"]:
-                        continue
-                    
-                    # Price using PATH-SPECIFIC strike
-                    price = pos["derivative"].price(
-                        S=S_path, 
-                        K=pos["strike"],  # Path-specific strike!
-                        step_idx=step_idx,
-                        N=pos["original_maturity_N"],
-                        h0=h0
-                    )
-                    portfolio_value[path_idx] += pos["quantity"] * float(price)
+        if len(self.expiry_steps) == 0 or self.derivative_template is None:
+            return portfolio_value
+        
+        # Filter active positions
+        active_mask = self.expiry_steps > current_step
+        if active_mask.sum() == 0:
+            return portfolio_value
+        
+        active_paths = self.path_indices[active_mask]
+        active_quantities = self.quantities[active_mask]
+        active_strikes = self.strikes[active_mask]
+        active_created = self.created_at_steps[active_mask]
+        active_maturities = self.original_maturities[active_mask]
+        
+        # Get spot prices for active positions (vectorized)
+        active_spots = S_current[active_paths]
+        
+        # Compute step indices
+        step_indices = current_step - active_created
+        
+        # Validate indices
+        valid_mask = (step_indices >= 0) & (step_indices < active_maturities)
+        if valid_mask.sum() == 0:
+            return portfolio_value
+        
+        # Filter to valid positions
+        valid_spots = active_spots[valid_mask]
+        valid_strikes = active_strikes[valid_mask]
+        valid_steps = step_indices[valid_mask]
+        valid_maturities = active_maturities[valid_mask]
+        valid_quantities = active_quantities[valid_mask]
+        valid_paths = active_paths[valid_mask]
+        
+        # BATCH PRICE ALL POSITIONS AT ONCE
+        # Note: This assumes derivative.price() can handle batched inputs
+        # If your derivative class doesn't support this, you'll need to add that capability
+        prices = self._batch_price_positions(
+            valid_spots, valid_strikes, valid_steps, valid_maturities, h0
+        )
+        
+        position_values = valid_quantities * prices
+        
+        # Aggregate per path using scatter_add
+        portfolio_value.scatter_add_(0, valid_paths, position_values)
         
         return portfolio_value
+    
+    def _batch_price_positions(
+        self, 
+        S: torch.Tensor, 
+        K: torch.Tensor, 
+        step_indices: torch.Tensor, 
+        maturities: torch.Tensor, 
+        h0: float
+    ) -> torch.Tensor:
+        """
+        Batch price multiple positions with different parameters.
+        This is the critical optimization - prices all positions in one call.
+        """
+        if self.derivative_template is None:
+            return torch.zeros_like(S)
+        
+        # Group by (step_idx, maturity) to minimize pricing calls
+        unique_configs = torch.stack([step_indices, maturities], dim=1)
+        unique_keys, inverse_indices = torch.unique(unique_configs, dim=0, return_inverse=True)
+        
+        n_positions = len(S)
+        prices = torch.zeros(n_positions, device=self.device)
+        
+        # Price each unique configuration
+        for i in range(len(unique_keys)):
+            mask = inverse_indices == i
+            if mask.sum() == 0:
+                continue
+            
+            step_idx = int(unique_keys[i, 0].item())
+            maturity = int(unique_keys[i, 1].item())
+            
+            S_batch = S[mask]
+            K_batch = K[mask]
+            
+            # Call derivative pricing (should support batched S and K)
+            batch_prices = self.derivative_template.price(
+                S=S_batch,
+                K=K_batch,
+                step_idx=step_idx,
+                N=maturity,
+                h0=h0
+            )
+            
+            prices[mask] = batch_prices
+        
+        return prices
     
     def compute_greeks(
         self, 
@@ -274,38 +361,101 @@ class PositionLedger:
         h0: float, 
         greek_name: str
     ) -> torch.Tensor:
-        """
-        Aggregate a named Greek across all active positions per path.
-        """
+        """Aggregate Greeks across all active positions. VECTORIZED."""
         greeks = torch.zeros(self.M, device=self.device)
         
-        for path_idx in range(self.M):
-            for pos in self.positions[path_idx]:
-                if pos["expiry_step"] > current_step:
-                    S_path = S_current[path_idx].unsqueeze(0)
-                    step_idx = current_step - pos["created_at_step"]
-                    
-                    if step_idx < 0 or step_idx >= pos["original_maturity_N"]:
-                        continue
-                    
-                    greek_method = getattr(pos["derivative"], greek_name)
-                    greek_val = greek_method(
-                        S=S_path, 
-                        K=pos["strike"],  # Path-specific strike!
-                        step_idx=step_idx, 
-                        N=pos["original_maturity_N"], 
-                        h0=h0
-                    )
-                    greeks[path_idx] += float(greek_val)
+        if len(self.expiry_steps) == 0 or self.derivative_template is None:
+            return greeks
+        
+        active_mask = self.expiry_steps > current_step
+        if active_mask.sum() == 0:
+            return greeks
+        
+        active_paths = self.path_indices[active_mask]
+        active_quantities = self.quantities[active_mask]
+        active_strikes = self.strikes[active_mask]
+        active_created = self.created_at_steps[active_mask]
+        active_maturities = self.original_maturities[active_mask]
+        
+        active_spots = S_current[active_paths]
+        step_indices = current_step - active_created
+        
+        valid_mask = (step_indices >= 0) & (step_indices < active_maturities)
+        if valid_mask.sum() == 0:
+            return greeks
+        
+        valid_spots = active_spots[valid_mask]
+        valid_strikes = active_strikes[valid_mask]
+        valid_steps = step_indices[valid_mask]
+        valid_maturities = active_maturities[valid_mask]
+        valid_quantities = active_quantities[valid_mask]
+        valid_paths = active_paths[valid_mask]
+        
+        # Batch compute Greeks (similar to pricing)
+        greek_values = self._batch_compute_greeks(
+            valid_spots, valid_strikes, valid_steps, valid_maturities, h0, greek_name
+        )
+        
+        position_greeks = valid_quantities * greek_values
+        greeks.scatter_add_(0, valid_paths, position_greeks)
+        
+        return greeks
+    
+    def _batch_compute_greeks(
+        self, 
+        S: torch.Tensor, 
+        K: torch.Tensor, 
+        step_indices: torch.Tensor, 
+        maturities: torch.Tensor, 
+        h0: float,
+        greek_name: str
+    ) -> torch.Tensor:
+        """Batch compute Greeks for multiple positions."""
+        if self.derivative_template is None:
+            return torch.zeros_like(S)
+        
+        unique_configs = torch.stack([step_indices, maturities], dim=1)
+        unique_keys, inverse_indices = torch.unique(unique_configs, dim=0, return_inverse=True)
+        
+        n_positions = len(S)
+        greeks = torch.zeros(n_positions, device=self.device)
+        
+        greek_method = getattr(self.derivative_template, greek_name)
+        
+        for i in range(len(unique_keys)):
+            mask = inverse_indices == i
+            if mask.sum() == 0:
+                continue
+            
+            step_idx = int(unique_keys[i, 0].item())
+            maturity = int(unique_keys[i, 1].item())
+            
+            S_batch = S[mask]
+            K_batch = K[mask]
+            
+            batch_greeks = greek_method(
+                S=S_batch,
+                K=K_batch,
+                step_idx=step_idx,
+                N=maturity,
+                h0=h0
+            )
+            
+            greeks[mask] = batch_greeks
         
         return greeks
     
     def get_ledger_size(self) -> torch.Tensor:
-        """Return number of active positions per path."""
-        sizes = torch.tensor(
-            [len(self.positions[path_idx]) for path_idx in range(self.M)], 
-            dtype=torch.float32, 
-            device=self.device
+        """Return number of active positions per path. VECTORIZED."""
+        sizes = torch.zeros(self.M, dtype=torch.float32, device=self.device)
+        if len(self.path_indices) == 0:
+            return sizes
+        
+        # Count positions per path
+        sizes.scatter_add_(
+            0, 
+            self.path_indices, 
+            torch.ones_like(self.path_indices, dtype=torch.float32)
         )
         return sizes
 
@@ -369,7 +519,7 @@ class HedgingEnvGARCH:
                 precomputation_manager=precomp_manager,  # ← Now available!
                 garch_params=garch_params
             )
-            self.position_ledger: Optional[PositionLedger] = None  # created per episode in reset()
+            self.position_ledger: Optional[VectorizedPositionLedger] = None  # created per episode in reset()
             self.hedging_derivatives_static = None
             # For logging/transaction typing
             self.instrument_types_list = ["stock"] + ["vanilla_option"] * self.grid_manager.grid_size
@@ -489,7 +639,7 @@ class HedgingEnvGARCH:
 
         # Reset ledger for floating grid mode
         if self.is_floating_grid:
-            self.position_ledger = PositionLedger(self.M, self.device)
+            self.position_ledger = VectorizedPositionLedger(self.M, self.device)
 
         # Reset barrier statuses if those wrappers exist
         try:
@@ -779,21 +929,19 @@ class HedgingEnvGARCH:
     def _simulate_full_trajectory_floating(self, all_actions: torch.Tensor):
         """
         P&L calculation for floating-grid mode with PATH-SPECIFIC strikes.
-        VECTORIZED VERSION - prices all paths at once per bucket.
+        FULLY VECTORIZED VERSION.
         """
-        ledger = PositionLedger(self.M, self.device)
+        ledger = VectorizedPositionLedger(self.M, self.device)
         S_t = torch.full((self.M,), self.S0, dtype=torch.float32, device=self.device)
         stock_position = torch.zeros(self.M, dtype=torch.float32, device=self.device)
         h_t = self.h_t.clone()
         h0_current = h_t.mean().item()
         
         V0 = self.derivative.price(S=S_t, K=self.K, step_idx=0, N=self.N, h0=h0_current)
-        
-        # Initialize bank account with proceeds from selling/hedging the derivative
         B_t = self.side * V0
         V0_portfolio = self.side * V0
         
-        # Preallocate trajectories
+        # Preallocate trajectories (optimization)
         S_trajectory = torch.zeros(self.M, self.N + 1, dtype=torch.float32, device=self.device)
         B_trajectory = torch.zeros(self.M, self.N + 1, dtype=torch.float32, device=self.device)
         stock_pos_trajectory = torch.zeros(self.M, self.N + 1, dtype=torch.float32, device=self.device)
@@ -809,14 +957,12 @@ class HedgingEnvGARCH:
         soft_constraint_violations = torch.zeros(self.M, device=self.device)
         ledger_size_trajectory = []
         
-        # Check if soft constraint is enabled
         compute_soft_constraint = (
             hasattr(self, 'lambda_constraint') and 
             self.lambda_constraint is not None and 
             self.lambda_constraint > 0
         )
         
-        # Get transaction cost rates
         tcp_stock = self._get_transaction_cost_rate(0)
         
         for t in range(self.N):
@@ -829,7 +975,7 @@ class HedgingEnvGARCH:
             cost_breakdown["stock"] += stock_cost
             stock_position = actions_t[:, 0]
             
-            # ===== OPTION TRADES (VECTORIZED!) =====
+            # ===== OPTION TRADES (VECTORIZED ACROSS BUCKETS) =====
             for bucket_idx in range(1, self.n_hedging_instruments):
                 trade_qty = torch.round(actions_t[:, bucket_idx])
                 trade_qty = torch.where(
@@ -838,18 +984,16 @@ class HedgingEnvGARCH:
                     trade_qty
                 )
                 
-                # Skip if no trades
                 if trade_qty.abs().sum() < 1e-6:
                     continue
                 
-                # Get bucket parameters (moneyness and maturity)
                 moneyness, maturity_days = self.grid_manager.get_bucket_params(bucket_idx - 1)
                 tcp_option = self._get_transaction_cost_rate(bucket_idx)
                 
                 # VECTORIZED: Compute strikes for ALL paths at once
-                K_paths = moneyness * S_t  # [M] strikes
+                K_paths = moneyness * S_t  # [M]
                 
-                # Create derivative template (just for pricing methods)
+                # Create derivative template
                 from src.option_greek.vanilla import VanillaOption
                 deriv_template = VanillaOption(
                     precomputation_manager=self.derivative.precomp_manager,
@@ -859,21 +1003,21 @@ class HedgingEnvGARCH:
                 deriv_template.N = maturity_days
                 deriv_template.created_at_step = t
                 
-                # VECTORIZED: Price ALL paths at once [M]
+                # VECTORIZED: Price ALL paths at once
                 option_prices = deriv_template.price(
-                    S=S_t,  # [M]
-                    K=K_paths,  # [M] - path-specific strikes!
+                    S=S_t,
+                    K=K_paths,
                     step_idx=0,
                     N=maturity_days,
                     h0=h0_current
-                )  # Returns [M]
+                )
                 
-                # VECTORIZED: Compute costs and update bank account
+                # VECTORIZED: Compute costs and update bank
                 option_costs = tcp_option * trade_qty.abs() * option_prices
                 B_t -= trade_qty * option_prices + option_costs
                 cost_breakdown["vanilla_option"] += option_costs
                 
-                # Add positions to ledger (only for non-zero trades)
+                # Add positions to ledger (still needs loop but batched internally)
                 nonzero_mask = trade_qty.abs() > 1e-6
                 nonzero_indices = torch.where(nonzero_mask)[0]
                 
@@ -899,12 +1043,12 @@ class HedgingEnvGARCH:
             dt = 1.0 / self.N
             B_t = B_t * torch.exp(torch.tensor(self.r * 252.0, device=self.device) * dt)
             
-            # ===== EXPIRATIONS: Realize payoffs for expired positions =====
+            # ===== EXPIRATIONS: Realize payoffs (VECTORIZED) =====
             h0_current = h_t.mean().item()
             expired_payoffs = ledger.compute_and_remove_expired(S_t, t + 1, h0_current)
             B_t += expired_payoffs
             
-            # ===== SOFT CONSTRAINT (optional) =====
+            # ===== SOFT CONSTRAINT (VECTORIZED) =====
             if compute_soft_constraint:
                 portfolio_value = ledger.compute_total_value(S_t, t + 1, h0_current)
                 P_t = B_t + stock_position * S_t + portfolio_value
@@ -931,13 +1075,11 @@ class HedgingEnvGARCH:
             payoff = torch.clamp(S_t - self.K, min=0.0)
         payoff = payoff * self.contract_size
         
-        # ===== TERMINAL PORTFOLIO VALUE =====
-        # Mark-to-market any remaining options (shouldn't be many if all expire by N)
+        # ===== TERMINAL PORTFOLIO VALUE (VECTORIZED) =====
         portfolio_value_final = ledger.compute_total_value(S_t, self.N, h_t.mean().item())
         terminal_value = B_t + stock_position * S_t + portfolio_value_final
         terminal_error = terminal_value - self.side * payoff
         
-        # ===== RETURN RESULTS =====
         trajectories = {
             "S": S_trajectory,
             "B": B_trajectory,
