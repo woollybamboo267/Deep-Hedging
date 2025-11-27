@@ -2,15 +2,14 @@
 # Designed to prevent explosion and promote stability
 
 model:
-  hidden_size: 32
+  hidden_size: 64
   num_lstm_blocks: 4
   obs_dim: 5
   use_action_recurrence: true
-  max_option_contracts: 1.0  # ← CRITICAL: Start with just 1 contract maximum
 
 training:
   learning_rate: 0.00001  # ← VERY LOW to prevent explosion
-  optimizer: AdamW
+  optimizer: Adam
   gradient_clip_max_norm: 0.1  # ← VERY AGGRESSIVE clipping
   weight_decay: 0.0001
   episodes: 300
@@ -21,7 +20,7 @@ training:
   batch_size: 1000
   num_epochs: 400
   gamma: 0.99999
-  entropy_coefficient: 0.5
+  entropy_coefficient: 1
 
 simulation:
   M: 500  # ← REDUCED from 1000 to speed up debugging
@@ -50,7 +49,7 @@ instruments:
     moneyness_levels: [0.8, 1.0, 1.1]
     maturity_days: [120, 252, 378]
     option_type: "call"
-    sparsity_penalty: 10.0  # ← VERY STRONG penalty to discourage trading
+    sparsity_penalty: .01  # ← VERY STRONG penalty to discourage trading
     min_trade_size: 1.0  # ← Only trade full contracts
 
 garch:
