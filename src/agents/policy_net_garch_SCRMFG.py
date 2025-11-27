@@ -176,7 +176,7 @@ class PolicyNetGARCH(nn.Module):
             # Apply symexp activation
             out = symexp(out)
             # Apply position limits - ALL instruments get limits
-            out = torch.clamp(out)  # Consistent limits
+            out = torch.clamp(out, min=-100, max=100)  # Consistent limits
             outputs.append(out)
         
         return outputs, hidden_states
