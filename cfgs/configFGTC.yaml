@@ -49,7 +49,7 @@ instruments:
     moneyness_levels: [0.8, 1.0, 1.1]
     maturity_days: [120, 252, 378]
     option_type: "call"
-    sparsity_penalty: .01  # ← VERY STRONG penalty to discourage trading
+    sparsity_penalty: .1  # ← VERY STRONG penalty to discourage trading
     min_trade_size: 1.0  # ← Only trade full contracts
 
 garch:
