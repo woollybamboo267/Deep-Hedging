@@ -1,15 +1,35 @@
-# Mueller et al. (2024) Architecture Configuration
-environment:
-  dt_min: 1.0e-10
+# Ultra-Conservative Mueller et al. (2024) Configuration
+# Designed to prevent explosion and promote stability
 
-garch:
-  alpha: 2.308475e-06
-  beta: 0.689984
-  gamma: 342.870019
-  h0: 5.14e-07
-  lambda: 0.420499
-  omega: 1.593749e-07
-  sigma0: 0.127037
+model:
+  hidden_size: 32
+  num_lstm_blocks: 4
+  obs_dim: 5
+  use_action_recurrence: true
+  max_option_contracts: 1.0  # ← CRITICAL: Start with just 1 contract maximum
+
+training:
+  learning_rate: 0.00001  # ← VERY LOW to prevent explosion
+  optimizer: AdamW
+  gradient_clip_max_norm: 0.1  # ← VERY AGGRESSIVE clipping
+  weight_decay: 0.0001
+  episodes: 300
+  seed: 78020349
+  device: cuda
+  checkpoint_frequency: 25
+  plot_frequency: 100
+  batch_size: 256
+  num_epochs: 400
+  gamma: 0.99999
+  entropy_coefficient: 0.5
+
+simulation:
+  M: 500  # ← REDUCED from 1000 to speed up debugging
+  N: 252
+  S0: 100
+  T: 1.0
+  contract_size: 1
+  r: 0.04
 
 hedged_option:
   K: 100
@@ -30,54 +50,20 @@ instruments:
     moneyness_levels: [0.8, 1.0, 1.1]
     maturity_days: [120, 252, 378]
     option_type: "call"
-    sparsity_penalty: 0.0001
-    min_trade_size: 0.5
+    sparsity_penalty: 100.0  # ← VERY STRONG penalty to discourage trading
+    min_trade_size: 1.0  # ← Only trade full contracts
 
-logging:
-  level: INFO
-  log_file: null
+garch:
+  alpha: 2.308475e-06
+  beta: 0.689984
+  gamma: 342.870019
+  h0: 5.14e-07
+  lambda: 0.420499
+  omega: 1.593749e-07
+  sigma0: 0.127037
 
-model:
-  hidden_size: 32  # ← CRITICAL: Mueller uses 32, not 256!
-  num_lstm_blocks: 4  # ← CRITICAL: Mueller uses 4 residual blocks
-  obs_dim: 5
-  use_action_recurrence: true
-  max_option_contracts: 10.0
-
-output:
-  checkpoint_path: policy_net_floating_grid.pth
-  model_save_path: policy_net_floating_grid.pth
-  plot_dpi: 150
-  plot_save_path: hedge_comparison_floating_ep{episode}.png
-  sample_path_index: 1
-
-precomputation:
-  N_quad: 256
-  device: cuda
-  u_max: 500.0
-
-simulation:
-  M: 1000
-  N: 252
-  S0: 100
-  T: 1.0
-  contract_size: 1
-  r: 0.04
-
-training:
-  batch_size: 256
-  checkpoint_frequency: 25
-  device: cuda
-  entropy_coefficient: 0.5
-  episodes: 300
-  gamma: 0.99999
-  gradient_clip_max_norm: 1.0  # ← CRITICAL: Aggressive clipping for stability
-  learning_rate: 0.0005  # ← REDUCED from 0.01 for stability
-  num_epochs: 400
-  optimizer: AdamW
-  plot_frequency: 100
-  seed: 78020349
-  weight_decay: 1.0e-04
+environment:
+  dt_min: 1.0e-10
 
 transaction_costs:
   TC: false
@@ -88,3 +74,19 @@ risk_measure:
 soft_constraint:
   enabled: false
   lambda: 0.0
+
+precomputation:
+  N_quad: 256
+  device: cuda
+  u_max: 500.0
+
+logging:
+  level: INFO
+  log_file: null
+
+output:
+  checkpoint_path: policy_net_floating_grid.pth
+  model_save_path: policy_net_floating_grid.pth
+  plot_dpi: 150
+  plot_save_path: hedge_comparison_floating_ep{episode}.png
+  sample_path_index: 1
