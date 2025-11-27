@@ -42,7 +42,7 @@ hedged_option:
 
 instruments:
   mode: "floating_grid"
-  n_hedging_instruments: 10
+  n_hedging_instruments: 26
   
   floating_grid:
     enabled: true
