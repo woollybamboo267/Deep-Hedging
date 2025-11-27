@@ -23,7 +23,7 @@ training:
   entropy_coefficient: 1
 
 simulation:
-  M: 500  # ← REDUCED from 1000 to speed up debugging
+  M: 1000  # ← REDUCED from 1000 to speed up debugging
   N: 252
   S0: 100
   T: 1.0
@@ -46,11 +46,11 @@ instruments:
   
   floating_grid:
     enabled: true
-    moneyness_levels: [0.8, 1.0, 1.1]
-    maturity_days: [120, 252, 378]
+    moneyness_levels: [0.8, .9, 1.0, 1.1, 1.2]
+    maturity_days: [120, 160, 252, 300, 378]
     option_type: "call"
-    sparsity_penalty: .1  # ← VERY STRONG penalty to discourage trading
-    min_trade_size: 1.0  # ← Only trade full contracts
+    sparsity_penalty: 0  # ← VERY STRONG penalty to discourage trading
+    min_trade_size: 0  # ← Only trade full contracts
 
 garch:
   alpha: 2.308475e-06
