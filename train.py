@@ -601,20 +601,7 @@ def train_episode(
 ) -> Dict[str, Any]:
     """
     Train for a single episode with Mueller et al. (2024) architecture.
-    
-    Args:
-        episode: Current episode number
-        config: Configuration dictionary
-        policy_net: Mueller policy network with residual LSTM blocks
-        optimizer: Optimizer instance
-        hedged_derivative: Derivative being hedged
-        hedging_derivatives: List of hedging instruments (None for floating grid)
-        HedgingSim: Simulation class
-        device: torch.device
-        precomputation_manager: Manager for precomputed option prices
-    
-    Returns:
-        Dictionary containing episode metrics and trajectories
+    Uses FULL BPTT without action/hidden state detachment.
     """
     
     hedged_cfg = config["hedged_option"]
@@ -629,7 +616,7 @@ def train_episode(
     constraint_config = config.get("soft_constraint", {"enabled": False, "lambda": 0.0})
     
     risk_measure = risk_config.get("type", "mse")
-    alpha = risk_config.get("alpha", None)  # Only needed for CVaR/VaR
+    alpha = risk_config.get("alpha", None)
     lambda_constraint = constraint_config.get("lambda", 0.0) if constraint_config.get("enabled", False) else 0.0
     
     # Get sparsity penalty for floating grid mode
@@ -667,11 +654,10 @@ def train_episode(
         precomputation_manager=precomputation_manager
     )
 
-    # Reset environment (resets GARCH state, random shocks, ledger)
+    # Reset environment
     env.reset()
     
-    # Simulate trajectory using policy network
-    # This handles action recurrence internally via the Mueller architecture
+    # Simulate trajectory using policy network (FULL BPTT - no detachment!)
     S_traj, V_traj, O_traj, obs_sequence, RL_actions = \
         env.simulate_trajectory_and_get_observations(policy_net)
     
@@ -700,7 +686,7 @@ def train_episode(
             total_grad_norm += p.grad.norm().item() ** 2
     total_grad_norm = total_grad_norm ** 0.5
     
-    # Gradient clipping to prevent exploding gradients
+    # CRITICAL: Aggressive gradient clipping (Mueller uses 1.0 for Adam)
     torch.nn.utils.clip_grad_norm_(
         policy_net.parameters(),
         max_norm=config["training"]["gradient_clip_max_norm"]
@@ -708,7 +694,7 @@ def train_episode(
     
     optimizer.step()
     
-    # Check for NaN/Inf (critical for stability)
+    # Check for NaN/Inf AFTER gradient clipping
     if torch.isnan(total_loss) or torch.isinf(total_loss):
         logging.error(f"Loss became NaN/Inf at episode {episode}")
         raise RuntimeError("Loss became NaN/Inf")
@@ -764,7 +750,6 @@ def train_episode(
         "lambda_constraint": lambda_constraint,
         "grad_norm": total_grad_norm
     }
-
 
 def main():
     """Main entry point."""
