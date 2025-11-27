@@ -68,7 +68,8 @@ transaction_costs:
   TC: true
 
 risk_measure:
-  type: mse
+  type: cvar
+  alpha: .90
 
 soft_constraint:
   enabled: false
