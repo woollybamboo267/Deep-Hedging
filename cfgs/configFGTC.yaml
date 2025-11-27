@@ -50,7 +50,7 @@ instruments:
     moneyness_levels: [0.8, 1.0, 1.1]
     maturity_days: [120, 252, 378]
     option_type: "call"
-    sparsity_penalty: 100.0  # ← VERY STRONG penalty to discourage trading
+    sparsity_penalty: 10.0  # ← VERY STRONG penalty to discourage trading
     min_trade_size: 1.0  # ← Only trade full contracts
 
 garch:
@@ -66,7 +66,7 @@ environment:
   dt_min: 1.0e-10
 
 transaction_costs:
-  TC: false
+  TC: true
 
 risk_measure:
   type: mse
