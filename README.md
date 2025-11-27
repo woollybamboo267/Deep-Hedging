@@ -50,7 +50,8 @@ Deep-Hedging/
 │
 ├── visual-results/                # Generated visualizations
 │   ├── barrier/                   # Barrier option results
-│   └── european/                  # European option results
+│   ├── european/                  # European option results
+|   └── american/                  # American option results
 │
 ├── derivative_factory.py          # Factory for derivative instruments
 ├── train.py                       # Main training script
