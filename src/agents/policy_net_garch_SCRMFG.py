@@ -145,8 +145,8 @@ class PolicyNetGARCH(nn.Module):
         if hidden_states is None:
             hidden_states = [
                 (
-                    torch.zeros(batch_size, self.hidden_size, device=x.device),
-                    torch.zeros(batch_size, self.hidden_size, device=x.device)
+                    torch.zeros(batch_size, self.hidden_size, device=x.device, requires_grad=True),
+                    torch.zeros(batch_size, self.hidden_size, device=x.device, requires_grad=True)
                 )
                 for _ in range(len(self.lstm_blocks))
             ]
