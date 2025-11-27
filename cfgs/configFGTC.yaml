@@ -1,5 +1,3 @@
-# config_floating_grid.yaml
-
 environment:
   dt_min: 1.0e-10
 
@@ -23,13 +21,13 @@ hedged_option:
   type: barrier
 
 instruments:
-  mode: "floating_grid"  # or "static" for backward compatibility
-  n_hedging_instruments: 10  # 1 stock + 30 options (5 moneyness × 6 maturities)
+  mode: "floating_grid"
+  n_hedging_instruments: 10
   
   floating_grid:
     enabled: true
-    moneyness_levels: [0.8, 1.0, 1.1]  # 5 levels
-    maturity_days: [120, 252, 378]  # 5 maturities
+    moneyness_levels: [0.8, 1.0, 1.1]
+    maturity_days: [120, 252, 378]
     option_type: "call"
     sparsity_penalty: 0.0001
     min_trade_size: 0.5
@@ -39,11 +37,10 @@ logging:
   log_file: null
 
 model:
-  hidden_size: 512
-  lstm_layers: 2
-  num_layers: 2
-  obs_dim: 5  # Changed from 5 to 9 for floating grid
-  use_action_recurrence: true  # ← ADD THIS LINE
+  hidden_size: 256  # ← REDUCED from 512
+  num_lstm_blocks: 2  # ← REDUCED from 4
+  obs_dim: 5
+  use_action_recurrence: true
 
 output:
   checkpoint_path: policy_net_floating_grid.pth
@@ -54,11 +51,11 @@ output:
 
 precomputation:
   N_quad: 256
-  device: cpu
+  device: cuda
   u_max: 500.0
 
 simulation:
-  M: 1000
+  M: 1000  # ← REDUCED from 1000
   N: 252
   S0: 100
   T: 1.0
@@ -66,7 +63,7 @@ simulation:
   r: 0.04
 
 training:
-  batch_size: 1000
+  batch_size: 256
   checkpoint_frequency: 25
   device: cuda
   entropy_coefficient: 0.5
@@ -84,8 +81,7 @@ transaction_costs:
   TC: false
 
 risk_measure:
-  type: mse  # or 'smse', 'cvar', 'var', 'mae'
-  # alpha: 0.95  # Only needed for cvar/var
+  type: mse
 
 soft_constraint:
   enabled: false
