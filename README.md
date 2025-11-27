@@ -77,7 +77,7 @@ Examples:
 
 ## Example Visualization
 
-### Delta Hedging
+### Delta Hedging A Up-and-In Barrier Call Option
 ![Delta Hedging Results](visual-results/barrier/1inst/NoTC/CVAR/BDTCX.png)
 
 ## Models
