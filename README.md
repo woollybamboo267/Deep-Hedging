@@ -77,7 +77,7 @@ Examples:
 ## Example Visualization
 
 ### Delta Hedging
-![Delta Hedging Results](visual-results/european/TC/D.png)
+![Delta Hedging Results](visual-results/barrier/1inst/NoTC/CVAR/BDTCX.png)
 
 ## Models
 
