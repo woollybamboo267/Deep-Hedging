@@ -602,6 +602,8 @@ def train_episode(
     """
     Train for a single episode with Mueller et al. (2024) architecture.
     Uses FULL BPTT without action/hidden state detachment.
+    
+    ADDED: Extensive diagnostics to understand what's happening.
     """
     
     hedged_cfg = config["hedged_option"]
@@ -661,8 +663,20 @@ def train_episode(
     S_traj, V_traj, O_traj, obs_sequence, RL_actions = \
         env.simulate_trajectory_and_get_observations(policy_net)
     
+    # DIAGNOSTIC: Check action magnitudes
+    stock_actions = RL_actions[:, :, 0]
+    option_actions = RL_actions[:, :, 1:]
+    
+    logging.debug(f"Episode {episode} - Action Stats:")
+    logging.debug(f"  Stock: mean={stock_actions.mean().item():.2f}, max={stock_actions.abs().max().item():.2f}")
+    logging.debug(f"  Options: mean={option_actions.mean().item():.2f}, max={option_actions.abs().max().item():.2f}")
+    
     # Compute full P&L trajectory with transaction costs
     terminal_errors, trajectories = env.simulate_full_trajectory(RL_actions, O_traj)
+    
+    # DIAGNOSTIC: Check terminal errors
+    logging.debug(f"  Terminal errors: mean={terminal_errors.mean().item():.2f}, std={terminal_errors.std().item():.2f}")
+    logging.debug(f"  Terminal errors: min={terminal_errors.min().item():.2f}, max={terminal_errors.max().item():.2f}")
     
     # Backpropagation
     optimizer.zero_grad()
@@ -677,16 +691,38 @@ def train_episode(
         lambda_sparsity=lambda_sparsity
     )
     
+    # SAFETY CHECK: If loss is exploding, skip this update
+    if total_loss.item() > 1e6:
+        logging.warning(f"Episode {episode}: Loss too large ({total_loss.item():.2e}), skipping update")
+        return {
+            "episode": episode,
+            "loss": total_loss.item(),
+            "risk_loss": risk_loss.item(),
+            "constraint_penalty": constraint_penalty.item(),
+            "sparsity_penalty": sparsity_penalty.item(),
+            "reward": -float(total_loss.item()),
+            "trajectories": trajectories,
+            "RL_positions": RL_actions,
+            "S_traj": S_traj,
+            "V_traj": V_traj,
+            "O_traj": O_traj,
+            "env": env,
+            "risk_measure": risk_measure,
+            "lambda_constraint": lambda_constraint,
+            "grad_norm": 0.0,
+            "skipped": True
+        }
+    
     total_loss.backward()
     
-    # Gradient diagnostics (helpful for debugging)
+    # Gradient diagnostics
     total_grad_norm = 0.0
     for p in policy_net.parameters():
         if p.grad is not None:
             total_grad_norm += p.grad.norm().item() ** 2
     total_grad_norm = total_grad_norm ** 0.5
     
-    # CRITICAL: Aggressive gradient clipping (Mueller uses 1.0 for Adam)
+    # CRITICAL: Very aggressive gradient clipping
     torch.nn.utils.clip_grad_norm_(
         policy_net.parameters(),
         max_norm=config["training"]["gradient_clip_max_norm"]
@@ -748,7 +784,8 @@ def train_episode(
         "env": env,
         "risk_measure": risk_measure,
         "lambda_constraint": lambda_constraint,
-        "grad_norm": total_grad_norm
+        "grad_norm": total_grad_norm,
+        "skipped": False
     }
 
 def main():
