@@ -255,8 +255,7 @@ def create_policy_network(config: Dict[str, Any], device: torch.device) -> Polic
         hidden_size=model_config.get("hidden_size", 32),  # Mueller uses 32!
         n_hedging_instruments=config["instruments"]["n_hedging_instruments"],
         num_lstm_blocks=model_config.get("num_lstm_blocks", 4),  # 4 residual blocks
-        use_action_recurrence=use_action_recurrence,
-        max_option_contracts=model_config.get("max_option_contracts", 10.0)
+        use_action_recurrence=use_action_recurrence
     ).to(device)
     
     logging.info(
