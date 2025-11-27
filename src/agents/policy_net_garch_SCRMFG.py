@@ -116,7 +116,7 @@ class PolicyNetGARCH(nn.Module):
             nn.init.zeros_(head.bias)
 
     def forward(
-        self, 
+        self,
         obs_sequence: torch.Tensor,
         prev_actions: Optional[torch.Tensor] = None,
         hidden_states: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
@@ -126,7 +126,6 @@ class PolicyNetGARCH(nn.Module):
             obs_sequence: [batch, seq_len, obs_dim]
             prev_actions: [batch, seq_len, n_instruments]
             hidden_states: List of (h, c) for each LSTM block
-        
         Returns:
             outputs: List of [batch, seq_len] per instrument
             new_hidden_states: List of (h, c) per block
@@ -154,7 +153,6 @@ class PolicyNetGARCH(nn.Module):
         
         # Process through residual LSTM blocks sequentially over time
         outputs_per_timestep = []
-        
         for t in range(seq_len):
             x_t = x[:, t, :]  # [batch, hidden_size]
             
@@ -175,23 +173,14 @@ class PolicyNetGARCH(nn.Module):
         outputs = []
         for i, head in enumerate(self.instrument_heads):
             out = head(x).squeeze(-1)  # [batch, seq_len]
-            
             # Apply symexp activation
             out = symexp(out)
-            
-            # Apply position limits
-            if i == 0:
-                # Stock: reasonable hedge ratios
-                out = torch.clamp(out, min=-5.0, max=5.0)
-            else:
-                # Options: no hard limit, just symexp output
-                # The network learns appropriate scales through training
-                pass
-            
+            # Apply position limits - ALL instruments get limits
+            out = torch.clamp(out, min=-5.0, max=5.0)  # Consistent limits
             outputs.append(out)
         
         return outputs, hidden_states
-# ----------------------------------------
+    # ----------------------------------------
 # Floating grid manager
 # ----------------------------------------
 class FloatingGridManager:
@@ -881,47 +870,52 @@ class HedgingEnvGARCH:
         all_positions = torch.stack(all_positions, dim=1)  # [M, N+1, n_instruments]
         obs_sequence = torch.cat(obs_list, dim=1)  # [M, N+1, obs_dim]
         return S_trajectory, V_trajectory, O_trajectories, obs_sequence, all_positions
-    
     def _simulate_floating_grid(self, policy_net: PolicyNetGARCH):
         """
-        Floating grid simulation with FULL BPTT (Mueller et al. 2024 approach).
-        NO detachment of actions or hidden states - only detach environment dynamics.
-        
-        ADDED: Safety checks to prevent position explosion.
+        Floating grid simulation with FULL BPTT.
+        NO detachment anywhere - gradients flow through everything.
+        FIXED: Unified action semantics (all actions are target positions).
         """
         S_trajectory = []
         V_trajectory = []
         obs_list = []
         all_actions = []
-    
+        
         # Initialize ledger and state
         ledger = VectorizedPositionLedger(self.M, self.device)
         S_t = torch.full((self.M,), self.S0, dtype=torch.float32, device=self.device)
         h_t = self.h_t.clone()
-        stock_position = torch.zeros(self.M, dtype=torch.float32, device=self.device)
-    
-        S_trajectory.append(S_t.clone())
-        h0_current = h_t.mean().item()
-        V0 = self.derivative.price(S=S_t, K=self.K, step_idx=0, N=self.N, h0=h0_current)
-        V_trajectory.append(V0)
-    
-        # Initial observation
-        obs_t = torch.zeros((self.M, 1, self.obs_dim), dtype=torch.float32, device=self.device)
-        obs_t[:, 0, 0] = 0.0  # time (normalized)
-        obs_t[:, 0, 1] = S_t  # current spot
-        obs_t[:, 0, 2] = self.S0  # previous spot (t=0 use S0)
-        obs_t[:, 0, 3] = torch.sqrt(h_t)  # volatility
-        obs_t[:, 0, 4] = V0  # derivative value
-        obs_list.append(obs_t)
-    
-        # Initialize previous actions as zeros for t=0
-        prev_actions_t = torch.zeros(
-            (self.M, 1, self.n_hedging_instruments), 
+        
+        # Track current positions (ALL instruments including stock)
+        current_positions = torch.zeros(
+            (self.M, self.n_hedging_instruments), 
             dtype=torch.float32, 
             device=self.device
         )
-    
-        # Get initial actions - NO torch.no_grad() here!
+        
+        S_trajectory.append(S_t.clone())
+        h0_current = h_t.mean().item()
+        
+        V0 = self.derivative.price(S=S_t, K=self.K, step_idx=0, N=self.N, h0=h0_current)
+        V_trajectory.append(V0)
+        
+        # Initial observation - FIXED: normalize all features
+        obs_t = torch.zeros((self.M, 1, self.obs_dim), dtype=torch.float32, device=self.device)
+        obs_t[:, 0, 0] = 0.0  # time (normalized)
+        obs_t[:, 0, 1] = S_t / self.K  # moneyness
+        obs_t[:, 0, 2] = S_t / self.K  # previous moneyness (t=0 use current)
+        obs_t[:, 0, 3] = torch.sqrt(h_t) / self.sigma0  # normalized volatility
+        obs_t[:, 0, 4] = V0 / (self.K * self.contract_size)  # normalized value
+        obs_list.append(obs_t)
+        
+        # Initialize previous actions as zeros for t=0
+        prev_actions_t = torch.zeros(
+            (self.M, 1, self.n_hedging_instruments),
+            dtype=torch.float32,
+            device=self.device
+        )
+        
+        # Get initial actions - NO detachment
         if policy_net.use_action_recurrence:
             outputs, hidden_states = policy_net(obs_t, prev_actions_t, None)
         else:
@@ -929,29 +923,39 @@ class HedgingEnvGARCH:
         
         actions_t = torch.stack([out[:, 0] for out in outputs], dim=-1)  # [M, n_instruments]
         all_actions.append(actions_t)
-    
+        
         # Track cumulative positions per path for safety
         cumulative_positions_per_path = torch.zeros(self.M, device=self.device)
-        MAX_POSITIONS_PER_PATH = 50  # Hard safety limit
-    
+        MAX_POSITIONS_PER_PATH = 50
+        
         # Main loop
         for t in range(self.N):
-            # Execute actions from previous output
-            actions_prev = all_actions[-1]
-    
-            # Stock semantics: interpret as target position
-            stock_trade = actions_prev[:, 0] - stock_position
-            stock_position = actions_prev[:, 0]
-    
-            # Options: treat actions_prev[:, i] (i>=1) as immediate trade quantities (rounded)
+            S_prev = S_t.clone()  # Store for observation
+            
+            # Get target positions from previous output
+            target_positions = all_actions[-1]  # [M, n_instruments]
+            
+            # UNIFIED ACTION SEMANTICS: All actions are target positions
+            # Compute trades as delta from current positions
+            trades = target_positions - current_positions  # [M, n_instruments]
+            
+            # Stock trade (index 0) - no rounding
+            stock_trade = trades[:, 0]
+            current_positions[:, 0] = target_positions[:, 0]
+            
+            # Option trades (indices 1+) - apply rounding and min trade size
             for bucket_idx in range(1, self.n_hedging_instruments):
-                trade_qty = torch.round(actions_prev[:, bucket_idx])
+                trade_qty = torch.round(trades[:, bucket_idx])
+                
                 # Suppress small trades
                 trade_qty = torch.where(
-                    trade_qty.abs() < self.min_trade_size, 
-                    torch.zeros_like(trade_qty), 
+                    trade_qty.abs() < self.min_trade_size,
+                    torch.zeros_like(trade_qty),
                     trade_qty
                 )
+                
+                # Update current position
+                current_positions[:, bucket_idx] = current_positions[:, bucket_idx] + trade_qty
                 
                 if trade_qty.abs().sum() > 1e-6:
                     # Get bucket parameters
@@ -972,8 +976,6 @@ class HedgingEnvGARCH:
                     
                     # Check for positions limit per path
                     nonzero_mask = trade_qty.abs() > 1e-6
-                    
-                    # SAFETY CHECK: Don't add positions if path already has too many
                     safe_mask = nonzero_mask & (cumulative_positions_per_path < MAX_POSITIONS_PER_PATH)
                     
                     if safe_mask.sum() > 0:
@@ -982,10 +984,8 @@ class HedgingEnvGARCH:
                             quantities=trade_qty[safe_mask],
                             strikes=K_paths[safe_mask],
                             expiry_steps=torch.full(
-                                (safe_mask.sum(),), 
-                                t + maturity_days, 
-                                dtype=torch.long, 
-                                device=self.device
+                                (safe_mask.sum(),), t + maturity_days,
+                                dtype=torch.long, device=self.device
                             ),
                             created_at_step=t,
                             original_maturity=maturity_days,
@@ -993,44 +993,40 @@ class HedgingEnvGARCH:
                             opening_spots=S_t[safe_mask],
                             derivative_template=deriv_template
                         )
-                        # Update position counter
                         cumulative_positions_per_path[safe_mask] += 1
-    
-            # Evolve GARCH and stock - DETACH ONLY ENVIRONMENT DYNAMICS
-            with torch.no_grad():
-                sqrt_h = torch.sqrt(h_t)
-                h_t = self.omega + self.beta * h_t + self.alpha * (self.Z[:, t] - self.gamma * sqrt_h) ** 2
-                h_t = torch.clamp(h_t, min=1e-12)
-                r_t = (self.r + self.lambda_ * h_t - 0.5 * h_t) + torch.sqrt(h_t) * self.Z[:, t]
-                S_t = S_t * torch.exp(r_t)
-    
+            
+            # ===== CRITICAL FIX: NO torch.no_grad() - Full BPTT =====
+            # Evolve GARCH and stock WITH gradients
+            sqrt_h = torch.sqrt(h_t)
+            h_t = self.omega + self.beta * h_t + self.alpha * (self.Z[:, t] - self.gamma * sqrt_h) ** 2
+            h_t = torch.clamp(h_t, min=1e-12)
+            r_t = (self.r + self.lambda_ * h_t - 0.5 * h_t) + torch.sqrt(h_t) * self.Z[:, t]
+            S_t = S_t * torch.exp(r_t)
+            
             # Remove expired positions
             ledger.remove_expired(t + 1)
-            
-            # Update position counter (subtract expired)
-            # This is approximate but prevents unbounded growth
             cumulative_positions_per_path = torch.clamp(cumulative_positions_per_path - 0.5, min=0)
-    
+            
             # Price current hedged derivative
             h0_current = h_t.mean().item()
             V_t = self.derivative.price(S=S_t, K=self.K, step_idx=t + 1, N=self.N, h0=h0_current)
+            
             S_trajectory.append(S_t.clone())
             V_trajectory.append(V_t)
-    
-            # Build observation for next iteration
+            
+            # Build observation for next iteration - FIXED: proper normalization
             time_val = (t + 1) / self.N
             obs_new = torch.zeros((self.M, 1, self.obs_dim), dtype=torch.float32, device=self.device)
             obs_new[:, 0, 0] = time_val
-            obs_new[:, 0, 1] = S_t
-            obs_new[:, 0, 2] = S_trajectory[-2]  # previous spot
-            obs_new[:, 0, 3] = torch.sqrt(h_t)
-            obs_new[:, 0, 4] = V_t
+            obs_new[:, 0, 1] = S_t / self.K  # current moneyness
+            obs_new[:, 0, 2] = S_prev / self.K  # previous moneyness
+            obs_new[:, 0, 3] = torch.sqrt(h_t) / self.sigma0  # normalized vol
+            obs_new[:, 0, 4] = V_t / (self.K * self.contract_size)  # normalized value
             obs_list.append(obs_new)
-    
+            
             # Ask policy for next actions - NO DETACHMENT
             if policy_net.use_action_recurrence:
-                # NO .detach() on actions or hidden states
-                prev_actions_t = actions_t.unsqueeze(1)
+                prev_actions_t = actions_t.unsqueeze(1)  # NO .detach()
                 outputs, hidden_states = policy_net(obs_new, prev_actions_t, hidden_states)
             else:
                 outputs, hidden_states = policy_net(obs_new, None, hidden_states)
@@ -1043,8 +1039,9 @@ class HedgingEnvGARCH:
         V_trajectory = torch.stack(V_trajectory, dim=1)  # [M, N+1]
         all_actions = torch.stack(all_actions, dim=1)  # [M, N+1, n_instruments]
         obs_sequence = torch.cat(obs_list, dim=1)  # [M, N+1, obs_dim]
-    
+        
         self.position_ledger = ledger
+        
         return S_trajectory, V_trajectory, None, obs_sequence, all_actions
     # -------------------------
     # Full-trajectory P&L simulation using policy outputs
@@ -1059,11 +1056,18 @@ class HedgingEnvGARCH:
     def _simulate_full_trajectory_floating(self, all_actions: torch.Tensor):
         """
         P&L calculation for floating-grid mode with PATH-SPECIFIC strikes.
-        FULLY VECTORIZED VERSION.
+        FULLY VECTORIZED. FIXED: Unified action semantics.
         """
         ledger = VectorizedPositionLedger(self.M, self.device)
         S_t = torch.full((self.M,), self.S0, dtype=torch.float32, device=self.device)
-        stock_position = torch.zeros(self.M, dtype=torch.float32, device=self.device)
+        
+        # Track current positions (ALL instruments)
+        current_positions = torch.zeros(
+            (self.M, self.n_hedging_instruments),
+            dtype=torch.float32,
+            device=self.device
+        )
+        
         h_t = self.h_t.clone()
         h0_current = h_t.mean().item()
         
@@ -1071,19 +1075,20 @@ class HedgingEnvGARCH:
         B_t = self.side * V0
         V0_portfolio = self.side * V0
         
-        # Preallocate trajectories (optimization)
+        # Preallocate trajectories
         S_trajectory = torch.zeros(self.M, self.N + 1, dtype=torch.float32, device=self.device)
         B_trajectory = torch.zeros(self.M, self.N + 1, dtype=torch.float32, device=self.device)
         stock_pos_trajectory = torch.zeros(self.M, self.N + 1, dtype=torch.float32, device=self.device)
         
         S_trajectory[:, 0] = S_t
         B_trajectory[:, 0] = B_t
-        stock_pos_trajectory[:, 0] = stock_position
+        stock_pos_trajectory[:, 0] = current_positions[:, 0]
         
         cost_breakdown = {
             "stock": torch.zeros(self.M, device=self.device),
             "vanilla_option": torch.zeros(self.M, device=self.device)
         }
+        
         soft_constraint_violations = torch.zeros(self.M, device=self.device)
         ledger_size_trajectory = []
         
@@ -1096,23 +1101,30 @@ class HedgingEnvGARCH:
         tcp_stock = self._get_transaction_cost_rate(0)
         
         for t in range(self.N):
-            actions_t = all_actions[:, t]
+            # Get target positions from actions
+            target_positions = all_actions[:, t]  # [M, n_instruments]
+            
+            # UNIFIED: Compute trades as delta from current positions
+            trades = target_positions - current_positions
             
             # ===== STOCK TRADE (vectorized) =====
-            stock_trade = actions_t[:, 0] - stock_position
+            stock_trade = trades[:, 0]
             stock_cost = tcp_stock * torch.abs(stock_trade) * S_t
             B_t -= stock_trade * S_t + stock_cost
             cost_breakdown["stock"] += stock_cost
-            stock_position = actions_t[:, 0]
+            current_positions[:, 0] = target_positions[:, 0]
             
             # ===== OPTION TRADES (VECTORIZED ACROSS BUCKETS) =====
             for bucket_idx in range(1, self.n_hedging_instruments):
-                trade_qty = torch.round(actions_t[:, bucket_idx])
+                trade_qty = torch.round(trades[:, bucket_idx])
                 trade_qty = torch.where(
                     trade_qty.abs() < self.min_trade_size,
                     torch.zeros_like(trade_qty),
                     trade_qty
                 )
+                
+                # Update current position
+                current_positions[:, bucket_idx] = current_positions[:, bucket_idx] + trade_qty
                 
                 if trade_qty.abs().sum() < 1e-6:
                     continue
@@ -1149,17 +1161,14 @@ class HedgingEnvGARCH:
                 
                 # Add positions to ledger (BATCHED - NO LOOP)
                 nonzero_mask = trade_qty.abs() > 1e-6
-                
                 if nonzero_mask.sum() > 0:
                     ledger.add_positions_batch(
                         path_indices=torch.where(nonzero_mask)[0],
                         quantities=trade_qty[nonzero_mask],
                         strikes=K_paths[nonzero_mask],
                         expiry_steps=torch.full(
-                            (nonzero_mask.sum(),), 
-                            t + maturity_days, 
-                            dtype=torch.long, 
-                            device=self.device
+                            (nonzero_mask.sum(),), t + maturity_days,
+                            dtype=torch.long, device=self.device
                         ),
                         created_at_step=t,
                         original_maturity=maturity_days,
@@ -1187,17 +1196,19 @@ class HedgingEnvGARCH:
             # ===== SOFT CONSTRAINT (VECTORIZED) =====
             if compute_soft_constraint:
                 portfolio_value = ledger.compute_total_value(S_t, t + 1, h0_current)
-                P_t = B_t + stock_position * S_t + portfolio_value
-                
+                P_t = B_t + current_positions[:, 0] * S_t + portfolio_value
                 V_t_phi = self.derivative.price(S=S_t, K=self.K, step_idx=t + 1, N=self.N, h0=h0_current)
                 V_t_phi = self.side * V_t_phi
                 xi_t = P_t - V_t_phi
-                soft_constraint_violations += torch.clamp(xi_t, min=0.0)
+                
+                # Time-weighted constraint violations
+                weight_t = ((t + 1) / self.N) ** 2
+                soft_constraint_violations += weight_t * torch.clamp(xi_t, min=0.0)
             
             # ===== RECORD TRAJECTORIES =====
             S_trajectory[:, t + 1] = S_t
             B_trajectory[:, t + 1] = B_t
-            stock_pos_trajectory[:, t + 1] = stock_position
+            stock_pos_trajectory[:, t + 1] = current_positions[:, 0]
             ledger_size_trajectory.append(float(ledger.get_ledger_size().mean().item()))
         
         # ===== TERMINAL PAYOFF =====
@@ -1209,11 +1220,12 @@ class HedgingEnvGARCH:
                 payoff = torch.clamp(self.K - S_t, min=0.0)
         else:
             payoff = torch.clamp(S_t - self.K, min=0.0)
+        
         payoff = payoff * self.contract_size
         
         # ===== TERMINAL PORTFOLIO VALUE (VECTORIZED) =====
         portfolio_value_final = ledger.compute_total_value(S_t, self.N, h_t.mean().item())
-        terminal_value = B_t + stock_position * S_t + portfolio_value_final
+        terminal_value = B_t + current_positions[:, 0] * S_t + portfolio_value_final
         terminal_error = terminal_value - self.side * payoff
         
         trajectories = {
@@ -1242,8 +1254,7 @@ def compute_loss_with_soft_constraint(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute combined loss with risk measure, soft constraint, and sparsity penalty.
-    
-    CRITICAL FIX: Sparsity penalty is now RAW contract count, not scaled by loss.
+    FIXED: Proper loss component scaling.
     
     Returns:
         total_loss, risk_loss, constraint_penalty, sparsity_penalty
@@ -1275,21 +1286,26 @@ def compute_loss_with_soft_constraint(
     soft_violations = trajectories.get("soft_constraint_violations", torch.zeros_like(terminal_errors))
     constraint_penalty = soft_violations.mean()
     
-    # Compute sparsity penalty - FIXED VERSION
+    # FIXED: Proper sparsity penalty scaling
     sparsity_penalty = torch.tensor(0.0, device=terminal_errors.device)
     if lambda_sparsity > 0 and "all_actions" in trajectories:
         all_actions = trajectories["all_actions"]  # [M, N+1, n_instruments]
         option_actions = all_actions[:, :, 1:]  # exclude stock (index 0)
         
-        # CRITICAL FIX: Use RAW sparsity without any multiplication
-        # This is the average absolute number of option contracts held
+        # Average absolute position size across time and paths
         raw_sparsity = option_actions.abs().mean()
         
-        # Just use the raw value - no scaling by loss!
-        sparsity_penalty = raw_sparsity
+        # ADAPTIVE SCALING: Scale sparsity to same magnitude as risk loss
+        # This makes lambda_sparsity interpretable (e.g., 0.1 means 10% as important as risk)
+        risk_scale = risk_loss.detach().sqrt()  # Use sqrt for better balance
+        sparsity_penalty = raw_sparsity * risk_scale
     
-    # Total loss
-    total_loss = risk_loss + lambda_constraint * constraint_penalty + lambda_sparsity * sparsity_penalty
+    # Total loss with properly scaled components
+    total_loss = (
+        risk_loss + 
+        lambda_constraint * constraint_penalty + 
+        lambda_sparsity * sparsity_penalty
+    )
     
     return total_loss, risk_loss, constraint_penalty, sparsity_penalty
 def get_transaction_costs(config: Dict[str, Any]) -> Dict[str, float]:
