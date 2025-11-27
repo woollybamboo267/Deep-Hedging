@@ -74,11 +74,11 @@ class PolicyNetGARCH(nn.Module):
     def __init__(
         self,
         obs_dim: int = 5,
-        hidden_size: int = 32,  # Mueller uses 32!
+        hidden_size: int = 32,
         n_hedging_instruments: int = 2,
-        num_lstm_blocks: int = 4,  # 4 residual blocks
+        num_lstm_blocks: int = 4,
         use_action_recurrence: bool = True,
-        max_option_contracts: float = 10.0,
+        max_option_contracts: float = 1.0,  # ← Lower default
     ):
         super().__init__()
         self.n_hedging_instruments = n_hedging_instruments
@@ -106,17 +106,17 @@ class PolicyNetGARCH(nn.Module):
         self._initialize_parameters()
     
     def _initialize_parameters(self):
-        """Initialize following Mueller et al. specifications"""
-        # Input projection: Xavier
+        """Initialize following Mueller et al. specifications - ULTRA CONSERVATIVE"""
+        # Input projection: Xavier (standard)
         nn.init.xavier_uniform_(self.input_proj.weight)
         nn.init.zeros_(self.input_proj.bias)
         
-        # Output heads: He init scaled by 1e-3, zero bias (CRITICAL!)
+        # Output heads: He init scaled by 1e-4 (even smaller than Mueller's 1e-3!)
         for head in self.instrument_heads:
             nn.init.kaiming_uniform_(head.weight, a=0, mode='fan_in', nonlinearity='linear')
-            head.weight.data *= 1e-3  # Scale down by 1000x
+            head.weight.data *= 1e-4  # ← EVEN SMALLER: Scale down by 10,000x
             nn.init.zeros_(head.bias)
-    
+
     def forward(
         self, 
         obs_sequence: torch.Tensor,
@@ -888,12 +888,7 @@ class HedgingEnvGARCH:
         Floating grid simulation with FULL BPTT (Mueller et al. 2024 approach).
         NO detachment of actions or hidden states - only detach environment dynamics.
         
-        Returns:
-            S_trajectory: [M, N+1]
-            V_trajectory: [M, N+1]
-            None (in place of O_trajectories)
-            obs_sequence: [M, N+1, obs_dim]
-            all_actions: [M, N+1, n_instruments]
+        ADDED: Safety checks to prevent position explosion.
         """
         S_trajectory = []
         V_trajectory = []
@@ -936,6 +931,10 @@ class HedgingEnvGARCH:
         actions_t = torch.stack([out[:, 0] for out in outputs], dim=-1)  # [M, n_instruments]
         all_actions.append(actions_t)
     
+        # Track cumulative positions per path for safety
+        cumulative_positions_per_path = torch.zeros(self.M, device=self.device)
+        MAX_POSITIONS_PER_PATH = 50  # Hard safety limit
+    
         # Main loop
         for t in range(self.N):
             # Execute actions from previous output
@@ -972,16 +971,19 @@ class HedgingEnvGARCH:
                     deriv_template.N = maturity_days
                     deriv_template.created_at_step = t
                     
-                    # Add positions to ledger (BATCHED - NO LOOP)
+                    # Check for positions limit per path
                     nonzero_mask = trade_qty.abs() > 1e-6
                     
-                    if nonzero_mask.sum() > 0:
+                    # SAFETY CHECK: Don't add positions if path already has too many
+                    safe_mask = nonzero_mask & (cumulative_positions_per_path < MAX_POSITIONS_PER_PATH)
+                    
+                    if safe_mask.sum() > 0:
                         ledger.add_positions_batch(
-                            path_indices=torch.where(nonzero_mask)[0],
-                            quantities=trade_qty[nonzero_mask],
-                            strikes=K_paths[nonzero_mask],
+                            path_indices=torch.where(safe_mask)[0],
+                            quantities=trade_qty[safe_mask],
+                            strikes=K_paths[safe_mask],
                             expiry_steps=torch.full(
-                                (nonzero_mask.sum(),), 
+                                (safe_mask.sum(),), 
                                 t + maturity_days, 
                                 dtype=torch.long, 
                                 device=self.device
@@ -989,9 +991,11 @@ class HedgingEnvGARCH:
                             created_at_step=t,
                             original_maturity=maturity_days,
                             bucket_idx=bucket_idx,
-                            opening_spots=S_t[nonzero_mask],
+                            opening_spots=S_t[safe_mask],
                             derivative_template=deriv_template
                         )
+                        # Update position counter
+                        cumulative_positions_per_path[safe_mask] += 1
     
             # Evolve GARCH and stock - DETACH ONLY ENVIRONMENT DYNAMICS
             with torch.no_grad():
@@ -1001,8 +1005,12 @@ class HedgingEnvGARCH:
                 r_t = (self.r + self.lambda_ * h_t - 0.5 * h_t) + torch.sqrt(h_t) * self.Z[:, t]
                 S_t = S_t * torch.exp(r_t)
     
-            # Remove expired positions (they expire at t+1 if expiry_step <= t+1)
+            # Remove expired positions
             ledger.remove_expired(t + 1)
+            
+            # Update position counter (subtract expired)
+            # This is approximate but prevents unbounded growth
+            cumulative_positions_per_path = torch.clamp(cumulative_positions_per_path - 0.5, min=0)
     
             # Price current hedged derivative
             h0_current = h_t.mean().item()
