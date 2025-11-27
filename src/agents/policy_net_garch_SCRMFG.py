@@ -885,10 +885,9 @@ class HedgingEnvGARCH:
     
     def _simulate_floating_grid(self, policy_net: PolicyNetGARCH):
         """
-        Floating grid simulation with action recurrence (Mueller et al. approach).
-        The policy outputs:
-          - actions[:, t, 0] = target stock position
-          - actions[:, t, i] (i>=1) = trades for option bucket i-1 (rounded to integer)
+        Floating grid simulation with FULL BPTT (Mueller et al. 2024 approach).
+        NO detachment of actions or hidden states - only detach environment dynamics.
+        
         Returns:
             S_trajectory: [M, N+1]
             V_trajectory: [M, N+1]
@@ -928,21 +927,18 @@ class HedgingEnvGARCH:
             device=self.device
         )
     
-        # Get initial actions WITH action recurrence
-        # NOTE: Pass hidden_states as positional argument, NOT keyword
-        # Use torch.no_grad() for trajectory simulation to prevent memory buildup
-        with torch.no_grad():
-            if policy_net.use_action_recurrence:
-                outputs, hidden_states = policy_net(obs_t, prev_actions_t, None)  # None = initial hidden states
-            else:
-                outputs, hidden_states = policy_net(obs_t, None, None)  # Ignore prev_actions if not using recurrence
-            
-            actions_t = torch.stack([out[:, 0] for out in outputs], dim=-1)  # [M, n_instruments]
+        # Get initial actions - NO torch.no_grad() here!
+        if policy_net.use_action_recurrence:
+            outputs, hidden_states = policy_net(obs_t, prev_actions_t, None)
+        else:
+            outputs, hidden_states = policy_net(obs_t, None, None)
+        
+        actions_t = torch.stack([out[:, 0] for out in outputs], dim=-1)  # [M, n_instruments]
         all_actions.append(actions_t)
     
         # Main loop
         for t in range(self.N):
-            # Execute actions from previous output (actions_t is target positions / trades)
+            # Execute actions from previous output
             actions_prev = all_actions[-1]
     
             # Stock semantics: interpret as target position
@@ -951,8 +947,8 @@ class HedgingEnvGARCH:
     
             # Options: treat actions_prev[:, i] (i>=1) as immediate trade quantities (rounded)
             for bucket_idx in range(1, self.n_hedging_instruments):
-                trade_qty = torch.round(actions_prev[:, bucket_idx])  # integerize
-                # suppress small trades
+                trade_qty = torch.round(actions_prev[:, bucket_idx])
+                # Suppress small trades
                 trade_qty = torch.where(
                     trade_qty.abs() < self.min_trade_size, 
                     torch.zeros_like(trade_qty), 
@@ -960,7 +956,7 @@ class HedgingEnvGARCH:
                 )
                 
                 if trade_qty.abs().sum() > 1e-6:
-                    # Get bucket parameters (moneyness and maturity)
+                    # Get bucket parameters
                     moneyness, maturity_days = self.grid_manager.get_bucket_params(bucket_idx - 1)
                     
                     # VECTORIZED: Compute strikes for ALL paths at once
@@ -997,12 +993,13 @@ class HedgingEnvGARCH:
                             derivative_template=deriv_template
                         )
     
-            # Evolve GARCH and stock
-            sqrt_h = torch.sqrt(h_t)
-            h_t = self.omega + self.beta * h_t + self.alpha * (self.Z[:, t] - self.gamma * sqrt_h) ** 2
-            h_t = torch.clamp(h_t, min=1e-12)
-            r_t = (self.r + self.lambda_ * h_t - 0.5 * h_t) + torch.sqrt(h_t) * self.Z[:, t]
-            S_t = S_t * torch.exp(r_t)
+            # Evolve GARCH and stock - DETACH ONLY ENVIRONMENT DYNAMICS
+            with torch.no_grad():
+                sqrt_h = torch.sqrt(h_t)
+                h_t = self.omega + self.beta * h_t + self.alpha * (self.Z[:, t] - self.gamma * sqrt_h) ** 2
+                h_t = torch.clamp(h_t, min=1e-12)
+                r_t = (self.r + self.lambda_ * h_t - 0.5 * h_t) + torch.sqrt(h_t) * self.Z[:, t]
+                S_t = S_t * torch.exp(r_t)
     
             # Remove expired positions (they expire at t+1 if expiry_step <= t+1)
             ledger.remove_expired(t + 1)
@@ -1018,25 +1015,17 @@ class HedgingEnvGARCH:
             obs_new = torch.zeros((self.M, 1, self.obs_dim), dtype=torch.float32, device=self.device)
             obs_new[:, 0, 0] = time_val
             obs_new[:, 0, 1] = S_t
-            # previous spot is the one before the last append
-            obs_new[:, 0, 2] = S_trajectory[-2]
+            obs_new[:, 0, 2] = S_trajectory[-2]  # previous spot
             obs_new[:, 0, 3] = torch.sqrt(h_t)
             obs_new[:, 0, 4] = V_t
             obs_list.append(obs_new)
     
-            # Ask policy for next actions
-            # Prepare previous actions for network input (Mueller's approach)
+            # Ask policy for next actions - NO DETACHMENT
             if policy_net.use_action_recurrence:
-                # CRITICAL: Use .detach() on prev_actions to prevent BPTT through time
-                prev_actions_t = actions_t.detach().unsqueeze(1)
-                # Detach hidden states - hidden_states is a list of (h, c) tuples
-                hidden_states = [(h.detach(), c.detach()) for h, c in hidden_states]
-                # Pass as positional arguments: obs, prev_actions, hidden_states
+                # NO .detach() on actions or hidden states
+                prev_actions_t = actions_t.unsqueeze(1)
                 outputs, hidden_states = policy_net(obs_new, prev_actions_t, hidden_states)
             else:
-                # Still detach hidden state even without action recurrence
-                hidden_states = [(h.detach(), c.detach()) for h, c in hidden_states]
-                # Pass as positional arguments: obs, prev_actions, hidden_states
                 outputs, hidden_states = policy_net(obs_new, None, hidden_states)
             
             actions_t = torch.stack([out[:, 0] for out in outputs], dim=-1)
