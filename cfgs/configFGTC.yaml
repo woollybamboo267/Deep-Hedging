@@ -1,3 +1,4 @@
+# Mueller et al. (2024) Architecture Configuration
 environment:
   dt_min: 1.0e-10
 
@@ -37,10 +38,11 @@ logging:
   log_file: null
 
 model:
-  hidden_size: 256  # ← REDUCED from 512
-  num_lstm_blocks: 2  # ← REDUCED from 4
+  hidden_size: 32  # ← CRITICAL: Mueller uses 32, not 256!
+  num_lstm_blocks: 4  # ← CRITICAL: Mueller uses 4 residual blocks
   obs_dim: 5
   use_action_recurrence: true
+  max_option_contracts: 10.0
 
 output:
   checkpoint_path: policy_net_floating_grid.pth
@@ -55,7 +57,7 @@ precomputation:
   u_max: 500.0
 
 simulation:
-  M: 1000  # ← REDUCED from 1000
+  M: 1000
   N: 252
   S0: 100
   T: 1.0
@@ -69,8 +71,8 @@ training:
   entropy_coefficient: 0.5
   episodes: 300
   gamma: 0.99999
-  gradient_clip_max_norm: 100
-  learning_rate: 0.01
+  gradient_clip_max_norm: 1.0  # ← CRITICAL: Aggressive clipping for stability
+  learning_rate: 0.0005  # ← REDUCED from 0.01 for stability
   num_epochs: 400
   optimizer: AdamW
   plot_frequency: 100
