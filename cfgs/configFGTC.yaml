@@ -18,7 +18,7 @@ training:
   device: cuda
   checkpoint_frequency: 25
   plot_frequency: 100
-  batch_size: 256
+  batch_size: 1000
   num_epochs: 400
   gamma: 0.99999
   entropy_coefficient: 0.5
