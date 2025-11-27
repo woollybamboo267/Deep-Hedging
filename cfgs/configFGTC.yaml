@@ -10,7 +10,7 @@ model:
 training:
   learning_rate: 0.00001  # ← VERY LOW to prevent explosion
   optimizer: Adam
-  gradient_clip_max_norm: 0.1  # ← VERY AGGRESSIVE clipping
+  gradient_clip_max_norm: 10  # ← VERY AGGRESSIVE clipping
   weight_decay: 0.0001
   episodes: 300
   seed: 78020349
