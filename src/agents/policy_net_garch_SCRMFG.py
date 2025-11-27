@@ -78,13 +78,11 @@ class PolicyNetGARCH(nn.Module):
         n_hedging_instruments: int = 2,
         num_lstm_blocks: int = 4,
         use_action_recurrence: bool = True,
-        max_option_contracts: float = 1.0,  # ← Lower default
     ):
         super().__init__()
         self.n_hedging_instruments = n_hedging_instruments
         self.hidden_size = hidden_size
         self.use_action_recurrence = use_action_recurrence
-        self.max_option_contracts = max_option_contracts
         
         # Input size includes previous actions if enabled
         input_size = obs_dim + n_hedging_instruments if use_action_recurrence else obs_dim
@@ -186,8 +184,9 @@ class PolicyNetGARCH(nn.Module):
                 # Stock: reasonable hedge ratios
                 out = torch.clamp(out, min=-5.0, max=5.0)
             else:
-                # Options: hard limit on contracts
-                out = torch.clamp(out, min=-self.max_option_contracts, max=self.max_option_contracts)
+                # Options: no hard limit, just symexp output
+                # The network learns appropriate scales through training
+                pass
             
             outputs.append(out)
         
