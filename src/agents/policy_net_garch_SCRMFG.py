@@ -112,7 +112,7 @@ class PolicyNetGARCH(nn.Module):
         # Output heads: He init scaled by 1e-4 (even smaller than Mueller's 1e-3!)
         for head in self.instrument_heads:
             nn.init.kaiming_uniform_(head.weight, a=0, mode='fan_in', nonlinearity='linear')
-            head.weight.data *= 1e-4  # ← EVEN SMALLER: Scale down by 10,000x
+            head.weight.data *= 1e-1  # ← EVEN SMALLER: Scale down by 10,000x
             nn.init.zeros_(head.bias)
 
     def forward(
