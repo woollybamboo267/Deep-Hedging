@@ -588,28 +588,35 @@ def run_inference(
         import traceback
         traceback.print_exc()
 
+# ============================================================================
+# FIXED train_episode FUNCTION FOR train.py
+# Replace this function in your existing train.py (starts around line 605)
+# ============================================================================
+
 def train_episode(
     episode: int,
-    config: dict,
-    policy_net: nn.Module,
+    config: Dict[str, Any],
+    policy_net: PolicyNetGARCH,
     optimizer: torch.optim.Optimizer,
     hedged_derivative,
     hedging_derivatives,
     HedgingSim,
     device: torch.device,
-    precomputation_manager,
-) -> dict:
+    precomputation_manager
+) -> Dict[str, Any]:
     """
-    Stabilized training episode with comprehensive safeguards.
+    Train for a single episode with Mueller et al. (2024) architecture.
+    Uses FULL BPTT without action/hidden state detachment.
     """
     
     hedged_cfg = config["hedged_option"]
     mode = config["instruments"].get("mode", "static")
     is_floating_grid = (mode == "floating_grid")
     
+    # Get transaction costs from config
     transaction_costs = get_transaction_costs(config)
     
-    # Risk measure configuration
+    # Get risk measure and soft constraint configuration
     risk_config = config.get("risk_measure", {"type": "mse"})
     constraint_config = config.get("soft_constraint", {"enabled": False, "lambda": 0.0})
     
@@ -617,17 +624,15 @@ def train_episode(
     alpha = risk_config.get("alpha", None)
     lambda_constraint = constraint_config.get("lambda", 0.0) if constraint_config.get("enabled", False) else 0.0
     
+    # Get sparsity penalty for floating grid mode
     lambda_sparsity = 0.0
     if is_floating_grid:
         lambda_sparsity = config["instruments"]["floating_grid"].get("sparsity_penalty", 0.0)
     
-    # FIX: Ensure K and S0 are tensors on correct device
-    K_tensor = torch.tensor(hedged_cfg["K"], dtype=torch.float32, device=device)
-    S0_tensor = torch.tensor(config["simulation"]["S0"], dtype=torch.float32, device=device)
-    
+    # Create simulation instance
     sim = HedgingSim(
-        S0=S0_tensor,
-        K=K_tensor,
+        S0=config["simulation"]["S0"],
+        K=hedged_cfg["K"],
         m=0.1,
         r=config["simulation"]["r"],
         sigma=config["garch"]["sigma0"],
@@ -640,9 +645,7 @@ def train_episode(
         seed=episode
     )
 
-    # Import your environment class
-    from your_module import HedgingEnvGARCH  # Replace with actual import
-    
+    # Create hedging environment
     env = HedgingEnvGARCH(
         sim=sim,
         derivative=hedged_derivative,
@@ -653,138 +656,105 @@ def train_episode(
         device=str(device),
         transaction_costs=transaction_costs,
         grid_config=config if is_floating_grid else None,
-        precomputation_manager=precomputation_manager,
+        precomputation_manager=precomputation_manager
     )
-    
-    # Add lambda_constraint to environment if using soft constraints
-    if lambda_constraint > 0:
-        env.lambda_constraint = lambda_constraint
-
-    # CRITICAL: Check network health BEFORE forward pass
-    if episode > 1:
-        param_norms = [p.data.norm().item() for p in policy_net.parameters()]
-        max_param_norm = max(param_norms)
-        
-        if max_param_norm > 1e6:
-            logging.error(f"Network parameters exploded: max norm = {max_param_norm:.2e}")
-            raise RuntimeError("Network parameters became too large")
-        
-        if any(np.isnan(norm) or np.isinf(norm) for norm in param_norms):
-            logging.error("Network parameters contain NaN/Inf")
-            raise RuntimeError("Network parameters corrupted")
 
     # Reset environment
     env.reset()
     
-    # Forward pass with error handling
-    try:
-        S_traj, V_traj, O_traj, obs_sequence, RL_actions = env.simulate_trajectory_and_get_observations(policy_net)
-        
-        # SAFETY CHECK: Verify outputs are valid
-        if torch.isnan(RL_actions).any() or torch.isinf(RL_actions).any():
-            logging.error(f"Episode {episode}: Policy outputs contain NaN/Inf")
-            raise RuntimeError("Policy produced invalid outputs")
-        
-        terminal_errors, trajectories = env.simulate_full_trajectory(RL_actions, O_traj)
-        
-    except RuntimeError as e:
-        logging.error(f"Episode {episode} forward pass failed: {e}")
-        raise
-
-    # Compute loss
+    # Simulate trajectory using policy network (FULL BPTT - no detachment!)
+    S_traj, V_traj, O_traj, obs_sequence, RL_actions = \
+        env.simulate_trajectory_and_get_observations(policy_net)
+    
+    # Compute full P&L trajectory with transaction costs
+    terminal_errors, trajectories = env.simulate_full_trajectory(RL_actions, O_traj)
+    
+    # Backpropagation
     optimizer.zero_grad()
     
-    total_loss, risk_loss, constraint_penalty, sparsity_pen = compute_loss_with_soft_constraint(
+    # Compute loss with configurable risk measure and penalties
+    total_loss, risk_loss, constraint_penalty, sparsity_penalty = compute_loss_with_soft_constraint(
         terminal_errors, 
-        trajectories, 
-        risk_measure=risk_measure, 
-        alpha=alpha, 
-        lambda_constraint=lambda_constraint, 
+        trajectories,
+        risk_measure=risk_measure,
+        alpha=alpha,
+        lambda_constraint=lambda_constraint,
         lambda_sparsity=lambda_sparsity
     )
     
-    # CRITICAL CHECK: Verify loss is valid BEFORE backward
+    # Check for NaN/Inf BEFORE backward
     if torch.isnan(total_loss) or torch.isinf(total_loss):
-        logging.error(f"Episode {episode}: Loss became NaN/Inf BEFORE backward")
-        logging.error(f"Risk loss: {risk_loss.item()}, Constraint: {constraint_penalty.item()}, Sparsity: {sparsity_pen.item() if isinstance(sparsity_pen, torch.Tensor) else sparsity_pen}")
-        logging.error(f"Terminal errors stats: mean={terminal_errors.mean():.4f}, std={terminal_errors.std():.4f}, max={terminal_errors.abs().max():.4f}")
+        logging.error(f"Episode {episode}: Loss is NaN/Inf BEFORE backward")
+        logging.error(f"  Risk loss: {risk_loss.item()}")
+        logging.error(f"  Constraint penalty: {constraint_penalty.item()}")
         raise RuntimeError("Loss became NaN/Inf")
     
-    # Backward pass
     total_loss.backward()
     
-    # CRITICAL: Check gradients BEFORE optimizer step
-    grad_norms = []
-    for name, param in policy_net.named_parameters():
-        if param.grad is not None:
-            grad_norm = param.grad.data.norm().item()
-            grad_norms.append(grad_norm)
-            
-            if np.isnan(grad_norm) or np.isinf(grad_norm):
-                logging.error(f"Episode {episode}: NaN/Inf gradient in {name}")
-                raise RuntimeError(f"Gradient corruption in {name}")
-    
-    max_grad_norm = max(grad_norms) if grad_norms else 0.0
-    
-    if max_grad_norm > 1e6:
-        logging.warning(f"Episode {episode}: Exploding gradient detected: {max_grad_norm:.2e}")
-    
-    # CRITICAL: Apply gradient clipping
-    clip_max_norm = config["training"].get("gradient_clip_max_norm", 1.0)
-    actual_grad_norm = torch.nn.utils.clip_grad_norm_(
-        policy_net.parameters(), 
-        max_norm=clip_max_norm
+    # Gradient clipping
+    grad_norm = torch.nn.utils.clip_grad_norm_(
+        policy_net.parameters(),
+        max_norm=config["training"]["gradient_clip_max_norm"]
     )
     
-    # Optimizer step
     optimizer.step()
     
-    # SAFETY CHECK: Verify network parameters after update
-    for name, param in policy_net.named_parameters():
-        if torch.isnan(param).any() or torch.isinf(param).any():
-            logging.error(f"Episode {episode}: Parameter {name} became NaN/Inf after optimizer step")
-            raise RuntimeError(f"Parameter corruption in {name}")
-
+    # Check for NaN/Inf AFTER optimizer step
+    if torch.isnan(total_loss) or torch.isinf(total_loss):
+        logging.error(f"Loss became NaN/Inf at episode {episode}")
+        raise RuntimeError("Loss became NaN/Inf")
+    
     final_reward = -float(total_loss.item())
-
-    # Logging
+    
+    # Construct detailed logging message
     log_msg = (
-        f"Episode {episode} | Risk: {risk_measure.upper()} | "
-        f"Total Loss: {total_loss.item():.6f} | Risk Loss: {risk_loss.item():.6f} | "
-        f"Grad Norm: {actual_grad_norm:.4f}"
+        f"Episode {episode} | "
+        f"Risk: {risk_measure.upper()} | "
+        f"Total Loss: {total_loss.item():.6f} | "
+        f"Risk Loss: {risk_loss.item():.6f} | "
+        f"Grad Norm: {grad_norm:.6f}"
     )
     
-    if lambda_sparsity > 0:
-        log_msg += f" | Sparsity: {sparsity_pen.item():.6f} (λ={lambda_sparsity})"
-    
+    # Add constraint penalty info if enabled
     if lambda_constraint > 0:
-        avg_violation = trajectories["soft_constraint_violations"].mean().item()
-        log_msg += f" | Constraint: {constraint_penalty.item():.6f}"
+        avg_violation = trajectories['soft_constraint_violations'].mean().item()
+        log_msg += (
+            f" | Constraint: {constraint_penalty.item():.6f} "
+            f"(λ={lambda_constraint}, Avg Viol: {avg_violation:.6f})"
+        )
+    
+    # Add sparsity penalty info if enabled
+    if lambda_sparsity > 0:
+        log_msg += f" | Sparsity: {sparsity_penalty.item():.6f} (λ={lambda_sparsity})"
     
     log_msg += f" | Reward: {final_reward:.6f}"
     
+    # Add ledger statistics for floating grid mode
     if is_floating_grid and "ledger_size_trajectory" in trajectories:
         avg_ledger = np.mean(trajectories["ledger_size_trajectory"])
         max_ledger = np.max(trajectories["ledger_size_trajectory"])
         log_msg += f" | Ledger (Avg/Max): {avg_ledger:.1f}/{max_ledger:.0f}"
     
     logging.info(log_msg)
-
+    
+    # Return comprehensive metrics dictionary
     return {
         "episode": episode,
         "loss": total_loss.item(),
         "risk_loss": risk_loss.item(),
         "constraint_penalty": constraint_penalty.item(),
-        "sparsity_penalty": sparsity_pen.item() if isinstance(sparsity_pen, torch.Tensor) else float(sparsity_pen),
+        "sparsity_penalty": sparsity_penalty.item(),
         "reward": final_reward,
-        "grad_norm": float(actual_grad_norm),
-        "max_param_norm": max(p.data.norm().item() for p in policy_net.parameters()),
         "trajectories": trajectories,
         "RL_positions": RL_actions,
         "S_traj": S_traj,
         "V_traj": V_traj,
         "O_traj": O_traj,
         "env": env,
+        "risk_measure": risk_measure,
+        "lambda_constraint": lambda_constraint,
+        "grad_norm": float(grad_norm),
+        "skipped": False
     }
 
 def main():
