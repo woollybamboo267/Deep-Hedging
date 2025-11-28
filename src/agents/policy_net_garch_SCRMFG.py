@@ -928,6 +928,11 @@ class HedgingEnvGARCH:
         cumulative_positions_per_path = torch.zeros(self.M, device=self.device)
         MAX_POSITIONS_PER_PATH = 50
         
+        # Diagnostics tracking
+        hidden_state_norms_trajectory = []
+        stock_actions_all = []
+        option_actions_all = []
+        
         # Main loop
         for t in range(self.N):
             S_prev = S_t.clone()  # Store for observation
@@ -942,10 +947,8 @@ class HedgingEnvGARCH:
             # Stock trade (index 0) - no rounding
             stock_trade = trades[:, 0]
             current_positions[:, 0] = target_positions[:, 0]
-            if t % max(1, self.N // 5) == 0:  # Log every 20% of steps
-                h_norms = [torch.norm(h, dim=1).mean().item() for h, c in hidden_states]
-                c_norms = [torch.norm(c, dim=1).mean().item() for h, c in hidden_states]
-                logging.debug(f"Step {t}: h_norms={h_norms}, c_norms={c_norms}")
+            stock_actions_all.append(stock_trade.detach().cpu().clone())
+            
             # Option trades (indices 1+) - apply rounding and min trade size
             for bucket_idx in range(1, self.n_hedging_instruments):
                 trade_qty = torch.round(trades[:, bucket_idx])
@@ -1033,23 +1036,29 @@ class HedgingEnvGARCH:
                 outputs, hidden_states = policy_net(obs_new, prev_actions_t, hidden_states)
             else:
                 outputs, hidden_states = policy_net(obs_new, None, hidden_states)
-            hidden_state_norms = []
-            for block_idx, (h, c) in enumerate(hidden_states):
-                h_norm = torch.norm(h, dim=1).mean().item()  # [M] -> scalar
-                c_norm = torch.norm(c, dim=1).mean().item()
-                hidden_state_norms.append((h_norm, c_norm))
-            logging.info(f"Episode hidden state norms (final): {hidden_state_norms}")
             
-            # Log action statistics
-            logging.info(f"Action stats - Stock: mean={stock_actions.mean():.4f}, std={stock_actions.std():.4f}, max={stock_actions.abs().max():.4f}")
-            if option_actions.numel() > 0:
-                logging.info(f"Action stats - Options: mean={option_actions.mean():.4f}, std={option_actions.std():.4f}, max={option_actions.abs().max():.4f}")
-            
-            # Count zero actions
-            stock_zero_pct = (stock_actions.abs() < 1e-6).float().mean().item() * 100
-            logging.info(f"Stock actions near zero: {stock_zero_pct:.1f}%")
             actions_t = torch.stack([out[:, 0] for out in outputs], dim=-1)
             all_actions.append(actions_t)
+            option_actions_all.append(actions_t[:, 1:].detach().cpu().clone() if actions_t.shape[1] > 1 else torch.empty(0))
+            
+            # Log hidden state norms every 20% of steps
+            if t % max(1, self.N // 5) == 0:
+                h_norms = [torch.norm(h, dim=1).mean().item() for h, c in hidden_states]
+                c_norms = [torch.norm(c, dim=1).mean().item() for h, c in hidden_states]
+                hidden_state_norms_trajectory.append((t, h_norms, c_norms))
+                logging.debug(f"Step {t}: h_norms={h_norms}, c_norms={c_norms}")
+        
+        # ===== END-OF-EPISODE DIAGNOSTICS =====
+        stock_actions_tensor = torch.cat(stock_actions_all, dim=0) if stock_actions_all else torch.empty(0)
+        option_actions_tensor = torch.cat(option_actions_all, dim=0) if option_actions_all else torch.empty(0)
+        
+        logging.info(f"Hidden state norms trajectory: {hidden_state_norms_trajectory}")
+        logging.info(f"Action stats - Stock: mean={stock_actions_tensor.mean():.4f}, std={stock_actions_tensor.std():.4f}, max={stock_actions_tensor.abs().max():.4f}")
+        if option_actions_tensor.numel() > 0:
+            logging.info(f"Action stats - Options: mean={option_actions_tensor.mean():.4f}, std={option_actions_tensor.std():.4f}, max={option_actions_tensor.abs().max():.4f}")
+        
+        stock_zero_pct = (stock_actions_tensor.abs() < 1e-6).float().mean().item() * 100
+        logging.info(f"Stock actions near zero: {stock_zero_pct:.1f}%")
         
         # Stack outputs and store ledger
         S_trajectory = torch.stack(S_trajectory, dim=1)  # [M, N+1]
@@ -1060,7 +1069,6 @@ class HedgingEnvGARCH:
         self.position_ledger = ledger
         
         return S_trajectory, V_trajectory, None, obs_sequence, all_actions
-    # -------------------------
     # Full-trajectory P&L simulation using policy outputs
     # -------------------------
     def simulate_full_trajectory(self, all_actions: torch.Tensor, O_trajectories_or_None):
