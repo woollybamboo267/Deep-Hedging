@@ -767,18 +767,18 @@ def train_episode(
     
     logging.info(log_msg)
     # Test without action recurrence
-     policy_net_no_rec = create_policy_network(config, device)
-     policy_net_no_rec.use_action_recurrence = False
+    policy_net_no_rec = create_policy_network(config, device)
+    policy_net_no_rec.use_action_recurrence = False
      
-     S_traj_no_rec, V_traj_no_rec, _, obs_seq_no_rec, RL_actions_no_rec = \
-         env.simulate_trajectory_and_get_observations(policy_net_no_rec)
+    S_traj_no_rec, V_traj_no_rec, _, obs_seq_no_rec, RL_actions_no_rec = \
+    env.simulate_trajectory_and_get_observations(policy_net_no_rec)
      
-     terminal_errors_no_rec, trajectories_no_rec = env.simulate_full_trajectory(RL_actions_no_rec, None)
-     loss_no_rec = (terminal_errors_no_rec ** 2).mean()
+    terminal_errors_no_rec, trajectories_no_rec = env.simulate_full_trajectory(RL_actions_no_rec, None)
+    loss_no_rec = (terminal_errors_no_rec ** 2).mean()
      
-     logging.info(f"Loss WITH action recurrence: {total_loss.item():.6f}")
-     logging.info(f"Loss WITHOUT action recurrence: {loss_no_rec.item():.6f}")
-     logging.info(f"Difference: {(loss - loss_no_rec).item():.6f}")
+    logging.info(f"Loss WITH action recurrence: {total_loss.item():.6f}")
+    logging.info(f"Loss WITHOUT action recurrence: {loss_no_rec.item():.6f}")
+    logging.info(f"Difference: {(loss - loss_no_rec).item():.6f}")
     # Return comprehensive metrics dictionary
     return {
         "episode": episode,
