@@ -28,7 +28,8 @@ import sys
 import os
 from pathlib import Path
 from typing import Dict, Any, Optional
-
+import torch
+import torch.nn as nn
 from src.agents.policy_net_garch_SCRMFG import (
     PolicyNetGARCH, 
     HedgingEnvGARCH,
