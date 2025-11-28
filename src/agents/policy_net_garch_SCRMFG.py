@@ -36,8 +36,9 @@ class RMSNorm(nn.Module):
 
 
 def symexp(x: torch.Tensor) -> torch.Tensor:
-    """Symmetric exponential: symexp(x) = sign(x) * (exp(|x|) - 1)"""
-    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
+    """Symmetric exponential with stability clipping: symexp(x) = sign(x) * (exp(|x|) - 1)"""
+    x_clipped = torch.clamp(x, min=-10.0, max=10.0)  # ← ADD THIS LINE
+    return torch.sign(x_clipped) * (torch.exp(torch.abs(x_clipped)) - 1)
 
 
 class ResidualLSTMBlock(nn.Module):
@@ -50,7 +51,7 @@ class ResidualLSTMBlock(nn.Module):
     def forward(self, x: torch.Tensor, hidden_state: Tuple[torch.Tensor, torch.Tensor]):
         x_norm = self.rms_norm(x)
         h_new, c_new = self.lstm_cell(x_norm, hidden_state)
-        out = x + h_new  # Residual connection
+        out = x + 0.1 * h_new  # ← CHANGE THIS LINE (was: out = x + h_new)
         return out, (h_new, c_new)
 
 
@@ -109,11 +110,12 @@ class PolicyNetGARCH(nn.Module):
         nn.init.xavier_uniform_(self.input_proj.weight)
         nn.init.zeros_(self.input_proj.bias)
         
-        # Output heads: He init scaled by 1e-4 (even smaller than Mueller's 1e-3!)
+        # Output heads: He init scaled by 0.01
         for head in self.instrument_heads:
             nn.init.kaiming_uniform_(head.weight, a=0, mode='fan_in', nonlinearity='linear')
-            head.weight.data *= 1 # ← EVEN SMALLER: Scale down by 10,000x
+            head.weight.data *= 0.01  # ← CHANGE THIS LINE (was: *= 1)
             nn.init.zeros_(head.bias)
+
 
     def forward(
         self,
