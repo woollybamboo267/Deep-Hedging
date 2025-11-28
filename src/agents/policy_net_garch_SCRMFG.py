@@ -113,7 +113,7 @@ class PolicyNetGARCH(nn.Module):
         # Output heads: He init scaled by 0.01
         for head in self.instrument_heads:
             nn.init.kaiming_uniform_(head.weight, a=0, mode='fan_in', nonlinearity='linear')
-            head.weight.data *= 0.01  # ← CHANGE THIS LINE (was: *= 1)
+            head.weight.data *= 1  # ← CHANGE THIS LINE (was: *= 1)
             nn.init.zeros_(head.bias)
 
 
