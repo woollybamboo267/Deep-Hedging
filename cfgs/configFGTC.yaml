@@ -12,7 +12,7 @@ training:
   optimizer: Adam
   gradient_clip_max_norm: 10  # ← moderatly AGGRESSIVE clipping
   weight_decay: 0.001
-  episodes: 300
+  episodes: 600
   seed: 78020349
   device: cuda
   checkpoint_frequency: 25
