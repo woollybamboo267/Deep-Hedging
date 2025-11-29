@@ -524,28 +524,125 @@ class FloatingGridManager:
 # ----------------------------------------
 # Position ledger for floating grid mode
 # ----------------------------------------
+
+
 class VectorizedPositionLedger:
-    """Fully vectorized position ledger with PRE-ALLOCATED tensors - NO concatenation."""
-    
-    def __init__(self, M: int, device: torch.device, max_positions: int = 10000000000):
+    """Block-based, dynamically expanding, vectorized position ledger.
+       Public API kept identical to the original class.
+       - `max_positions` is used as the block size for each allocated block.
+       - Blocks are appended when needed; no concatenation of existing blocks.
+    """
+
+    def __init__(self, M: int, device: torch.device, max_positions: int = 10000):
         self.M = M
         self.device = device
-        self.max_positions = max_positions
-        
-        # PRE-ALLOCATE all tensors - NO dynamic growth
-        self.path_indices = torch.zeros(max_positions, dtype=torch.long, device=device)
-        self.quantities = torch.zeros(max_positions, dtype=torch.float32, device=device)
-        self.strikes = torch.zeros(max_positions, dtype=torch.float32, device=device)
-        self.expiry_steps = torch.zeros(max_positions, dtype=torch.long, device=device)
-        self.created_at_steps = torch.zeros(max_positions, dtype=torch.long, device=device)
-        self.original_maturities = torch.zeros(max_positions, dtype=torch.long, device=device)
-        self.bucket_indices = torch.zeros(max_positions, dtype=torch.long, device=device)
-        self.opening_spots = torch.zeros(max_positions, dtype=torch.float32, device=device)
-        self.is_active = torch.zeros(max_positions, dtype=torch.bool, device=device)
-        
-        self.n_positions = 0  # Track how many positions slots are used
+        self.block_size = int(max(1, max_positions))  # block size for each block
+
+        # Blocks: each list element is a tensor block of length `block_size`
+        self.path_indices_blocks: List[torch.Tensor] = []
+        self.quantities_blocks: List[torch.Tensor] = []
+        self.strikes_blocks: List[torch.Tensor] = []
+        self.expiry_steps_blocks: List[torch.Tensor] = []
+        self.created_at_steps_blocks: List[torch.Tensor] = []
+        self.original_maturities_blocks: List[torch.Tensor] = []
+        self.bucket_indices_blocks: List[torch.Tensor] = []
+        self.opening_spots_blocks: List[torch.Tensor] = []
+        self.is_active_blocks: List[torch.Tensor] = []
+
+        # Track total number of positions used (across all blocks)
+        self.n_positions = 0
+
+        # Which block is partially filled (index), and the next free index within it
+        self.current_block_idx: int = -1
+        self.next_idx_within_block: int = 0
+
+        # derivative template (kept from original)
         self.derivative_template = None
-    
+
+        # allocate the initial block
+        self._allocate_block()
+
+    # -------------------------
+    # Internal helpers
+    # -------------------------
+    def _allocate_block(self):
+        """Allocate a new block of pre-sized tensors and append to block lists."""
+        size = self.block_size
+        device = self.device
+
+        self.path_indices_blocks.append(torch.zeros(size, dtype=torch.long, device=device))
+        self.quantities_blocks.append(torch.zeros(size, dtype=torch.float32, device=device))
+        self.strikes_blocks.append(torch.zeros(size, dtype=torch.float32, device=device))
+        self.expiry_steps_blocks.append(torch.zeros(size, dtype=torch.long, device=device))
+        self.created_at_steps_blocks.append(torch.zeros(size, dtype=torch.long, device=device))
+        self.original_maturities_blocks.append(torch.zeros(size, dtype=torch.long, device=device))
+        self.bucket_indices_blocks.append(torch.zeros(size, dtype=torch.long, device=device))
+        self.opening_spots_blocks.append(torch.zeros(size, dtype=torch.float32, device=device))
+        self.is_active_blocks.append(torch.zeros(size, dtype=torch.bool, device=device))
+
+        self.current_block_idx += 1
+        self.next_idx_within_block = 0
+
+    def _find_space_and_reserve(self, n_new: int):
+        """Ensure enough room for n_new positions; allocate additional blocks as needed.
+           Returns (start_global_index, list of (block_idx, start_within_block, count_in_block))
+           so caller can write slices block-by-block.
+        """
+        block_plan = []
+        remaining = n_new
+
+        while remaining > 0:
+            if self.current_block_idx == -1:
+                self._allocate_block()
+
+            space = self.block_size - self.next_idx_within_block
+            if space == 0:
+                self._allocate_block()
+                space = self.block_size
+
+            take = min(space, remaining)
+            bidx = self.current_block_idx
+            start_within = self.next_idx_within_block
+            block_plan.append((bidx, start_within, take))
+
+            # advance pointers
+            self.next_idx_within_block += take
+            self.n_positions += take
+            remaining -= take
+
+            # if current block filled exactly, next call will allocate new block
+
+        # compute starting global index of the first reserved slot
+        # We don't strictly need global start index externally, but keep parity with old API
+        # For debugging we can compute start idx:
+        # start_idx = self.n_positions - n_new
+        return block_plan
+
+    def _iterate_blocks_active_slice(self):
+        """Yield (block_idx, active_slice_mask) for active positions across blocks.
+           active_slice_mask is a boolean tensor of length block_size but it may include trailing
+           false entries in the last block if it isn't full.
+        """
+        total_used = 0
+        # Determine how many positions used in each block: block_used = block_size except possibly last
+        for bidx in range(len(self.path_indices_blocks)):
+            block_used = self.block_size
+            # For last block, used positions might be less than block_size
+            # Compute how many positions in this block have been allocated based on n_positions
+            remaining = self.n_positions - total_used
+            if remaining <= 0:
+                block_used = 0
+            elif remaining < self.block_size:
+                block_used = remaining
+            # yield block index and used count
+            yield bidx, block_used
+            total_used += block_used
+            if total_used >= self.n_positions:
+                break
+
+    # -------------------------
+    # Public API (kept identical)
+    # -------------------------
     def add_positions_batch(
         self,
         path_indices: torch.Tensor,
@@ -558,188 +655,195 @@ class VectorizedPositionLedger:
         opening_spots: torch.Tensor,
         derivative_template
     ):
-        """Add multiple positions at once - NO concatenation, just direct assignment."""
+        """Add multiple positions at once - now supports block expansion."""
         if self.derivative_template is None:
             self.derivative_template = derivative_template
-        
+
+        # ensure tensors are on correct device & shapes
+        device = self.device
+        path_indices = path_indices.to(device=device)
+        quantities = quantities.to(device=device)
+        strikes = strikes.to(device=device)
+        expiry_steps = expiry_steps.to(device=device)
+        opening_spots = opening_spots.to(device=device)
+
         n_new = len(path_indices)
-        start_idx = self.n_positions
-        end_idx = self.n_positions + n_new
-        
-        if end_idx > self.max_positions:
-            logging.warning(f"Ledger overflow! Needed {end_idx}, have {self.max_positions}. Skipping positions.")
+        if n_new == 0:
             return
-        
-        # DIRECT ASSIGNMENT - No concatenation!
-        self.path_indices[start_idx:end_idx] = path_indices
-        self.quantities[start_idx:end_idx] = quantities
-        self.strikes[start_idx:end_idx] = strikes
-        self.expiry_steps[start_idx:end_idx] = expiry_steps
-        self.created_at_steps[start_idx:end_idx] = created_at_step
-        self.original_maturities[start_idx:end_idx] = original_maturity
-        self.bucket_indices[start_idx:end_idx] = bucket_idx
-        self.opening_spots[start_idx:end_idx] = opening_spots
-        self.is_active[start_idx:end_idx] = True
-        
-        self.n_positions = end_idx
-    
+
+        # Reserve slots across blocks
+        block_plan = self._find_space_and_reserve(n_new)
+
+        # Write into blocks according to plan
+        offset = 0
+        for (bidx, start_within, take) in block_plan:
+            end_within = start_within + take
+            sl = slice(start_within, end_within)
+
+            self.path_indices_blocks[bidx][sl] = path_indices[offset: offset + take]
+            self.quantities_blocks[bidx][sl] = quantities[offset: offset + take]
+            self.strikes_blocks[bidx][sl] = strikes[offset: offset + take]
+            self.expiry_steps_blocks[bidx][sl] = expiry_steps[offset: offset + take]
+            # created_at_steps and original_maturities are scalars for the batch
+            self.created_at_steps_blocks[bidx][sl] = created_at_step
+            self.original_maturities_blocks[bidx][sl] = original_maturity
+            self.bucket_indices_blocks[bidx][sl] = bucket_idx
+            self.opening_spots_blocks[bidx][sl] = opening_spots[offset: offset + take]
+            self.is_active_blocks[bidx][sl] = True
+
+            offset += take
+
     def remove_expired(self, current_step: int):
-        """Mark expired positions as inactive - DON'T create new tensors."""
+        """Mark expired positions as inactive - iterate blocks, no tensor creation."""
         if self.n_positions == 0:
             return
-        
-        # Get slice of active positions
-        active_slice = slice(0, self.n_positions)
-        
-        # Find expired positions
-        expired_mask = self.expiry_steps[active_slice] <= current_step
-        
-        # Mark as inactive - no tensor creation!
-        self.is_active[active_slice] = self.is_active[active_slice] & ~expired_mask
-    
+
+        for bidx, used in self._iterate_blocks_active_slice():
+            if used == 0:
+                continue
+            active_slice = slice(0, used)
+            expired_mask = self.expiry_steps_blocks[bidx][active_slice] <= current_step
+            # mark inactive where expired
+            self.is_active_blocks[bidx][active_slice] = self.is_active_blocks[bidx][active_slice] & ~expired_mask
+
     def compute_and_remove_expired(
-        self, 
-        S_current: torch.Tensor, 
-        current_step: int, 
+        self,
+        S_current: torch.Tensor,
+        current_step: int,
         h0: float
     ) -> torch.Tensor:
-        """Compute payoffs for expired positions and mark them inactive. VECTORIZED."""
+        """Compute payoffs for expired positions and mark them inactive. VECTORIZED per-block."""
         payoffs = torch.zeros(self.M, device=self.device)
-        
         if self.n_positions == 0:
             return payoffs
-        
-        # Get active slice
-        active_slice = slice(0, self.n_positions)
-        
-        # Find expired positions
-        expired_mask = self.expiry_steps[active_slice] <= current_step
-        expired_mask = expired_mask & self.is_active[active_slice]  # Only active positions
-        
-        if expired_mask.sum() == 0:
-            return payoffs
-        
-        # Get data for expired positions (using masks - still differentiable)
-        expired_paths = self.path_indices[active_slice][expired_mask]
-        expired_quantities = self.quantities[active_slice][expired_mask]
-        expired_strikes = self.strikes[active_slice][expired_mask]
-        
-        # Get spot prices for expired positions (vectorized indexing)
-        expired_spots = S_current[expired_paths]
-        
-        # Compute payoffs (vectorized)
-        opt_type = getattr(self.derivative_template, "option_type", "call").lower()
-        if opt_type == "call":
-            intrinsic_values = torch.clamp(expired_spots - expired_strikes, min=0.0)
-        else:
-            intrinsic_values = torch.clamp(expired_strikes - expired_spots, min=0.0)
-        
-        position_payoffs = expired_quantities * intrinsic_values
-        
-        # Aggregate payoffs per path using scatter_add
-        payoffs.scatter_add_(0, expired_paths, position_payoffs)
-        
-        # Mark expired positions as inactive
-        temp_inactive = torch.zeros_like(self.is_active[active_slice])
-        temp_inactive[expired_mask] = True
-        self.is_active[active_slice] = self.is_active[active_slice] & ~temp_inactive
-        
+
+        S_current = S_current.to(device=self.device)
+
+        # iterate blocks and compute expired payoffs block-wise
+        for bidx, used in self._iterate_blocks_active_slice():
+            if used == 0:
+                continue
+            active_slice = slice(0, used)
+            expiry = self.expiry_steps_blocks[bidx][active_slice]
+            is_active = self.is_active_blocks[bidx][active_slice]
+
+            expired_mask = (expiry <= current_step) & is_active
+            if expired_mask.sum() == 0:
+                continue
+
+            expired_paths = self.path_indices_blocks[bidx][active_slice][expired_mask]
+            expired_quantities = self.quantities_blocks[bidx][active_slice][expired_mask]
+            expired_strikes = self.strikes_blocks[bidx][active_slice][expired_mask]
+
+            expired_spots = S_current[expired_paths]
+
+            opt_type = getattr(self.derivative_template, "option_type", "call").lower()
+            if opt_type == "call":
+                intrinsic_values = torch.clamp(expired_spots - expired_strikes, min=0.0)
+            else:
+                intrinsic_values = torch.clamp(expired_strikes - expired_spots, min=0.0)
+
+            position_payoffs = expired_quantities * intrinsic_values
+            payoffs.scatter_add_(0, expired_paths, position_payoffs)
+
+            # mark those positions inactive
+            temp_inactive = torch.zeros_like(self.is_active_blocks[bidx][active_slice])
+            temp_inactive[expired_mask] = True
+            self.is_active_blocks[bidx][active_slice] = self.is_active_blocks[bidx][active_slice] & ~temp_inactive
+
         return payoffs
-    
+
     def compute_total_value(
-        self, 
-        S_current: torch.Tensor, 
-        current_step: int, 
+        self,
+        S_current: torch.Tensor,
+        current_step: int,
         h0: float
     ) -> torch.Tensor:
-        """Price all active positions. FULLY VECTORIZED."""
+        """Price all active positions. FULLY VECTORIZED per-block and aggregated."""
         portfolio_value = torch.zeros(self.M, device=self.device)
-        
         if self.n_positions == 0 or self.derivative_template is None:
             return portfolio_value
-        
-        # Get active slice
-        active_slice = slice(0, self.n_positions)
-        
-        # Filter active positions that haven't expired
-        active_mask = self.is_active[active_slice] & (self.expiry_steps[active_slice] > current_step)
-        
-        if active_mask.sum() == 0:
-            return portfolio_value
-        
-        # Get active position data (using masks - differentiable)
-        active_paths = self.path_indices[active_slice][active_mask]
-        active_quantities = self.quantities[active_slice][active_mask]
-        active_strikes = self.strikes[active_slice][active_mask]
-        active_created = self.created_at_steps[active_slice][active_mask]
-        active_maturities = self.original_maturities[active_slice][active_mask]
-        
-        # Get spot prices for active positions (vectorized)
-        active_spots = S_current[active_paths]
-        
-        # Compute step indices
-        step_indices = current_step - active_created
-        
-        # Validate indices
-        valid_mask = (step_indices >= 0) & (step_indices < active_maturities)
-        if valid_mask.sum() == 0:
-            return portfolio_value
-        
-        # Filter to valid positions
-        valid_spots = active_spots[valid_mask]
-        valid_strikes = active_strikes[valid_mask]
-        valid_steps = step_indices[valid_mask]
-        valid_maturities = active_maturities[valid_mask]
-        valid_quantities = active_quantities[valid_mask]
-        valid_paths = active_paths[valid_mask]
-        
-        # BATCH PRICE ALL POSITIONS AT ONCE
-        prices = self._batch_price_positions(
-            valid_spots, valid_strikes, valid_steps, valid_maturities, h0
-        )
-        
-        position_values = valid_quantities * prices
-        
-        # Aggregate per path using scatter_add
-        portfolio_value.scatter_add_(0, valid_paths, position_values)
-        
+
+        S_current = S_current.to(device=self.device)
+
+        # process each block separately and accumulate into portfolio_value
+        for bidx, used in self._iterate_blocks_active_slice():
+            if used == 0:
+                continue
+
+            active_slice = slice(0, used)
+            is_active = self.is_active_blocks[bidx][active_slice]
+            expiry = self.expiry_steps_blocks[bidx][active_slice]
+
+            # active and not expired
+            active_mask = is_active & (expiry > current_step)
+            if active_mask.sum() == 0:
+                continue
+
+            active_paths = self.path_indices_blocks[bidx][active_slice][active_mask]
+            active_quantities = self.quantities_blocks[bidx][active_slice][active_mask]
+            active_strikes = self.strikes_blocks[bidx][active_slice][active_mask]
+            active_created = self.created_at_steps_blocks[bidx][active_slice][active_mask]
+            active_maturities = self.original_maturities_blocks[bidx][active_slice][active_mask]
+
+            active_spots = S_current[active_paths]
+
+            step_indices = current_step - active_created
+
+            valid_mask = (step_indices >= 0) & (step_indices < active_maturities)
+            if valid_mask.sum() == 0:
+                continue
+
+            valid_spots = active_spots[valid_mask]
+            valid_strikes = active_strikes[valid_mask]
+            valid_steps = step_indices[valid_mask]
+            valid_maturities = active_maturities[valid_mask]
+            valid_quantities = active_quantities[valid_mask]
+            valid_paths = active_paths[valid_mask]
+
+            prices = self._batch_price_positions(
+                valid_spots, valid_strikes, valid_steps, valid_maturities, h0
+            )
+
+            position_values = valid_quantities * prices
+            portfolio_value.scatter_add_(0, valid_paths, position_values)
+
         return portfolio_value
-    
+
     def _batch_price_positions(
-        self, 
-        S: torch.Tensor, 
-        K: torch.Tensor, 
-        step_indices: torch.Tensor, 
-        maturities: torch.Tensor, 
+        self,
+        S: torch.Tensor,
+        K: torch.Tensor,
+        step_indices: torch.Tensor,
+        maturities: torch.Tensor,
         h0: float
     ) -> torch.Tensor:
         """
         Batch price multiple positions with different parameters.
         Groups by (step_idx, maturity) to minimize pricing calls.
+        This internal function is unchanged in behavior from your original;
+        it works on arbitrary-length tensors and is safe to call per-block.
         """
         if self.derivative_template is None:
             return torch.zeros_like(S)
-        
-        # Group by (step_idx, maturity) to minimize pricing calls
+
         unique_configs = torch.stack([step_indices, maturities], dim=1)
         unique_keys, inverse_indices = torch.unique(unique_configs, dim=0, return_inverse=True)
-        
+
         n_positions = len(S)
         prices = torch.zeros(n_positions, device=self.device)
-        
-        # Price each unique configuration
+
         for i in range(len(unique_keys)):
             mask = inverse_indices == i
             if mask.sum() == 0:
                 continue
-            
+
             step_idx = int(unique_keys[i, 0].item())
             maturity = int(unique_keys[i, 1].item())
-            
+
             S_batch = S[mask]
             K_batch = K[mask]
-            
-            # Call derivative pricing (should support batched S and K)
+
             batch_prices = self.derivative_template.price(
                 S=S_batch,
                 K=K_batch,
@@ -747,93 +851,97 @@ class VectorizedPositionLedger:
                 N=maturity,
                 h0=h0
             )
-            
+
             prices[mask] = batch_prices
-        
+
         return prices
-    
+
     def compute_greeks(
-        self, 
-        S_current: torch.Tensor, 
-        current_step: int, 
-        h0: float, 
-        greek_name: str
-    ) -> torch.Tensor:
-        """Aggregate Greeks across all active positions. VECTORIZED."""
-        greeks = torch.zeros(self.M, device=self.device)
-        
-        if self.n_positions == 0 or self.derivative_template is None:
-            return greeks
-        
-        # Get active slice
-        active_slice = slice(0, self.n_positions)
-        active_mask = self.is_active[active_slice] & (self.expiry_steps[active_slice] > current_step)
-        
-        if active_mask.sum() == 0:
-            return greeks
-        
-        active_paths = self.path_indices[active_slice][active_mask]
-        active_quantities = self.quantities[active_slice][active_mask]
-        active_strikes = self.strikes[active_slice][active_mask]
-        active_created = self.created_at_steps[active_slice][active_mask]
-        active_maturities = self.original_maturities[active_slice][active_mask]
-        
-        active_spots = S_current[active_paths]
-        step_indices = current_step - active_created
-        
-        valid_mask = (step_indices >= 0) & (step_indices < active_maturities)
-        if valid_mask.sum() == 0:
-            return greeks
-        
-        valid_spots = active_spots[valid_mask]
-        valid_strikes = active_strikes[valid_mask]
-        valid_steps = step_indices[valid_mask]
-        valid_maturities = active_maturities[valid_mask]
-        valid_quantities = active_quantities[valid_mask]
-        valid_paths = active_paths[valid_mask]
-        
-        # Batch compute Greeks (similar to pricing)
-        greek_values = self._batch_compute_greeks(
-            valid_spots, valid_strikes, valid_steps, valid_maturities, h0, greek_name
-        )
-        
-        position_greeks = valid_quantities * greek_values
-        greeks.scatter_add_(0, valid_paths, position_greeks)
-        
-        return greeks
-    
-    def _batch_compute_greeks(
-        self, 
-        S: torch.Tensor, 
-        K: torch.Tensor, 
-        step_indices: torch.Tensor, 
-        maturities: torch.Tensor, 
+        self,
+        S_current: torch.Tensor,
+        current_step: int,
         h0: float,
         greek_name: str
     ) -> torch.Tensor:
-        """Batch compute Greeks for multiple positions."""
+        """Aggregate Greeks across all active positions. VECTORIZED (per-block)."""
+        greeks = torch.zeros(self.M, device=self.device)
+        if self.n_positions == 0 or self.derivative_template is None:
+            return greeks
+
+        S_current = S_current.to(device=self.device)
+
+        for bidx, used in self._iterate_blocks_active_slice():
+            if used == 0:
+                continue
+
+            active_slice = slice(0, used)
+            is_active = self.is_active_blocks[bidx][active_slice]
+            expiry = self.expiry_steps_blocks[bidx][active_slice]
+
+            active_mask = is_active & (expiry > current_step)
+            if active_mask.sum() == 0:
+                continue
+
+            active_paths = self.path_indices_blocks[bidx][active_slice][active_mask]
+            active_quantities = self.quantities_blocks[bidx][active_slice][active_mask]
+            active_strikes = self.strikes_blocks[bidx][active_slice][active_mask]
+            active_created = self.created_at_steps_blocks[bidx][active_slice][active_mask]
+            active_maturities = self.original_maturities_blocks[bidx][active_slice][active_mask]
+
+            active_spots = S_current[active_paths]
+            step_indices = current_step - active_created
+
+            valid_mask = (step_indices >= 0) & (step_indices < active_maturities)
+            if valid_mask.sum() == 0:
+                continue
+
+            valid_spots = active_spots[valid_mask]
+            valid_strikes = active_strikes[valid_mask]
+            valid_steps = step_indices[valid_mask]
+            valid_maturities = active_maturities[valid_mask]
+            valid_quantities = active_quantities[valid_mask]
+            valid_paths = active_paths[valid_mask]
+
+            greek_values = self._batch_compute_greeks(
+                valid_spots, valid_strikes, valid_steps, valid_maturities, h0, greek_name
+            )
+
+            position_greeks = valid_quantities * greek_values
+            greeks.scatter_add_(0, valid_paths, position_greeks)
+
+        return greeks
+
+    def _batch_compute_greeks(
+        self,
+        S: torch.Tensor,
+        K: torch.Tensor,
+        step_indices: torch.Tensor,
+        maturities: torch.Tensor,
+        h0: float,
+        greek_name: str
+    ) -> torch.Tensor:
+        """Batch compute Greeks for multiple positions (per-block)."""
         if self.derivative_template is None:
             return torch.zeros_like(S)
-        
+
         unique_configs = torch.stack([step_indices, maturities], dim=1)
         unique_keys, inverse_indices = torch.unique(unique_configs, dim=0, return_inverse=True)
-        
+
         n_positions = len(S)
         greeks = torch.zeros(n_positions, device=self.device)
-        
         greek_method = getattr(self.derivative_template, greek_name)
-        
+
         for i in range(len(unique_keys)):
             mask = inverse_indices == i
             if mask.sum() == 0:
                 continue
-            
+
             step_idx = int(unique_keys[i, 0].item())
             maturity = int(unique_keys[i, 1].item())
-            
+
             S_batch = S[mask]
             K_batch = K[mask]
-            
+
             batch_greeks = greek_method(
                 S=S_batch,
                 K=K_batch,
@@ -841,28 +949,30 @@ class VectorizedPositionLedger:
                 N=maturity,
                 h0=h0
             )
-            
+
             greeks[mask] = batch_greeks
-        
+
         return greeks
-    
+
     def get_ledger_size(self) -> torch.Tensor:
-        """Return number of active positions per path. VECTORIZED."""
+        """Return number of active positions per path. VECTORIZED across blocks."""
         sizes = torch.zeros(self.M, dtype=torch.float32, device=self.device)
         if self.n_positions == 0:
             return sizes
-        
-        # Get active slice
-        active_slice = slice(0, self.n_positions)
-        active_paths = self.path_indices[active_slice][self.is_active[active_slice]]
-        
-        # Count positions per path
-        sizes.scatter_add_(
-            0, 
-            active_paths, 
-            torch.ones_like(active_paths, dtype=torch.float32)
-        )
+
+        for bidx, used in self._iterate_blocks_active_slice():
+            if used == 0:
+                continue
+            active_slice = slice(0, used)
+            active_paths = self.path_indices_blocks[bidx][active_slice][self.is_active_blocks[bidx][active_slice]]
+
+            if active_paths.numel() == 0:
+                continue
+
+            sizes.scatter_add_(0, active_paths, torch.ones_like(active_paths, dtype=torch.float32))
+
         return sizes
+
 
 # ----------------------------------------
 # Hedging environment with GARCH dynamics
