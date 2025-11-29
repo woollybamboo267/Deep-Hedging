@@ -527,7 +527,7 @@ class FloatingGridManager:
 class VectorizedPositionLedger:
     """Fully vectorized position ledger with PRE-ALLOCATED tensors - NO concatenation."""
     
-    def __init__(self, M: int, device: torch.device, max_positions: int = 100000):
+    def __init__(self, M: int, device: torch.device, max_positions: int = 1000000):
         self.M = M
         self.device = device
         self.max_positions = max_positions
