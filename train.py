@@ -605,18 +605,31 @@ def train_episode(
     precomputation_manager
 ) -> Dict[str, Any]:
     """
-    Train for a single episode with Mueller et al. (2024) architecture.
-    Uses FULL BPTT without action/hidden state detachment.
+    Train for a single episode with comprehensive diagnostic logging.
     """
+    # Import logging functions from policy_net_garch_SCRMFG
+    from src.agents.policy_net_garch_SCRMFG import (
+        log_policy_diagnostics,
+        log_gradient_diagnostics,
+        log_action_diagnostics,
+        log_trajectory_diagnostics,
+        log_loss_diagnostics
+    )
+    
+    # Log frequency: full diagnostics every N episodes
+    LOG_FREQ = config.get("logging", {}).get("detailed_frequency", 10)
+    detailed_logging = (episode % LOG_FREQ == 0)
+    
+    # Log network state periodically
+    if detailed_logging:
+        log_policy_diagnostics(policy_net, episode, prefix="PRE-FORWARD")
     
     hedged_cfg = config["hedged_option"]
     mode = config["instruments"].get("mode", "static")
     is_floating_grid = (mode == "floating_grid")
     
-    # Get transaction costs from config
     transaction_costs = get_transaction_costs(config)
     
-    # Get risk measure and soft constraint configuration
     risk_config = config.get("risk_measure", {"type": "mse"})
     constraint_config = config.get("soft_constraint", {"enabled": False, "lambda": 0.0})
     
@@ -624,12 +637,11 @@ def train_episode(
     alpha = risk_config.get("alpha", None)
     lambda_constraint = constraint_config.get("lambda", 0.0) if constraint_config.get("enabled", False) else 0.0
     
-    # Get sparsity penalty for floating grid mode
     lambda_sparsity = 0.0
     if is_floating_grid:
         lambda_sparsity = config["instruments"]["floating_grid"].get("sparsity_penalty", 0.0)
     
-    # Create simulation instance
+    # Create simulation
     sim = HedgingSim(
         S0=config["simulation"]["S0"],
         K=hedged_cfg["K"],
@@ -645,7 +657,7 @@ def train_episode(
         seed=episode
     )
 
-    # Create hedging environment
+    # Create environment
     env = HedgingEnvGARCH(
         sim=sim,
         derivative=hedged_derivative,
@@ -659,20 +671,26 @@ def train_episode(
         precomputation_manager=precomputation_manager
     )
 
-    # Reset environment
     env.reset()
     
-    # Simulate trajectory using policy network (FULL BPTT - no detachment!)
+    # FORWARD PASS
     S_traj, V_traj, O_traj, obs_sequence, RL_actions = \
         env.simulate_trajectory_and_get_observations(policy_net)
     
-    # Compute full P&L trajectory with transaction costs
+    # Log actions periodically
+    if detailed_logging:
+        log_action_diagnostics(RL_actions, episode)
+    
+    # P&L calculation
     terminal_errors, trajectories = env.simulate_full_trajectory(RL_actions, O_traj)
     
-    # Backpropagation
+    # Log trajectories periodically
+    if detailed_logging:
+        log_trajectory_diagnostics(trajectories, episode)
+    
+    # BACKWARD PASS
     optimizer.zero_grad()
     
-    # Compute loss with configurable risk measure and penalties
     total_loss, risk_loss, constraint_penalty, sparsity_penalty = compute_loss_with_soft_constraint(
         terminal_errors, 
         trajectories,
@@ -682,14 +700,31 @@ def train_episode(
         lambda_sparsity=lambda_sparsity
     )
     
+    # Log loss components periodically
+    if detailed_logging:
+        log_loss_diagnostics(total_loss, risk_loss, constraint_penalty, 
+                            sparsity_penalty, terminal_errors, episode)
+    
     # Check for NaN/Inf BEFORE backward
     if torch.isnan(total_loss) or torch.isinf(total_loss):
-        logging.error(f"Episode {episode}: Loss is NaN/Inf BEFORE backward")
+        logging.error(f"❌ Episode {episode}: Loss is NaN/Inf BEFORE backward!")
         logging.error(f"  Risk loss: {risk_loss.item()}")
-        logging.error(f"  Constraint penalty: {constraint_penalty.item()}")
-        raise RuntimeError("Loss became NaN/Inf")
+        logging.error(f"  Constraint: {constraint_penalty.item()}")
+        logging.error(f"  Sparsity: {sparsity_penalty.item()}")
+        logging.error(f"  Terminal errors: min={terminal_errors.min()}, max={terminal_errors.max()}")
+        raise RuntimeError("Loss became NaN/Inf before backward")
     
     total_loss.backward()
+    
+    # Log gradients periodically
+    if detailed_logging:
+        grad_norm = log_gradient_diagnostics(policy_net, episode, prefix="POST-BACKWARD")
+    else:
+        # Still compute grad norm for logging
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            policy_net.parameters(),
+            max_norm=float('inf')  # Just compute, don't clip yet
+        )
     
     # Gradient clipping
     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -699,45 +734,40 @@ def train_episode(
     
     optimizer.step()
     
+    # Log network state after update periodically
+    if detailed_logging:
+        log_policy_diagnostics(policy_net, episode, prefix="POST-UPDATE")
+    
     # Check for NaN/Inf AFTER optimizer step
     if torch.isnan(total_loss) or torch.isinf(total_loss):
-        logging.error(f"Loss became NaN/Inf at episode {episode}")
-        raise RuntimeError("Loss became NaN/Inf")
+        logging.error(f"❌ Episode {episode}: Loss is NaN/Inf AFTER optimizer step!")
+        raise RuntimeError("Loss became NaN/Inf after optimizer step")
     
     final_reward = -float(total_loss.item())
     
-    # Construct detailed logging message
+    # ALWAYS log episode summary
     log_msg = (
-        f"Episode {episode} | "
-        f"Risk: {risk_measure.upper()} | "
-        f"Total Loss: {total_loss.item():.6f} | "
-        f"Risk Loss: {risk_loss.item():.6f} | "
-        f"Grad Norm: {grad_norm:.6f}"
+        f"Ep {episode} | {risk_measure.upper()} | "
+        f"Loss: {total_loss.item():.6f} | Risk: {risk_loss.item():.6f} | "
+        f"GradNorm: {grad_norm:.6f}"
     )
     
-    # Add constraint penalty info if enabled
     if lambda_constraint > 0:
-        avg_violation = trajectories['soft_constraint_violations'].mean().item()
-        log_msg += (
-            f" | Constraint: {constraint_penalty.item():.6f} "
-            f"(λ={lambda_constraint}, Avg Viol: {avg_violation:.6f})"
-        )
+        avg_viol = trajectories['soft_constraint_violations'].mean().item()
+        log_msg += f" | Constr: {constraint_penalty.item():.6f} (viol={avg_viol:.6f})"
     
-    # Add sparsity penalty info if enabled
     if lambda_sparsity > 0:
-        log_msg += f" | Sparsity: {sparsity_penalty.item():.6f} (λ={lambda_sparsity})"
+        log_msg += f" | Sparse: {sparsity_penalty.item():.6f}"
     
     log_msg += f" | Reward: {final_reward:.6f}"
     
-    # Add ledger statistics for floating grid mode
     if is_floating_grid and "ledger_size_trajectory" in trajectories:
         avg_ledger = np.mean(trajectories["ledger_size_trajectory"])
         max_ledger = np.max(trajectories["ledger_size_trajectory"])
-        log_msg += f" | Ledger (Avg/Max): {avg_ledger:.1f}/{max_ledger:.0f}"
+        log_msg += f" | Ledger: {avg_ledger:.1f}/{max_ledger:.0f}"
     
     logging.info(log_msg)
     
-    # Return comprehensive metrics dictionary
     return {
         "episode": episode,
         "loss": total_loss.item(),
@@ -745,6 +775,7 @@ def train_episode(
         "constraint_penalty": constraint_penalty.item(),
         "sparsity_penalty": sparsity_penalty.item(),
         "reward": final_reward,
+        "grad_norm": float(grad_norm),
         "trajectories": trajectories,
         "RL_positions": RL_actions,
         "S_traj": S_traj,
@@ -753,7 +784,6 @@ def train_episode(
         "env": env,
         "risk_measure": risk_measure,
         "lambda_constraint": lambda_constraint,
-        "grad_norm": float(grad_norm),
         "skipped": False
     }
 
