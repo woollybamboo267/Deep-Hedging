@@ -5,7 +5,7 @@ model:
   hidden_size: 64
   num_lstm_blocks: 4
   obs_dim: 5
-  use_action_recurrence: true
+  use_action_recurrence: false
 
 training:
   learning_rate: 0.00001  # ← VERY LOW to prevent explosion
