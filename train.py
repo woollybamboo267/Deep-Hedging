@@ -38,7 +38,7 @@ from src.agents.policy_net_garch_SCRMFG import (
 from src.option_greek.precompute import create_precomputation_manager_from_config
 from src.visualization.plot_results import compute_rl_metrics
 from derivative_factory import setup_derivatives_from_precomputed
-
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
