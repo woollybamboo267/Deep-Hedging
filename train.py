@@ -715,7 +715,14 @@ def train_episode(
         raise RuntimeError("Loss became NaN/Inf before backward")
     
     total_loss.backward()
-    
+    has_grads = any(p.grad is not None and p.grad.abs().sum() > 0 for p in policy_net.parameters())
+    print(f"Policy has gradients: {has_grads}")
+     
+     # Check if all_actions has gradients
+    if RL_actions.grad is not None:
+        print(f"RL_actions.grad norm: {RL_actions.grad.norm()}")
+        else:
+        print("RL_actions has NO gradient!")
     # Log gradients periodically
     if detailed_logging:
         grad_norm = log_gradient_diagnostics(policy_net, episode, prefix="POST-BACKWARD")
