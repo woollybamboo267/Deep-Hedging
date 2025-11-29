@@ -19,7 +19,24 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)# ============================================================================
 # DIAGNOSTIC LOGGING FUNCTIONS - Add these at the end of policy_net_garch_SCRMFG.py
 # ============================================================================
+# After line ~15 (after logger definition), add:
 
+def threshold_with_ste(trade_qty: torch.Tensor, threshold: float = 0.01) -> torch.Tensor:
+    """
+    Apply hard threshold in forward pass, soft gradient in backward pass.
+    Suppresses trades with |qty| < threshold while maintaining gradient flow.
+    """
+    # Forward: Hard threshold - only execute trades >= threshold, rounded
+    mask = trade_qty.abs() >= threshold
+    trade_discrete = torch.where(mask, trade_qty.round(), torch.zeros_like(trade_qty))
+    
+    # Backward: Soft gradient - smooth penalty for small trades
+    sharpness = 100.0  # Controls steepness of sigmoid
+    soft_mask = torch.sigmoid(sharpness * (trade_qty.abs() - threshold))
+    trade_continuous = trade_qty * soft_mask
+    
+    # STE: forward uses discrete, backward uses continuous
+    return trade_continuous + (trade_discrete - trade_continuous).detach()
 def log_policy_diagnostics(policy_net, episode: int, prefix: str = ""):
     """Log policy network weight/bias statistics."""
     if prefix:
@@ -1362,12 +1379,8 @@ class HedgingEnvGARCH:
             for bucket_idx in range(1, self.n_hedging_instruments):
                 trade_qty = trades[:, bucket_idx]
                 
-                # Suppress small trades
-                trade_qty = torch.where(
-                    trade_qty.abs() < self.min_trade_size,
-                    torch.zeros_like(trade_qty),
-                    trade_qty
-                )
+                # Apply threshold with STE
+                trade_qty = threshold_with_ste(trade_qty, threshold=self.min_trade_size)
                 
                 # Update current position
                 current_positions[:, bucket_idx] = current_positions[:, bucket_idx] + trade_qty
@@ -1551,12 +1564,9 @@ class HedgingEnvGARCH:
             # ===== OPTION TRADES (VECTORIZED ACROSS BUCKETS) =====
             for bucket_idx in range(1, self.n_hedging_instruments):
                 trade_qty = trades[:, bucket_idx]
-                trade_qty = torch.where(
-                    trade_qty.abs() < self.min_trade_size,
-                    torch.zeros_like(trade_qty),
-                    trade_qty
-                )
                 
+                # Apply threshold with STE
+                trade_qty = threshold_with_ste(trade_qty, threshold=self.min_trade_size)
                 # Update current position
                 current_positions[:, bucket_idx] = current_positions[:, bucket_idx] + trade_qty
                 
