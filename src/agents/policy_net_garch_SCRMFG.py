@@ -21,17 +21,22 @@ logger = logging.getLogger(__name__)# ==========================================
 # ============================================================================
 # After line ~15 (after logger definition), add:
 
-def threshold_with_ste(trade_qty: torch.Tensor, threshold: float = 0.01) -> torch.Tensor:
+def threshold_with_ste(trade_qty: torch.Tensor, threshold: float = 0.01, round_to: float = 0.01) -> torch.Tensor:
     """
     Apply hard threshold in forward pass, soft gradient in backward pass.
-    Suppresses trades with |qty| < threshold while maintaining gradient flow.
+    
+    Args:
+        trade_qty: Raw trade quantities from policy
+        threshold: Minimum trade size (suppress anything smaller)
+        round_to: Rounding precision (0.01 = nearest hundredth, 0.1 = nearest tenth, 1.0 = integer)
     """
-    # Forward: Hard threshold - only execute trades >= threshold, rounded
+    # Forward: Hard threshold - only execute trades >= threshold, rounded to precision
     mask = trade_qty.abs() >= threshold
-    trade_discrete = torch.where(mask, trade_qty.round(), torch.zeros_like(trade_qty))
+    trade_rounded = torch.round(trade_qty / round_to) * round_to  # Round to nearest round_to
+    trade_discrete = torch.where(mask, trade_rounded, torch.zeros_like(trade_qty))
     
     # Backward: Soft gradient - smooth penalty for small trades
-    sharpness = 100.0  # Controls steepness of sigmoid
+    sharpness = 100.0
     soft_mask = torch.sigmoid(sharpness * (trade_qty.abs() - threshold))
     trade_continuous = trade_qty * soft_mask
     
