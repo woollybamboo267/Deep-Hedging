@@ -37,7 +37,7 @@ class RMSNorm(nn.Module):
 
 def symexp(x: torch.Tensor) -> torch.Tensor:
     """Symmetric exponential with stability clipping: symexp(x) = sign(x) * (exp(|x|) - 1)"""
-    x_clipped = torch.clamp(x, min=-10.0, max=10.0)  # ← ADD THIS LINE
+    x_clipped = torch.clamp(x, min=-5.0, max=5.0)  # ← ADD THIS LINE
     return torch.sign(x_clipped) * (torch.exp(torch.abs(x_clipped)) - 1)
 
 
@@ -178,7 +178,7 @@ class PolicyNetGARCH(nn.Module):
             # Apply symexp activation
             out = symexp(out)
             # Apply position limits - ALL instruments get limits
-            out = torch.clamp(out, min=-100, max=100)  # Consistent limits
+            out = torch.clamp(out, min=-10, max=10)  # Consistent limits
             outputs.append(out)
         
         return outputs, hidden_states
