@@ -19,8 +19,8 @@ training:
   plot_frequency: 100
   batch_size: 512
   num_epochs: 400
-  gamma: 0.999999
-  entropy_coefficient: 1
+  gamma: 1
+  entropy_coefficient: 2
 
 simulation:
   M: 1000  # ← REDUCED from 1000 to speed up debugging
