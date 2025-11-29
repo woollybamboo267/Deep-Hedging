@@ -1237,7 +1237,7 @@ class HedgingEnvGARCH:
             
             # Option trades (indices 1+) - apply rounding and min trade size
             for bucket_idx in range(1, self.n_hedging_instruments):
-                trade_qty = torch.round(trades[:, bucket_idx])
+                trade_qty = trades[:, bucket_idx]
                 
                 # Suppress small trades
                 trade_qty = torch.where(
