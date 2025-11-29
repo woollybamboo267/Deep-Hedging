@@ -722,7 +722,7 @@ def train_episode(
     if RL_actions.grad is not None:
         print(f"RL_actions.grad norm: {RL_actions.grad.norm()}")
         else:
-        print("RL_actions has NO gradient!")
+            print("RL_actions has NO gradient!")
     # Log gradients periodically
     if detailed_logging:
         grad_norm = log_gradient_diagnostics(policy_net, episode, prefix="POST-BACKWARD")
