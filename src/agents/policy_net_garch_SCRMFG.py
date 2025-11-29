@@ -16,66 +16,80 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-logger = logging.getLogger(__name__)
-def log_policy_network_diagnostics(policy_net, episode: int):
-    """Log comprehensive policy network diagnostics."""
+logger = logging.getLogger(__name__)# ============================================================================
+# DIAGNOSTIC LOGGING FUNCTIONS - Add these at the end of policy_net_garch_SCRMFG.py
+# ============================================================================
+
+def log_policy_diagnostics(policy_net, episode: int, prefix: str = ""):
+    """Log policy network weight/bias statistics."""
+    if prefix:
+        prefix = f"{prefix} - "
+    
     logger.info(f"\n{'='*80}")
-    logger.info(f"POLICY NETWORK DIAGNOSTICS - Episode {episode}")
+    logger.info(f"{prefix}POLICY NETWORK DIAGNOSTICS - Episode {episode}")
     logger.info(f"{'='*80}")
     
-    # Input projection weights
-    input_weight_norm = torch.norm(policy_net.input_proj.weight).item()
-    input_weight_mean = policy_net.input_proj.weight.mean().item()
-    input_weight_std = policy_net.input_proj.weight.std().item()
-    logger.info(f"Input Projection: norm={input_weight_norm:.4f}, mean={input_weight_mean:.6f}, std={input_weight_std:.6f}")
+    # Input projection
+    input_w_norm = torch.norm(policy_net.input_proj.weight).item()
+    input_w_mean = policy_net.input_proj.weight.mean().item()
+    input_w_std = policy_net.input_proj.weight.std().item()
+    input_b_norm = torch.norm(policy_net.input_proj.bias).item()
+    logger.info(f"Input Proj: W_norm={input_w_norm:.4f}, W_mean={input_w_mean:.6f}, "
+                f"W_std={input_w_std:.6f}, b_norm={input_b_norm:.6f}")
     
     # LSTM blocks
     for i, block in enumerate(policy_net.lstm_blocks):
-        h_ih_norm = torch.norm(block.lstm_cell.weight_ih).item()
-        h_hh_norm = torch.norm(block.lstm_cell.weight_hh).item()
-        logger.info(f"LSTM Block {i}: W_ih_norm={h_ih_norm:.4f}, W_hh_norm={h_hh_norm:.4f}")
+        w_ih_norm = torch.norm(block.lstm_cell.weight_ih).item()
+        w_hh_norm = torch.norm(block.lstm_cell.weight_hh).item()
+        b_ih_norm = torch.norm(block.lstm_cell.bias_ih).item()
+        b_hh_norm = torch.norm(block.lstm_cell.bias_hh).item()
+        logger.info(f"LSTM Block {i}: W_ih={w_ih_norm:.4f}, W_hh={w_hh_norm:.4f}, "
+                   f"b_ih={b_ih_norm:.4f}, b_hh={b_hh_norm:.4f}")
     
     # Output heads
     for i, head in enumerate(policy_net.instrument_heads):
-        weight_norm = torch.norm(head.weight).item()
-        weight_mean = head.weight.mean().item()
-        bias = head.bias.item()
-        logger.info(f"Head {i}: weight_norm={weight_norm:.6f}, mean={weight_mean:.6f}, bias={bias:.6f}")
+        w_norm = torch.norm(head.weight).item()
+        w_mean = head.weight.mean().item()
+        w_max = head.weight.abs().max().item()
+        b_val = head.bias.item()
+        logger.info(f"Head {i}: W_norm={w_norm:.6f}, W_mean={w_mean:.6f}, "
+                   f"W_max={w_max:.6f}, bias={b_val:.6f}")
     
     logger.info(f"{'='*80}\n")
 
 
-def log_gradient_diagnostics(policy_net, episode: int):
-    """Log gradient statistics for all parameters."""
+def log_gradient_diagnostics(policy_net, episode: int, prefix: str = ""):
+    """Log gradient norms for all parameters."""
+    if prefix:
+        prefix = f"{prefix} - "
+    
     logger.info(f"\n{'='*80}")
-    logger.info(f"GRADIENT DIAGNOSTICS - Episode {episode}")
+    logger.info(f"{prefix}GRADIENT DIAGNOSTICS - Episode {episode}")
     logger.info(f"{'='*80}")
     
-    total_grad_norm = 0.0
-    param_count = 0
+    total_norm_sq = 0.0
+    has_gradients = False
     
     # Input projection
     if policy_net.input_proj.weight.grad is not None:
+        has_gradients = True
         grad_norm = torch.norm(policy_net.input_proj.weight.grad).item()
         grad_mean = policy_net.input_proj.weight.grad.mean().item()
         grad_max = policy_net.input_proj.weight.grad.abs().max().item()
-        total_grad_norm += grad_norm ** 2
-        param_count += 1
-        logger.info(f"Input Proj Grad: norm={grad_norm:.6f}, mean={grad_mean:.8f}, max={grad_max:.6f}")
+        total_norm_sq += grad_norm ** 2
+        logger.info(f"Input Proj: grad_norm={grad_norm:.8f}, grad_mean={grad_mean:.10f}, grad_max={grad_max:.8f}")
     
     # LSTM blocks
     for i, block in enumerate(policy_net.lstm_blocks):
         if block.lstm_cell.weight_ih.grad is not None:
             grad_norm = torch.norm(block.lstm_cell.weight_ih.grad).item()
-            total_grad_norm += grad_norm ** 2
-            param_count += 1
-            logger.info(f"LSTM {i} W_ih Grad: norm={grad_norm:.6f}")
+            total_norm_sq += grad_norm ** 2
+            logger.info(f"LSTM {i} W_ih: grad_norm={grad_norm:.8f}")
         
         if block.lstm_cell.weight_hh.grad is not None:
             grad_norm = torch.norm(block.lstm_cell.weight_hh.grad).item()
-            total_grad_norm += grad_norm ** 2
-            param_count += 1
-            logger.info(f"LSTM {i} W_hh Grad: norm={grad_norm:.6f}")
+            total_norm_sq += grad_norm ** 2
+            logger.info(f"LSTM {i} W_hh: grad_norm={grad_norm:.8f}")
     
     # Output heads
     for i, head in enumerate(policy_net.instrument_heads):
@@ -83,113 +97,103 @@ def log_gradient_diagnostics(policy_net, episode: int):
             grad_norm = torch.norm(head.weight.grad).item()
             grad_mean = head.weight.grad.mean().item()
             grad_max = head.weight.grad.abs().max().item()
-            total_grad_norm += grad_norm ** 2
-            param_count += 1
-            logger.info(f"Head {i} Grad: norm={grad_norm:.6f}, mean={grad_mean:.8f}, max={grad_max:.6f}")
+            total_norm_sq += grad_norm ** 2
+            logger.info(f"Head {i}: grad_norm={grad_norm:.8f}, grad_mean={grad_mean:.10f}, grad_max={grad_max:.8f}")
     
-    global_grad_norm = np.sqrt(total_grad_norm)
-    logger.info(f"\nGLOBAL GRADIENT NORM: {global_grad_norm:.6f}")
+    if not has_gradients:
+        logger.warning("⚠️  NO GRADIENTS FOUND!")
+    else:
+        global_norm = np.sqrt(total_norm_sq)
+        logger.info(f"\nGLOBAL GRADIENT NORM: {global_norm:.8f}")
+        
+        if global_norm < 1e-8:
+            logger.warning(f"⚠️  VANISHING GRADIENTS! Global norm = {global_norm:.12f}")
+        elif global_norm > 1e4:
+            logger.warning(f"⚠️  EXPLODING GRADIENTS! Global norm = {global_norm:.12f}")
+    
     logger.info(f"{'='*80}\n")
-    
-    return global_grad_norm
+    return np.sqrt(total_norm_sq) if has_gradients else 0.0
 
 
-def log_action_statistics(all_actions: torch.Tensor, episode: int, step: Optional[int] = None):
-    """Log detailed action statistics."""
-    prefix = f"Episode {episode}" + (f", Step {step}" if step is not None else "")
+def log_action_diagnostics(actions: torch.Tensor, episode: int, step: Optional[int] = None):
+    """Log action statistics."""
+    step_str = f", Step {step}" if step is not None else ""
     logger.info(f"\n{'='*80}")
-    logger.info(f"ACTION STATISTICS - {prefix}")
+    logger.info(f"ACTION DIAGNOSTICS - Episode {episode}{step_str}")
     logger.info(f"{'='*80}")
     
-    # actions shape: [M, N+1, n_instruments] or [M, n_instruments]
-    if len(all_actions.shape) == 3:
-        M, T, n_inst = all_actions.shape
+    if len(actions.shape) == 3:
+        M, T, n_inst = actions.shape
         logger.info(f"Actions shape: [M={M}, T={T}, n_instruments={n_inst}]")
         
         for inst_idx in range(n_inst):
-            actions_inst = all_actions[:, :, inst_idx]
-            mean_val = actions_inst.mean().item()
-            std_val = actions_inst.std().item()
-            min_val = actions_inst.min().item()
-            max_val = actions_inst.max().item()
-            zero_pct = (actions_inst.abs() < 1e-6).float().mean().item() * 100
+            acts = actions[:, :, inst_idx]
+            mean_val = acts.mean().item()
+            std_val = acts.std().item()
+            min_val = acts.min().item()
+            max_val = acts.max().item()
+            zero_pct = (acts.abs() < 1e-6).float().mean().item() * 100
             
-            logger.info(f"Instrument {inst_idx}: mean={mean_val:.4f}, std={std_val:.4f}, "
-                       f"min={min_val:.4f}, max={max_val:.4f}, zero%={zero_pct:.1f}%")
+            logger.info(f"Inst {inst_idx}: mean={mean_val:.6f}, std={std_val:.6f}, "
+                       f"min={min_val:.4f}, max={max_val:.4f}, zeros={zero_pct:.1f}%")
     else:
-        M, n_inst = all_actions.shape
+        M, n_inst = actions.shape
         logger.info(f"Actions shape: [M={M}, n_instruments={n_inst}]")
         
         for inst_idx in range(n_inst):
-            actions_inst = all_actions[:, inst_idx]
-            mean_val = actions_inst.mean().item()
-            std_val = actions_inst.std().item()
-            min_val = actions_inst.min().item()
-            max_val = actions_inst.max().item()
+            acts = actions[:, inst_idx]
+            mean_val = acts.mean().item()
+            std_val = acts.std().item()
+            min_val = acts.min().item()
+            max_val = acts.max().item()
             
-            logger.info(f"Instrument {inst_idx}: mean={mean_val:.4f}, std={std_val:.4f}, "
+            logger.info(f"Inst {inst_idx}: mean={mean_val:.6f}, std={std_val:.6f}, "
                        f"min={min_val:.4f}, max={max_val:.4f}")
     
     logger.info(f"{'='*80}\n")
 
 
 def log_trajectory_diagnostics(trajectories: Dict[str, Any], episode: int):
-    """Log detailed trajectory statistics."""
+    """Log trajectory statistics."""
     logger.info(f"\n{'='*80}")
     logger.info(f"TRAJECTORY DIAGNOSTICS - Episode {episode}")
     logger.info(f"{'='*80}")
     
-    # Stock trajectory
-    S_traj = trajectories.get("S")
-    if S_traj is not None:
-        S_mean = S_traj.mean().item()
-        S_std = S_traj.std().item()
-        S_min = S_traj.min().item()
-        S_max = S_traj.max().item()
-        S_final_mean = S_traj[:, -1].mean().item()
-        logger.info(f"Stock (S): mean={S_mean:.2f}, std={S_std:.2f}, min={S_min:.2f}, "
-                   f"max={S_max:.2f}, final_mean={S_final_mean:.2f}")
+    # Stock
+    S = trajectories.get("S")
+    if S is not None:
+        logger.info(f"Stock (S): mean={S.mean():.2f}, std={S.std():.2f}, "
+                   f"min={S.min():.2f}, max={S.max():.2f}, final={S[:,-1].mean():.2f}")
     
-    # Bank account trajectory
-    B_traj = trajectories.get("B")
-    if B_traj is not None:
-        B_mean = B_traj.mean().item()
-        B_std = B_traj.std().item()
-        B_min = B_traj.min().item()
-        B_max = B_traj.max().item()
-        B_final_mean = B_traj[:, -1].mean().item()
-        logger.info(f"Bank (B): mean={B_mean:.2f}, std={B_std:.2f}, min={B_min:.2f}, "
-                   f"max={B_max:.2f}, final_mean={B_final_mean:.2f}")
+    # Bank
+    B = trajectories.get("B")
+    if B is not None:
+        logger.info(f"Bank (B): mean={B.mean():.2f}, std={B.std():.2f}, "
+                   f"min={B.min():.2f}, max={B.max():.2f}, final={B[:,-1].mean():.2f}")
     
-    # Stock positions
+    # Positions
     stock_pos = trajectories.get("stock_positions")
     if stock_pos is not None:
-        pos_mean = stock_pos.mean().item()
-        pos_std = stock_pos.std().item()
-        pos_min = stock_pos.min().item()
-        pos_max = stock_pos.max().item()
-        logger.info(f"Stock Positions: mean={pos_mean:.4f}, std={pos_std:.4f}, "
-                   f"min={pos_min:.4f}, max={pos_max:.4f}")
+        logger.info(f"Stock Pos: mean={stock_pos.mean():.4f}, std={stock_pos.std():.4f}, "
+                   f"min={stock_pos.min():.4f}, max={stock_pos.max():.4f}")
     
-    # Cost breakdown
-    cost_breakdown = trajectories.get("cost_breakdown", {})
-    total_costs = sum(v.mean().item() for v in cost_breakdown.values())
-    logger.info(f"Total Transaction Costs: {total_costs:.4f}")
-    for cost_type, cost_tensor in cost_breakdown.items():
-        logger.info(f"  {cost_type}: {cost_tensor.mean().item():.4f}")
+    # Costs
+    costs = trajectories.get("cost_breakdown", {})
+    total_cost = sum(v.mean().item() for v in costs.values())
+    logger.info(f"Total Transaction Costs: {total_cost:.4f}")
+    for ctype, ctensor in costs.items():
+        logger.info(f"  {ctype}: {ctensor.mean().item():.4f}")
     
-    # Ledger size (for floating grid)
-    ledger_sizes = trajectories.get("ledger_size_trajectory", [])
-    if ledger_sizes:
-        avg_ledger = np.mean(ledger_sizes)
-        max_ledger = np.max(ledger_sizes)
-        min_ledger = np.min(ledger_sizes)
-        logger.info(f"Ledger Size: avg={avg_ledger:.1f}, min={min_ledger:.0f}, max={max_ledger:.0f}")
+    # Ledger
+    ledger = trajectories.get("ledger_size_trajectory", [])
+    if ledger:
+        logger.info(f"Ledger Size: avg={np.mean(ledger):.1f}, "
+                   f"min={np.min(ledger):.0f}, max={np.max(ledger):.0f}")
     
     logger.info(f"{'='*80}\n")
 
 
-def log_loss_components(
+def log_loss_diagnostics(
     total_loss: torch.Tensor,
     risk_loss: torch.Tensor,
     constraint_penalty: torch.Tensor,
@@ -197,52 +201,105 @@ def log_loss_components(
     terminal_errors: torch.Tensor,
     episode: int
 ):
-    """Log detailed loss component breakdown."""
+    """Log loss component breakdown."""
     logger.info(f"\n{'='*80}")
-    logger.info(f"LOSS COMPONENTS - Episode {episode}")
+    logger.info(f"LOSS DIAGNOSTICS - Episode {episode}")
     logger.info(f"{'='*80}")
     
-    logger.info(f"Total Loss: {total_loss.item():.6f}")
-    logger.info(f"  Risk Loss: {risk_loss.item():.6f} ({risk_loss.item()/total_loss.item()*100:.1f}%)")
-    logger.info(f"  Constraint Penalty: {constraint_penalty.item():.6f} ({constraint_penalty.item()/total_loss.item()*100:.1f}%)")
-    logger.info(f"  Sparsity Penalty: {sparsity_penalty.item():.6f} ({sparsity_penalty.item()/total_loss.item()*100:.1f}%)")
+    logger.info(f"Total Loss: {total_loss.item():.8f}")
     
-    # Terminal error statistics
+    total_val = total_loss.item()
+    if total_val > 1e-10:
+        logger.info(f"  Risk: {risk_loss.item():.8f} ({risk_loss.item()/total_val*100:.1f}%)")
+        logger.info(f"  Constraint: {constraint_penalty.item():.8f} ({constraint_penalty.item()/total_val*100:.1f}%)")
+        logger.info(f"  Sparsity: {sparsity_penalty.item():.8f} ({sparsity_penalty.item()/total_val*100:.1f}%)")
+    else:
+        logger.info(f"  Risk: {risk_loss.item():.8f}")
+        logger.info(f"  Constraint: {constraint_penalty.item():.8f}")
+        logger.info(f"  Sparsity: {sparsity_penalty.item():.8f}")
+    
+    # Terminal errors
     err_mean = terminal_errors.mean().item()
     err_std = terminal_errors.std().item()
     err_min = terminal_errors.min().item()
     err_max = terminal_errors.max().item()
     err_median = terminal_errors.median().item()
     
-    logger.info(f"\nTerminal Errors:")
-    logger.info(f"  Mean: {err_mean:.4f}")
-    logger.info(f"  Std: {err_std:.4f}")
-    logger.info(f"  Min: {err_min:.4f}")
-    logger.info(f"  Max: {err_max:.4f}")
-    logger.info(f"  Median: {err_median:.4f}")
+    logger.info(f"\nTerminal Errors: mean={err_mean:.6f}, std={err_std:.6f}, "
+               f"min={err_min:.4f}, max={err_max:.4f}, median={err_median:.6f}")
     
-    # Distribution analysis
-    positive_pct = (terminal_errors > 0).float().mean().item() * 100
-    negative_pct = (terminal_errors < 0).float().mean().item() * 100
+    # Distribution
+    pos_pct = (terminal_errors > 0).float().mean().item() * 100
+    neg_pct = (terminal_errors < 0).float().mean().item() * 100
     near_zero_pct = (terminal_errors.abs() < 0.01).float().mean().item() * 100
     
-    logger.info(f"\nError Distribution:")
-    logger.info(f"  Positive: {positive_pct:.1f}%")
-    logger.info(f"  Negative: {negative_pct:.1f}%")
-    logger.info(f"  Near Zero (|err| < 0.01): {near_zero_pct:.1f}%")
+    logger.info(f"Distribution: positive={pos_pct:.1f}%, negative={neg_pct:.1f}%, "
+               f"near_zero={near_zero_pct:.1f}%")
+    
+    # Check for issues
+    if torch.isnan(total_loss) or torch.isinf(total_loss):
+        logger.error("❌ LOSS IS NaN/Inf!")
+    if err_std < 1e-8:
+        logger.warning("⚠️  Terminal errors have near-zero variance!")
     
     logger.info(f"{'='*80}\n")
 
 
-def log_optimization_step(optimizer, episode: int):
-    """Log optimizer state."""
+def log_observation_diagnostics(obs: torch.Tensor, episode: int, step: int):
+    """Log observation statistics at a specific timestep."""
     logger.info(f"\n{'='*80}")
-    logger.info(f"OPTIMIZER STATE - Episode {episode}")
+    logger.info(f"OBSERVATION DIAGNOSTICS - Episode {episode}, Step {step}")
     logger.info(f"{'='*80}")
     
-    for i, param_group in enumerate(optimizer.param_groups):
-        lr = param_group['lr']
-        logger.info(f"Parameter Group {i}: lr={lr:.8f}")
+    # obs shape: [M, 1, obs_dim] or [M, obs_dim]
+    if len(obs.shape) == 3:
+        obs = obs[:, 0, :]  # Take first timestep
+    
+    M, obs_dim = obs.shape
+    logger.info(f"Observation shape: [M={M}, obs_dim={obs_dim}]")
+    
+    feature_names = ["time", "moneyness", "prev_moneyness", "vol", "value"]
+    
+    for i in range(min(obs_dim, len(feature_names))):
+        feat = obs[:, i]
+        mean_val = feat.mean().item()
+        std_val = feat.std().item()
+        min_val = feat.min().item()
+        max_val = feat.max().item()
+        
+        logger.info(f"{feature_names[i]}: mean={mean_val:.6f}, std={std_val:.6f}, "
+                   f"min={min_val:.6f}, max={max_val:.6f}")
+        
+        if torch.isnan(feat).any():
+            logger.error(f"❌ NaN detected in {feature_names[i]}!")
+        if torch.isinf(feat).any():
+            logger.error(f"❌ Inf detected in {feature_names[i]}!")
+    
+    logger.info(f"{'='*80}\n")
+
+
+def log_hidden_state_diagnostics(hidden_states, episode: int, step: int):
+    """Log LSTM hidden state statistics."""
+    logger.info(f"\n{'='*80}")
+    logger.info(f"HIDDEN STATE DIAGNOSTICS - Episode {episode}, Step {step}")
+    logger.info(f"{'='*80}")
+    
+    for i, (h, c) in enumerate(hidden_states):
+        h_norm = torch.norm(h, dim=1).mean().item()
+        c_norm = torch.norm(c, dim=1).mean().item()
+        h_mean = h.mean().item()
+        c_mean = c.mean().item()
+        h_max = h.abs().max().item()
+        c_max = c.abs().max().item()
+        
+        logger.info(f"Block {i}: h_norm={h_norm:.6f}, c_norm={c_norm:.6f}, "
+                   f"h_mean={h_mean:.6f}, c_mean={c_mean:.6f}, "
+                   f"h_max={h_max:.4f}, c_max={c_max:.4f}")
+        
+        if h_norm > 1e3 or c_norm > 1e3:
+            logger.warning(f"⚠️  Block {i} has exploding hidden states!")
+        if h_norm < 1e-6 or c_norm < 1e-6:
+            logger.warning(f"⚠️  Block {i} has vanishing hidden states!")
     
     logger.info(f"{'='*80}\n")
 
